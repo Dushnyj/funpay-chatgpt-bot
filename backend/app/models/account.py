@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
@@ -42,3 +42,18 @@ class AccountLimits(Base):
     refresh_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     refresh_recover_attempts: Mapped[int] = mapped_column(default=0)
     refresh_last_recover_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class AccountCheckJob(Base):
+    __tablename__ = "account_check_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"))
+    priority: Mapped[str] = mapped_column(String(20), default="scheduled")  # new | refresh_recover | manual | scheduled | limit_check
+    job_type: Mapped[str] = mapped_column(String(20))  # full_validation | refresh_recover | limit_check
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | running | done | failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    result: Mapped[str | None] = mapped_column(default=None)
+    error: Mapped[str | None] = mapped_column(default=None)
