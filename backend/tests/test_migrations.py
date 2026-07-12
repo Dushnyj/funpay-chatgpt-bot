@@ -129,12 +129,12 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert {"chat_conversations", "chat_messages"} <= tables
     assert "admin_session_version" in seller_columns
     async with engine.connect() as connection:
-        password, golden, telegram, tier_code, version = (
+        password, golden, telegram, tier_id, version = (
             await connection.execute(
                 text(
                     "SELECT a.password_encrypted, s.funpay_session_key, "
-                    "s.telegram_bot_token, t.code, v.version_num "
-                    "FROM accounts a JOIN subscription_tiers t ON t.id=a.tier_id "
+                    "s.telegram_bot_token, a.tier_id, v.version_num "
+                    "FROM accounts a "
                     "CROSS JOIN seller_settings s "
                     "CROSS JOIN alembic_version v WHERE a.id=1 AND s.id=1"
                 )
@@ -143,6 +143,6 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert decrypt(password) == "account-password"
     assert decrypt(golden) == "legacy-funpay-key"
     assert decrypt(telegram) == "123456789:legacy-token"
-    assert tier_code == "plus"
+    assert tier_id is None
     assert version == "20260713_0005"
     await engine.dispose()

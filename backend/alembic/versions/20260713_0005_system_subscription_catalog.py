@@ -139,6 +139,15 @@ def upgrade() -> None:
         batch_op.alter_column(
             "tier_id", existing_type=sa.Integer(), nullable=True
         )
+    # A pending/failed account has never produced trustworthy OpenAI plan
+    # evidence.  Do not carry its old operator-selected tier into the new
+    # automatic catalog, otherwise it could become sellable under a false plan.
+    connection.execute(
+        sa.text(
+            "UPDATE accounts SET tier_id = NULL "
+            "WHERE status IN ('pending_validation', 'validation_failed')"
+        )
+    )
 
 
 def downgrade() -> None:
