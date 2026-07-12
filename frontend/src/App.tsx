@@ -1,8 +1,30 @@
+import { Routes, Route } from 'react-router-dom'
+import Layout from './components/Layout'
+import ProtectedRoute from './components/ProtectedRoute'
+import Login from './pages/Login'
+import Dashboard from './pages/Dashboard'
+import Accounts from './pages/Accounts'
+import Tiers from './pages/Tiers'
+import Lots from './pages/Lots'
+import Orders from './pages/Orders'
+import Prices from './pages/Prices'
+import Templates from './pages/Templates'
+import Settings from './pages/Settings'
+
 export default function App() {
   return (
-    <div>
-      <h1>FunPay ChatGPT Rental Bot</h1>
-      <p>Admin panel (Phase 6)</p>
-    </div>
+    <Routes>
+      <Route path="/login" element={<Login />} />
+      <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+        <Route index element={<Dashboard />} />
+        <Route path="accounts" element={<Accounts />} />
+        <Route path="catalog" element={<Tiers />} />
+        <Route path="lots" element={<Lots />} />
+        <Route path="orders" element={<Orders />} />
+        <Route path="prices" element={<Prices />} />
+        <Route path="templates" element={<Templates />} />
+        <Route path="settings" element={<Settings />} />
+      </Route>
+    </Routes>
   )
 }
