@@ -21,6 +21,10 @@ dependencies = [
     "playwright>=1.41",
     "python-telegram-bot>=21.0",
     "funpaybotengine>=0.7.0",
+    "aioimaplib>=2.0",
+    "pyzbar>=0.1.9",
+    "Pillow>=10.0",
+    "qrcode[pil]>=7.4",
 ]
 
 [project.optional-dependencies]
