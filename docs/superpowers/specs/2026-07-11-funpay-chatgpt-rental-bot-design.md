@@ -565,8 +565,9 @@ SellerSettings
    Шаблон — в секции «MessageTemplate» (title/description/лимиты/инструкции).
     │
     ▼
-5. funpay.complete_order() — «Отправить на проверку»
-   Order.status = delivered
+5. Доставка данных через чат: бот отправляет welcome_message (логин/пароль/2FA-инструкции)
+   FunPay НЕ имеет API complete_order() — подтверждение сделки = действие покупателя
+   Order.status остаётся pending до SaleClosedEvent
    → триггер LotAutoManager (пересчёт квоты и лимитов, возможное снятие лотов)
     │
     ▼
@@ -663,37 +664,51 @@ for tier in SubscriptionTier WHERE is_active:
 
 ### Bump лотов
 
+`funpaybotengine.raise_offers(category_id, *subcategory_ids)` бампит **категорию/подкатегорию** целиком (а не отдельный лот). Бесплатный bump имеет кулдаун на FunPay.
+
 ```
-Scheduler, BumpLots (если auto_bump_enabled):
-for lot in Lot WHERE status = 'active':
-    last_bump = BumpLog.last_for(lot)
+Scheduler, BumpService (если auto_bump_enabled):
+for subcategory_id in distinct(Lot.funpay_node_id WHERE status = 'active'):
+    last_bump = BumpLog.last_successful_for(subcategory)
     if last_bump is None or NOW() - last_bump >= bump_interval_hours:
-        result = funpay.bump_lot(lot.funpay_id)
-        BumpLog.create(lot, result)
+        result = gateway.bump_category(category_id, subcategory_id)
+        BumpLog.create(subcategory, result)
         if not result.ok: уведомление продавцу
 ```
 
-Равномерное распределение: лоты поднимаются по одному с интервалом, не разом.
+Равномерное распределение: подкатегории поднимаются по очереди с интервалом, не разом. Один bump_category вызов поднимает все лоты продавца в подкатегории.
 
 ## 11. Обработка заказов FunPay
 
-### События
+### События funpaybotengine
+
+События приходят через WebSocket (Runner). Регистрация хэндлеров: `@dp.on_new_sale()`, `@dp.on_sale_closed()`, `@dp.on_sale_refunded()`, `@dp.on_new_message()`.
 
 ```
-NEW_ORDER
-├── создать Order (идемпотентно по funpay_order_id)
-├── определить lot → tier/duration/scope/min_pct, lang по buyer_locale
-└── запустить жизненный цикл аренды
+NewSaleEvent (новый оплаченный заказ)
+├── OrderProcessor.process_new_sale(): создать Order (идемпотентно по funpay_order_id)
+├── gateway.get_order(): определить subcategory_id → Lot matching (tier/duration/scope)
+├── lang по buyer_locale
+└── запустить жизненный цикл аренды (Фаза 4: AccountPool.acquire + Rental)
 
-ORDER_STATUS_CHANGED
-├── confirmed → Order.status = confirmed, «Спасибо за покупку»
-├── dispute → Order.status = dispute, уведомление продавцу
-└── cancelled → Order.status = cancelled, аренда → revoked + кик
+SaleClosedEvent (покупатель подтвердил получение)
+├── OrderProcessor.process_sale_closed(): Order.status = completed
+└── «Спасибо за покупку» (Фаза 4: MessageTemplate['thanks'])
 
-NEW_MESSAGE (в чате сделки)
-├── матч команды → обработка
+SaleRefundedEvent (возврат / спор разрешён в пользу покупателя)
+├── OrderProcessor.process_sale_refunded(): Order.status = refunded
+├── Rental → revoked (Фаза 4)
+└── кик покупателя (Фаза 4: KickService)
+
+NewMessageEvent (в чате сделки)
+├── CommandParser.parse(text) → ParsedCommand | None
+├── команда распознана → CommandRouter.dispatch(ctx) → хэндлер
 └── обычное сообщение → игнор
 ```
+
+### Статусы FunPay
+
+`funpayparsers.OrderStatus`: `PAID` (оплачен, ждёт подтверждения покупателем), `COMPLETED` (завершён), `REFUNDED` (возврат). Нет отдельного `dispute`/`cancelled` — спор на FunPay эскалируется в возврат.
 
 ### Идемпотентность
 
@@ -701,9 +716,9 @@ NEW_MESSAGE (в чате сделки)
 - Каждое сообщение логируется с `message_id` → обработка только новых.
 - `!код` — проверка `last_code_request_at`, отказ если < 30 сек назад.
 
-### Завершение сделки
+### Доставка и завершение сделки
 
-Бот нажимает «Выполнить» сразу после выдачи данных (шаг 5). Покупатель подтверждает → деньги продавцу. Если не подтверждает → поддержка FunPay подтверждает за него через 24–48ч при наличии доказательств в чате.
+FunPay НЕ имеет API `complete_order()` — подтверждение сделки это действие покупателя. Продавец только доставляет данные (логин/пароль/2FA) через чат после выдачи аренды. Покупатель подтверждает → деньги продавцу (`SaleClosedEvent`). Если не подтверждает → поддержка FunPay подтверждает за него через 24–48ч при наличии лога в чате (вся выдача и команды пишутся в `AuditLog`).
 
 ## 12. Очередь проверок аккаунтов
 
@@ -914,7 +929,7 @@ Periodic `pg_dump` по cron, хранение N дней.
 
 ## 21. Риски
 
-1. **funpaybotengine (15⭐):** FunPay-слой изолирован за `ChatGateway`. Методы `create_lot/pause_lot/activate_lot/bump_lot/complete_order` требуют проверки по исходникам — при отсутствии допишем HTTP-клиент.
+1. **funpaybotengine (15⭐, v0.7.0):** проверен по исходникам. API: `Bot(golden_key)`, `send_message`, `get_order_page`, `save_offer_fields` (create/update отдельного лота через `active=True/False`), `set_offer_active`, `get_my_offers_page`, `raise_offers(category_id, *subcategory_ids)` (bump категории), `listen_events(dp)`. События: `NewSaleEvent`/`SaleClosedEvent`/`SaleRefundedEvent`/`NewMessageEvent`. **Нет `complete_order()`** (подтверждение — действие покупателя). Изолирован за `ChatGateway` Protocol. Пауза/активация лота через `save_offer_fields` с `active=False/True` (НЕ `set_offers_hidden` — это глобальный переключатель). Риск: `save_offer_fields` не возвращает ID созданного лота — требуется `get_my_offers_page` для поиска по title после создания.
 2. **Неофициальный backend-api OpenAI:** эндпоинты `/backend-api/wham/usage` и `/accounts/check/...` не документированы, могут меняться. Митигация: изоляция за `OpenAIClient`, обработка ошибок, fallback на Playwright-замеры.
 3. **Ротация refresh_token при logout all:** logout all инвалидирует refresh_token — штатный сценарий при кике. Обрабатывается авто-перезаходом через Playwright OAuth flow (отдельный пул воркеров, до `refresh_max_attempts` попыток). Нагрузка: при активной аренде десятки перезаходов в час — требует достаточного `refresh_recover_concurrency`.
 4. **Триггеры антибот-защиты OpenAI:** массовые логины/замеры с одного IP. Митигация: ограничение `check_concurrency`, паузы, при необходимости — прокси. HTTP-замеры легче Playwright.
