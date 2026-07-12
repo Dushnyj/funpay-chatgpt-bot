@@ -25,7 +25,7 @@ async def _add_account(
     session: AsyncSession,
     tier: SubscriptionTier,
     login: str = "acc1",
-    expires_in_days: int = 30,
+    expires_in_days: int | None = 30,
     chat_5h: int = 80,
     chat_weekly: int = 70,
     codex_5h: int = 60,
@@ -38,7 +38,11 @@ async def _add_account(
         password_encrypted="enc",
         totp_secret_encrypted="enc",
         tier_id=tier.id,
-        subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=expires_in_days),
+        subscription_expires_at=(
+            datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+            if expires_in_days is not None
+            else None
+        ),
         status="active",
         max_active_rentals=max_active_rentals,
     )
@@ -99,6 +103,28 @@ async def test_acquire_filters_out_expired_subscription(session: AsyncSession):
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
     assert result is None
+
+
+async def test_acquire_allows_verified_free_plan_without_billing_expiry(
+    session: AsyncSession,
+):
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    tier.code = "free"
+    account = await _add_account(session, tier, expires_in_days=None)
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_days=duration.days,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+    result = await AccountPool().acquire(
+        session,
+        criteria,
+        default_max_active_rentals=1,
+    )
+    assert result is not None and result.id == account.id
 
 
 async def test_acquire_filters_out_refresh_expired(session: AsyncSession):

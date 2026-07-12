@@ -22,6 +22,15 @@ export function useDeleteTier() {
   })
 }
 
+export function useUpdateTier() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: number; is_sellable?: boolean; is_active?: boolean }) =>
+      api.patch<Tier>(`/tiers/${id}`, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tiers'] }),
+  })
+}
+
 export function useDurations() {
   return useQuery({ queryKey: ['durations'], queryFn: () => api.get<Duration[]>('/durations') })
 }

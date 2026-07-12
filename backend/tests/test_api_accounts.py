@@ -42,6 +42,8 @@ async def test_create_account(auth_client: AsyncClient, session: AsyncSession):
     data = resp.json()
     assert data["login"] == "acc1"
     assert data["status"] == "pending_validation"
+    assert data["tier_id"] is None
+    assert data["validation_job"]["status"] == "pending"
     assert "password" not in str(data)
     assert "totp_secret" not in str(data)
     account = await session.get(Account, data["id"])
@@ -113,6 +115,34 @@ async def test_patch_account_status(auth_client: AsyncClient, session: AsyncSess
     resp = await auth_client.patch(f"/api/accounts/{acc_id}", json={"status": "active"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "active"
+
+
+async def test_failed_account_can_be_requeued_with_visible_job(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post("/api/accounts", json={
+        "login": "retry-account",
+        "password": "pass",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+    })
+    account = await session.get(Account, created.json()["id"])
+    job = (
+        await session.execute(
+            select(AccountCheckJob).where(AccountCheckJob.account_id == account.id)
+        )
+    ).scalar_one()
+    account.status = "validation_failed"
+    job.status = "failed"
+    job.error = '{"stage":"login","code":"cloudflare_challenge","detail":"blocked"}'
+    await session.commit()
+
+    response = await auth_client.post(f"/api/accounts/{account.id}/recheck")
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["status"] == "pending_validation"
+    assert payload["validation_job"]["status"] == "pending"
+    assert payload["validation_job"]["priority"] == "manual"
 
 
 async def test_create_account_with_email(auth_client: AsyncClient, session: AsyncSession):

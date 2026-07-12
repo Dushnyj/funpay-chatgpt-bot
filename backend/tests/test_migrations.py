@@ -47,7 +47,31 @@ async def test_upgrade_database_creates_head_schema_idempotently(
         version = (
             await connection.execute(text("SELECT version_num FROM alembic_version"))
         ).scalar_one()
-    assert version == "20260713_0004"
+        catalog = set(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT code FROM subscription_tiers "
+                        "WHERE system_managed = 1 AND is_sellable = 1"
+                    )
+                )
+            ).scalars()
+        )
+        account_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]: column
+                for column in inspect(sync_connection).get_columns("accounts")
+            }
+        )
+    assert version == "20260713_0005"
+    assert catalog == {
+        "free", "go", "plus", "pro_5x", "pro_20x", "business",
+        "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
+    }
+    assert account_columns["tier_id"]["nullable"] is True
+    assert {
+        "plan_raw_type", "plan_source", "plan_confidence", "plan_detected_at"
+    } <= set(account_columns)
     await engine.dispose()
 
 
@@ -105,12 +129,13 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert {"chat_conversations", "chat_messages"} <= tables
     assert "admin_session_version" in seller_columns
     async with engine.connect() as connection:
-        password, golden, telegram, version = (
+        password, golden, telegram, tier_code, version = (
             await connection.execute(
                 text(
                     "SELECT a.password_encrypted, s.funpay_session_key, "
-                    "s.telegram_bot_token, v.version_num "
-                    "FROM accounts a CROSS JOIN seller_settings s "
+                    "s.telegram_bot_token, t.code, v.version_num "
+                    "FROM accounts a JOIN subscription_tiers t ON t.id=a.tier_id "
+                    "CROSS JOIN seller_settings s "
                     "CROSS JOIN alembic_version v WHERE a.id=1 AND s.id=1"
                 )
             )
@@ -118,5 +143,6 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert decrypt(password) == "account-password"
     assert decrypt(golden) == "legacy-funpay-key"
     assert decrypt(telegram) == "123456789:legacy-token"
-    assert version == "20260713_0004"
+    assert tier_code == "plus"
+    assert version == "20260713_0005"
     await engine.dispose()

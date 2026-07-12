@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
@@ -116,6 +116,7 @@ class LotAutoManager:
             .join(Duration, Duration.id == PriceMatrix.duration_id)
             .where(
                 SubscriptionTier.is_active.is_(True),
+                SubscriptionTier.is_sellable.is_(True),
                 Duration.is_enabled.is_(True),
             )
         )
@@ -139,7 +140,8 @@ class LotAutoManager:
         """Apply the same eligibility rules used during real allocation."""
         duration = await session.get(Duration, matrix.duration_id)
         scope = await session.get(LimitScope, matrix.limit_scope_id)
-        if duration is None or scope is None:
+        tier = await session.get(SubscriptionTier, matrix.tier_id)
+        if duration is None or scope is None or tier is None or not tier.is_sellable:
             return False
 
         settings = await session.get(SellerSettings, 1)
@@ -147,6 +149,12 @@ class LotAutoManager:
         now = datetime.now(timezone.utc)
         fresh_cutoff = now - _LIMITS_FRESH_THRESHOLD
         required_expires_at = now + timedelta(days=duration.days)
+        expiry_condition = Account.subscription_expires_at >= required_expires_at
+        if tier.code == "free":
+            expiry_condition = or_(
+                expiry_condition,
+                Account.subscription_expires_at.is_(None),
+            )
         active_rentals = (
             select(Rental.account_id, func.count(Rental.id).label("cnt"))
             .where(Rental.status == "active")
@@ -161,7 +169,7 @@ class LotAutoManager:
             .where(
                 Account.status == "active",
                 Account.tier_id == matrix.tier_id,
-                Account.subscription_expires_at >= required_expires_at,
+                expiry_condition,
                 AccountLimits.measured_at >= fresh_cutoff,
                 AccountLimits.refresh_status == "ok",
                 func.coalesce(Account.max_active_rentals, default_max)

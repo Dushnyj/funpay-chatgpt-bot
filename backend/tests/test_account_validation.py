@@ -1,6 +1,7 @@
 import base64
 import json
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -30,6 +31,8 @@ async def test_validate_account_success(session, monkeypatch):
         login="new@e.com",
         password_encrypted="pass123",
         totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        email="new@gmail.com",
+        email_password_encrypted="mailpass",
         tier_id=tier.id,
         status="pending_validation",
     )
@@ -41,10 +44,14 @@ async def test_validate_account_success(session, monkeypatch):
     async def fake_browser_context(*args, **kw):
         yield object()
 
+    provider = MagicMock()
+    provider.preflight = AsyncMock()
+
     # Мокаем Playwright-логин: возвращает tuple (auth_code, code_verifier)
     async def fake_login_and_get_auth_code(context, login, password, totp_secret, **kw):
         assert login == "new@e.com"
         assert password == "pass123"
+        assert kw["email_provider"] is provider
         return "fake-auth-code", "fake-verifier"
 
     async def fake_exchange(code, verifier, redirect_uri):
@@ -61,11 +68,16 @@ async def test_validate_account_success(session, monkeypatch):
         )
 
     # Мокаем замер (чтобы не дёргать реальный backend-api)
-    async def fake_measure(session_arg, account_id):
+    async def fake_measure(session_arg, account_id, **kwargs):
         assert account_id == acc.id
+        assert kwargs["claim_plan_type"] == "plus"
         return MeasureResult.OK
 
     monkeypatch.setattr("app.services.account_validation.browser_context", fake_browser_context)
+    monkeypatch.setattr(
+        "app.services.account_validation.detect_imap_provider",
+        lambda *_args, **_kwargs: provider,
+    )
     monkeypatch.setattr("app.services.account_validation.login_and_get_auth_code", fake_login_and_get_auth_code)
     monkeypatch.setattr("app.services.account_validation.exchange_code_for_tokens", fake_exchange)
     monkeypatch.setattr("app.services.account_validation.measure_account_limits", fake_measure)
@@ -86,9 +98,9 @@ async def test_validate_account_success(session, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_validate_account_login_failure(session, monkeypatch):
-    """Playwright логин не удался → аккаунт остаётся в pending_validation."""
-    from app.integrations.playwright.oauth_login import OAuthLoginError
-    from app.services.account_validation import ValidationOutcome, validate_account
+    """A typed login failure is exposed and leaves a terminal account state."""
+    from app.integrations.playwright.oauth_login import OAuthErrorCode, OAuthLoginError
+    from app.services.account_validation import AccountValidationError, validate_account
 
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
@@ -110,16 +122,23 @@ async def test_validate_account_login_failure(session, monkeypatch):
         yield object()
 
     async def failing_login(context, login, password, totp_secret, **kw):
-        raise OAuthLoginError("invalid credentials")
+        raise OAuthLoginError(
+            "OpenAI отклонил логин или пароль.",
+            code=OAuthErrorCode.INVALID_CREDENTIALS,
+            stage="password",
+        )
 
     monkeypatch.setattr("app.services.account_validation.browser_context", fake_browser_context)
     monkeypatch.setattr("app.services.account_validation.login_and_get_auth_code", failing_login)
 
-    outcome = await validate_account(session, acc.id)
-    assert outcome == ValidationOutcome.LOGIN_FAILED
+    with pytest.raises(AccountValidationError) as error:
+        await validate_account(session, acc.id)
+    assert error.value.code == "invalid_credentials"
+    assert error.value.stage == "password"
+    assert "wrong" not in error.value.to_json()
 
     reloaded = await session.get(Account, acc.id)
-    assert reloaded.status == "pending_validation"
+    assert reloaded.status == "validation_failed"
 
 
 @pytest.mark.asyncio
@@ -170,11 +189,18 @@ async def test_validate_account_no_totp_with_email_enables_2fa(session, monkeypa
             }),
         )
 
-    async def fake_measure(session_arg, account_id):
+    async def fake_measure(session_arg, account_id, **kwargs):
         assert account_id == acc.id
+        assert kwargs["claim_plan_type"] == "plus"
         return MeasureResult.OK
 
     monkeypatch.setattr("app.services.account_validation.browser_context", fake_browser_context)
+    provider = MagicMock()
+    provider.preflight = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.account_validation.detect_imap_provider",
+        lambda *_args, **_kwargs: provider,
+    )
     monkeypatch.setattr("app.services.account_validation.enable_2fa", fake_enable_2fa)
     monkeypatch.setattr("app.services.account_validation.login_and_get_auth_code", fake_login_and_get_auth_code)
     monkeypatch.setattr("app.services.account_validation.exchange_code_for_tokens", fake_exchange)
@@ -196,8 +222,8 @@ async def test_validate_account_no_totp_with_email_enables_2fa(session, monkeypa
 
 @pytest.mark.asyncio
 async def test_validate_account_no_totp_no_email_invalid_2fa(session):
-    """Нет TOTP и нет email → INVALID_2FA."""
-    from app.services.account_validation import ValidationOutcome, validate_account
+    """No TOTP/email produces a precise, terminal validation failure."""
+    from app.services.account_validation import AccountValidationError, validate_account
 
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
@@ -213,17 +239,19 @@ async def test_validate_account_no_totp_no_email_invalid_2fa(session):
     session.add(acc)
     await session.commit()
 
-    outcome = await validate_account(session, acc.id)
-    assert outcome == ValidationOutcome.INVALID_2FA
+    with pytest.raises(AccountValidationError) as error:
+        await validate_account(session, acc.id)
+    assert error.value.code == "missing_2fa_data"
+    assert error.value.stage == "input"
 
     reloaded = await session.get(Account, acc.id)
-    assert reloaded.status == "pending_validation"
+    assert reloaded.status == "validation_failed"
 
 
 @pytest.mark.asyncio
 async def test_validate_account_invalid_totp_secret(session):
-    """totp_secret кривой (не base32) → INVALID_2FA."""
-    from app.services.account_validation import ValidationOutcome, validate_account
+    """Invalid TOTP secret is reported without exposing it."""
+    from app.services.account_validation import AccountValidationError, validate_account
 
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
@@ -239,18 +267,20 @@ async def test_validate_account_invalid_totp_secret(session):
     session.add(acc)
     await session.commit()
 
-    outcome = await validate_account(session, acc.id)
-    assert outcome == ValidationOutcome.INVALID_2FA
+    with pytest.raises(AccountValidationError) as error:
+        await validate_account(session, acc.id)
+    assert error.value.code == "invalid_totp"
+    assert "not-base32" not in error.value.to_json()
 
     reloaded = await session.get(Account, acc.id)
-    assert reloaded.status == "pending_validation"
+    assert reloaded.status == "validation_failed"
 
 
 @pytest.mark.asyncio
 async def test_validate_account_enable_2fa_failure(session, monkeypatch):
-    """Нет TOTP + email задан, но enable_2fa падает → SETUP_2FA_FAILED."""
+    """The concrete 2FA UI stage is preserved in the job-facing exception."""
     from app.integrations.playwright.enable_2fa import Enable2FAError
-    from app.services.account_validation import ValidationOutcome, validate_account
+    from app.services.account_validation import AccountValidationError, validate_account
 
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
@@ -273,13 +303,25 @@ async def test_validate_account_enable_2fa_failure(session, monkeypatch):
         yield object()
 
     async def failing_enable_2fa(context, login, password, email_provider, **kw):
-        raise Enable2FAError("QR not found")
+        raise Enable2FAError(
+            "QR-код не найден.",
+            code="setup_2fa_qr_not_found",
+            stage="setup_2fa_qr",
+        )
 
     monkeypatch.setattr("app.services.account_validation.browser_context", fake_browser_context)
     monkeypatch.setattr("app.services.account_validation.enable_2fa", failing_enable_2fa)
+    provider = MagicMock()
+    provider.preflight = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.account_validation.detect_imap_provider",
+        lambda *_args, **_kwargs: provider,
+    )
 
-    outcome = await validate_account(session, acc.id)
-    assert outcome == ValidationOutcome.SETUP_2FA_FAILED
+    with pytest.raises(AccountValidationError) as error:
+        await validate_account(session, acc.id)
+    assert error.value.code == "setup_2fa_qr_not_found"
+    assert error.value.stage == "setup_2fa_qr"
 
     reloaded = await session.get(Account, acc.id)
-    assert reloaded.status == "pending_validation"
+    assert reloaded.status == "validation_failed"

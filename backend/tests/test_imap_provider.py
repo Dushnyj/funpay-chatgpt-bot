@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.integrations.email.imap_provider import IMAPProvider, detect_imap_provider
+from app.integrations.email.provider import EmailErrorCode, EmailProviderError
 
 
 def _response(result="OK", lines=None):
@@ -13,98 +14,155 @@ def _response(result="OK", lines=None):
 
 
 def test_detect_gmail():
-    p = detect_imap_provider("user@gmail.com", "pass")
-    assert isinstance(p, IMAPProvider)
-    assert p.imap_host == "imap.gmail.com"
+    provider = detect_imap_provider("user@gmail.com", "pass")
+    assert isinstance(provider, IMAPProvider)
+    assert provider.imap_host == "imap.gmail.com"
 
 
 def test_detect_outlook():
-    p = detect_imap_provider("user@outlook.com", "pass")
-    assert p.imap_host == "outlook.office365.com"
+    provider = detect_imap_provider("user@outlook.com", "pass")
+    assert provider.imap_host == "outlook.office365.com"
 
 
 def test_detect_hotmail():
-    p = detect_imap_provider("user@hotmail.com", "pass")
-    assert p.imap_host == "outlook.office365.com"
+    provider = detect_imap_provider("user@hotmail.com", "pass")
+    assert provider.imap_host == "outlook.office365.com"
 
 
 def test_detect_yahoo():
-    p = detect_imap_provider("user@yahoo.com", "pass")
-    assert p.imap_host == "imap.mail.yahoo.com"
+    provider = detect_imap_provider("user@yahoo.com", "pass")
+    assert provider.imap_host == "imap.mail.yahoo.com"
 
 
 def test_detect_custom_domain_uses_fallback():
-    # Кастомный домен — fallback на gmail host (можно конфигурировать)
-    p = detect_imap_provider("user@mydomain.com", "pass", fallback_host="mail.mydomain.com")
-    assert p.imap_host == "mail.mydomain.com"
+    provider = detect_imap_provider(
+        "user@mydomain.com", "pass", fallback_host="mail.mydomain.com"
+    )
+    assert provider.imap_host == "mail.mydomain.com"
+
+
+def _client() -> AsyncMock:
+    client = AsyncMock()
+    client.wait_hello_from_server = AsyncMock()
+    client.login = AsyncMock(return_value=_response())
+    client.select = AsyncMock(return_value=_response())
+    client.logout = AsyncMock()
+    return client
 
 
 async def test_fetch_verification_code_returns_code():
     provider = IMAPProvider("user@gmail.com", "pass", "imap.gmail.com")
+    client = _client()
+    client.search = AsyncMock(return_value=_response(lines=[b"1"]))
+    client.fetch = AsyncMock(
+        return_value=_response(lines=[b"Your verification code is 654321."])
+    )
 
-    # Мокаем aioimaplib.IMAP4
-    mock_client = AsyncMock()
-    mock_client.wait_hello_from_server = AsyncMock()
-    mock_client.login = AsyncMock(return_value=_response())
-    mock_client.select = AsyncMock(return_value=_response())
-    mock_client.logout = AsyncMock()
-
-    # SEARCH возвращает UID
-    mock_search_resp = _response(lines=[b"1"])
-    mock_client.search = AsyncMock(return_value=mock_search_resp)
-
-    # FETCH возвращает тело письма
-    mock_fetch_resp = _response(lines=[b"Your verification code is 654321."])
-    mock_client.fetch = AsyncMock(return_value=mock_fetch_resp)
-
-    with patch("app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL", return_value=mock_client) as ctor:
+    with patch(
+        "app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL",
+        return_value=client,
+    ) as constructor:
         code = await provider.fetch_verification_code(timeout=5)
 
     assert code == "654321"
-    assert ctor.call_args.kwargs["ssl_context"] is not None
+    assert constructor.call_args.kwargs["ssl_context"] is not None
+    client.search.assert_awaited_with("ALL", "FROM", "openai.com")
 
 
-async def test_fetch_verification_code_no_messages_returns_none():
+async def test_fetch_verification_code_no_messages_is_no_code():
     provider = IMAPProvider("user@gmail.com", "pass", "imap.gmail.com")
+    client = _client()
+    client.search = AsyncMock(return_value=_response(lines=[]))
 
-    mock_client = AsyncMock()
-    mock_client.wait_hello_from_server = AsyncMock()
-    mock_client.login = AsyncMock(return_value=_response())
-    mock_client.select = AsyncMock(return_value=_response())
-    mock_client.logout = AsyncMock()
-
-    mock_search_resp = _response(lines=[])
-    mock_client.search = AsyncMock(return_value=mock_search_resp)
-
-    with patch("app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL", return_value=mock_client):
-        code = await provider.fetch_verification_code(timeout=1)
-
-    assert code is None
+    with patch(
+        "app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL",
+        return_value=client,
+    ):
+        with pytest.raises(EmailProviderError) as error:
+            await provider.fetch_verification_code(timeout=0)
+    assert error.value.code is EmailErrorCode.NO_CODE
 
 
-async def test_fetch_verification_code_handles_connection_error():
+async def test_fetch_verification_code_classifies_connection_error():
     provider = IMAPProvider("user@gmail.com", "pass", "imap.gmail.com")
+    client = _client()
+    client.wait_hello_from_server = AsyncMock(
+        side_effect=ConnectionRefusedError("refused")
+    )
 
-    mock_client = AsyncMock()
-    mock_client.wait_hello_from_server = AsyncMock(side_effect=ConnectionRefusedError("refused"))
-
-    with patch("app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL", return_value=mock_client):
-        code = await provider.fetch_verification_code(timeout=1)
-
-    assert code is None
+    with patch(
+        "app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL",
+        return_value=client,
+    ):
+        with pytest.raises(EmailProviderError) as error:
+            await provider.fetch_verification_code(timeout=1)
+    assert error.value.code is EmailErrorCode.CONNECTION_FAILED
 
 
 @pytest.mark.parametrize("failed_operation", ["login", "select", "search", "fetch"])
-async def test_protocol_errors_return_none(failed_operation):
+async def test_protocol_errors_are_classified(failed_operation):
     provider = IMAPProvider("user@gmail.com", "pass", "imap.gmail.com")
-    client = AsyncMock()
-    client.wait_hello_from_server = AsyncMock()
-    client.logout = AsyncMock()
-    client.login = AsyncMock(return_value=_response())
-    client.select = AsyncMock(return_value=_response())
+    client = _client()
     client.search = AsyncMock(return_value=_response(lines=[b"1"]))
     client.fetch = AsyncMock(return_value=_response(lines=[b"code 123456"]))
     setattr(client, failed_operation, AsyncMock(return_value=_response("NO", [b"denied"])))
 
-    with patch("app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL", return_value=client):
-        assert await provider.fetch_verification_code(timeout=1) is None
+    with patch(
+        "app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL",
+        return_value=client,
+    ):
+        with pytest.raises(EmailProviderError) as error:
+            await provider.fetch_verification_code(timeout=1)
+    expected = (
+        EmailErrorCode.AUTH_FAILED
+        if failed_operation == "login"
+        else EmailErrorCode.CONNECTION_FAILED
+    )
+    assert error.value.code is expected
+
+
+async def test_outlook_basic_auth_is_explicitly_unsupported():
+    provider = detect_imap_provider("user@outlook.com", "pass")
+    with pytest.raises(EmailProviderError) as error:
+        await provider.preflight()
+    assert error.value.code is EmailErrorCode.UNSUPPORTED
+
+
+async def test_preflight_excludes_old_read_message_and_fetches_new_one():
+    provider = IMAPProvider("user@gmail.com", "pass", "imap.gmail.com")
+    client = _client()
+    client.search = AsyncMock(
+        side_effect=[
+            _response(lines=[b"1"]),
+            _response(lines=[b"1 2"]),
+        ]
+    )
+    client.fetch = AsyncMock(return_value=_response(lines=[b"code 112233"]))
+
+    with patch(
+        "app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL",
+        return_value=client,
+    ):
+        await provider.preflight()
+        assert await provider.fetch_verification_code(timeout=1) == "112233"
+
+    client.fetch.assert_awaited_once_with("2", "(BODY.PEEK[])")
+
+
+async def test_fetch_decodes_mime_encoded_body():
+    provider = IMAPProvider("user@gmail.com", "pass", "imap.gmail.com")
+    client = _client()
+    client.search = AsyncMock(return_value=_response(lines=[b"9"]))
+    raw_message = (
+        b"Subject: Verification code\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"Content-Transfer-Encoding: base64\r\n\r\n"
+        b"WW91ciBjb2RlIGlzIDc3ODg5OQ==\r\n"
+    )
+    client.fetch = AsyncMock(return_value=_response(lines=[raw_message]))
+
+    with patch(
+        "app.integrations.email.imap_provider.aioimaplib.IMAP4_SSL",
+        return_value=client,
+    ):
+        assert await provider.fetch_verification_code(timeout=1) == "778899"

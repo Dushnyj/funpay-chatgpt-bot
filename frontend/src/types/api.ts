@@ -4,9 +4,14 @@ export interface StatusResponse {
 
 export interface Tier {
   id: number
+  code?: string
   name: string
   description: string | null
   is_active: boolean
+  system_managed?: boolean
+  is_sellable?: boolean
+  sort_order?: number
+  usage_multiplier?: number | null
 }
 
 export interface TierCreate {
@@ -30,6 +35,7 @@ export interface LimitScope {
 
 export interface AccountLimits {
   account_id: number
+  plan_type?: string | null
   chat_5h_remaining_pct: number | null
   chat_weekly_remaining_pct: number | null
   codex_5h_remaining_pct: number | null
@@ -41,12 +47,29 @@ export interface AccountLimits {
 export interface Account {
   id: number
   login: string
-  tier_id: number
+  tier_id: number | null
   email: string | null
   subscription_expires_at: string | null
   max_active_rentals: number | null
   status: string
   notes: string | null
+  plan_raw_type?: string | null
+  plan_source?: string | null
+  plan_confidence?: number | null
+  plan_detected_at?: string | null
+  validation_job?: AccountValidationJob | null
+}
+
+export interface AccountValidationJob {
+  id: number
+  status: string
+  job_type: string
+  stage?: string | null
+  error_code?: string | null
+  error_detail?: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
 }
 
 export interface AccountCreate {
@@ -55,7 +78,6 @@ export interface AccountCreate {
   totp_secret?: string
   email?: string
   email_password?: string
-  tier_id: number
   subscription_expires_at?: string
   max_active_rentals?: number
   notes?: string
@@ -65,6 +87,23 @@ export interface TotpExport {
   secret: string
   otpauth_uri: string
   qr_png_base64: string
+}
+
+export interface DeviceAuthSession {
+  session_id: string
+  verification_url: string
+  user_code: string
+  expires_at: string
+  interval_seconds: number
+}
+
+export type DeviceAuthStatusValue = 'pending' | 'completed' | 'failed' | 'expired'
+
+export interface DeviceAuthStatus {
+  status: DeviceAuthStatusValue
+  error_code?: string | null
+  error_detail?: string | null
+  account?: Account | null
 }
 
 export interface PriceMatrixItem {

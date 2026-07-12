@@ -206,7 +206,12 @@ from app.models.catalog import Duration, LimitScope
 from app.models.audit import AuditLog
 from app.models.settings import SellerSettings
 from app.check_job_queue import CheckJobQueue
-from app.services.account_validation import ValidationOutcome, validate_account
+from app.services.account_validation import (
+    AccountValidationError,
+    ValidationCode,
+    ValidationOutcome,
+    validate_account,
+)
 from app.services.account_pool import AccountCriteria, AccountPool
 from app.services.kick_service import KickResult, KickService
 
@@ -216,6 +221,11 @@ _REPLACEABLE_OUTCOMES = {
     ValidationOutcome.LOGIN_FAILED,
     ValidationOutcome.INVALID_2FA,
     ValidationOutcome.SETUP_2FA_FAILED,
+}
+_REPLACEABLE_VALIDATION_CODES = {
+    ValidationCode.INVALID_CREDENTIALS.value,
+    ValidationCode.INVALID_TOTP.value,
+    ValidationCode.OAUTH_REJECTED.value,
 }
 
 
@@ -265,20 +275,34 @@ class ReplaceHandler:
 
         try:
             validation = await self._validator(session, rental.account_id)
+        except AccountValidationError as exc:
+            session.add(AuditLog(
+                event_type="replacement_validation_failed",
+                account_id=rental.account_id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+                metadata_={"stage": exc.stage, "code": exc.code},
+            ))
+            await session.flush()
+            if exc.code not in _REPLACEABLE_VALIDATION_CODES:
+                text = await render_message(session, "seller_called", ctx.lang)
+                await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+                return
+            validation = None
         except Exception as exc:
             session.add(AuditLog(
                 event_type="replacement_validation_failed",
                 account_id=rental.account_id,
                 rental_id=rental.id,
                 chat_id=rental.buyer_funpay_chat_id,
-                metadata_={"error": str(exc)},
+                metadata_={"error_type": type(exc).__name__},
             ))
             await session.flush()
             text = await render_message(session, "seller_called", ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
-        if validation not in _REPLACEABLE_OUTCOMES:
+        if validation is not None and validation not in _REPLACEABLE_OUTCOMES:
             session.add(AuditLog(
                 event_type="replacement_declined",
                 account_id=rental.account_id,

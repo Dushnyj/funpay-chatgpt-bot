@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountLimits
+from app.models.catalog import SubscriptionTier
 from app.models.rental import Rental
 
 
@@ -69,11 +70,18 @@ class AccountPool:
         stmt = (
             select(Account)
             .join(AccountLimits, AccountLimits.account_id == Account.id)
+            .join(SubscriptionTier, SubscriptionTier.id == Account.tier_id)
             .outerjoin(active_rentals, active_rentals.c.account_id == Account.id)
             .where(
                 Account.status == "active",
                 Account.tier_id == criteria.tier_id,
-                Account.subscription_expires_at >= required_expires_at,
+                or_(
+                    Account.subscription_expires_at >= required_expires_at,
+                    and_(
+                        SubscriptionTier.code == "free",
+                        Account.subscription_expires_at.is_(None),
+                    ),
+                ),
                 AccountLimits.measured_at >= fresh_cutoff,
                 AccountLimits.refresh_status == "ok",
                 func.coalesce(

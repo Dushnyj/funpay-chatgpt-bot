@@ -23,8 +23,13 @@ class StatusResponse(BaseModel):
 class TierOut(_Base):
     id: int
     name: str
+    code: str | None = None
     description: str | None = None
     is_active: bool
+    system_managed: bool = True
+    is_sellable: bool = False
+    sort_order: int = 0
+    usage_multiplier: float | None = None
 
 
 class TierCreate(BaseModel):
@@ -34,9 +39,8 @@ class TierCreate(BaseModel):
 
 
 class TierUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=120)
-    description: str | None = Field(default=None, max_length=2000)
     is_active: bool | None = None
+    is_sellable: bool | None = None
 
 
 class DurationOut(_Base):
@@ -60,15 +64,33 @@ class LimitScopeOut(_Base):
 
 # --- Accounts ---
 
+class ValidationJobOut(BaseModel):
+    id: int
+    status: str
+    job_type: str
+    priority: str
+    stage: str | None = None
+    error_code: str | None = None
+    error_detail: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class AccountOut(_Base):
     id: int
     login: str
-    tier_id: int
+    tier_id: int | None = None
     email: str | None = None
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = None
     status: str
     notes: str | None = None
+    plan_raw_type: str | None = None
+    plan_source: str | None = None
+    plan_confidence: float | None = None
+    plan_detected_at: datetime | None = None
+    validation_job: ValidationJobOut | None = None
 
 
 class AccountCreate(BaseModel):
@@ -77,7 +99,6 @@ class AccountCreate(BaseModel):
     totp_secret: str = Field(default="", max_length=256)
     email: str | None = Field(default=None, max_length=320)
     email_password: str | None = Field(default=None, max_length=4096)
-    tier_id: int = Field(gt=0)
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = Field(default=None, ge=1, le=100)
     notes: str | None = Field(default=None, max_length=4000)
@@ -86,7 +107,9 @@ class AccountCreate(BaseModel):
 class AccountUpdate(BaseModel):
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = Field(default=None, ge=1, le=100)
-    status: Literal["pending_validation", "active", "maintenance", "disabled"] | None = None
+    status: Literal[
+        "pending_validation", "validation_failed", "active", "maintenance", "disabled"
+    ] | None = None
     notes: str | None = Field(default=None, max_length=4000)
 
 
@@ -98,10 +121,26 @@ class AccountLimitsOut(_Base):
     codex_weekly_remaining_pct: int | None = None
     refresh_status: str
     measured_at: datetime | None = None
+    plan_type: str | None = None
 
 
 class AccountWithLimits(AccountOut):
     limits: AccountLimitsOut | None = None
+
+
+class DeviceAuthStartOut(BaseModel):
+    session_id: str
+    verification_url: str
+    user_code: str
+    expires_at: datetime
+    interval_seconds: int
+
+
+class DeviceAuthStatusOut(BaseModel):
+    status: Literal["pending", "completed", "failed", "expired"]
+    error_code: str | None = None
+    error_detail: str | None = None
+    account: AccountOut | None = None
 
 
 # --- Price Matrix ---

@@ -3,11 +3,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.message import MessageTemplate
+from app.services.subscription_plans import SYSTEM_SUBSCRIPTION_PLANS
 
 
-DEFAULT_TIERS: tuple[tuple[str, str], ...] = (
-    ("Plus", "ChatGPT Plus"),
-    ("Pro", "ChatGPT Pro"),
+DEFAULT_TIERS: tuple[tuple[str, str], ...] = tuple(
+    (plan.name, plan.description) for plan in SYSTEM_SUBSCRIPTION_PLANS
 )
 DEFAULT_DURATIONS: tuple[int, ...] = (1, 3, 5, 7, 15, 30)
 DEFAULT_LIMIT_SCOPES: tuple[tuple[str, str], ...] = (
@@ -142,14 +142,31 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 
 async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
     """Create the stable catalog defaults without overwriting operator data."""
-    existing_tiers = set(
-        (await session.execute(select(SubscriptionTier.name))).scalars().all()
+    existing_tiers = (
+        (await session.execute(select(SubscriptionTier))).scalars().all()
     )
-    for name, description in DEFAULT_TIERS:
-        if name not in existing_tiers:
-            session.add(
-                SubscriptionTier(name=name, description=description, is_active=True)
+    tiers_by_code = {tier.code: tier for tier in existing_tiers if tier.code}
+    tiers_by_name = {tier.name: tier for tier in existing_tiers}
+    for plan in SYSTEM_SUBSCRIPTION_PLANS:
+        tier = tiers_by_code.get(plan.code) or tiers_by_name.get(plan.name)
+        # Upgrade the old two-tier catalog without creating a second Pro row.
+        if tier is None and plan.code == "pro_20x":
+            tier = tiers_by_name.get("Pro")
+            if tier is not None:
+                tier.name = plan.name
+        if tier is None:
+            tier = SubscriptionTier(
+                code=plan.code,
+                name=plan.name,
+                description=plan.description,
+                is_active=True,
             )
+            session.add(tier)
+        tier.code = plan.code
+        tier.system_managed = True
+        tier.is_sellable = plan.is_sellable
+        tier.sort_order = plan.sort_order
+        tier.usage_multiplier = plan.usage_multiplier
 
     existing_durations = set(
         (await session.execute(select(Duration.days))).scalars().all()

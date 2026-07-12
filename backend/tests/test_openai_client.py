@@ -63,7 +63,7 @@ async def test_get_account_metadata_success(httpx_mock):
         method="GET",
         json={
             "accounts": {
-                "default": {
+                "acc-1": {
                     "account": {"plan_type": "pro"},
                     "entitlement": {"expires_at": "2026-09-01T00:00:00Z"},
                 }

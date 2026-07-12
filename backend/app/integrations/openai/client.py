@@ -34,7 +34,9 @@ class OpenAIClient:
 
     async def get_account_metadata(self) -> AccountMetadata:
         response = await self._request("GET", ACCOUNTS_CHECK_URL)
-        return AccountMetadata.from_accounts_check(response.json())
+        return AccountMetadata.from_accounts_check(
+            response.json(), account_id=self._account_id
+        )
 
     async def _request(self, method: str, url: str) -> httpx.Response:
         assert self._client is not None, "используй async with OpenAIClient(...) as client"

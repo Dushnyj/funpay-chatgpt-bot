@@ -1,3 +1,4 @@
+from sqlalchemy import Boolean, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -10,6 +11,13 @@ class SubscriptionTier(Base):
     name: Mapped[str] = mapped_column(unique=True)
     description: Mapped[str | None] = mapped_column(default=None)
     is_active: Mapped[bool] = mapped_column(default=True)
+    # ``code`` is nullable only for backwards compatibility with operator-created
+    # legacy rows.  Every system tier always has a stable canonical code.
+    code: Mapped[str | None] = mapped_column(String(64), unique=True, default=None)
+    system_managed: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_sellable: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    usage_multiplier: Mapped[float | None] = mapped_column(Float, default=None)
 
 
 class Duration(Base):

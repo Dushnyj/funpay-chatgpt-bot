@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useCreateTier, useDeleteTier, useDurations, useLimitScopes, useTiers } from '../api/catalog'
+import { useDurations, useLimitScopes, useTiers, useUpdateTier } from '../api/catalog'
 import { ApiError } from '../api/client'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
@@ -34,66 +34,56 @@ export default function Tiers() {
 
 function TiersTab() {
   const tiersQuery = useTiers()
-  const createTier = useCreateTier()
-  const deleteTier = useDeleteTier()
-  const [showForm, setShowForm] = useState(false)
-  const [deleteTarget, setDeleteTarget] = useState<Tier | null>(null)
-  const [name, setName] = useState('')
-  const [description, setDescription] = useState('')
+  const updateTier = useUpdateTier()
+  const [updatingTier, setUpdatingTier] = useState<number | null>(null)
   const [error, setError] = useState('')
 
   if (tiersQuery.isLoading) return <LoadingState label="Загружаем тарифы" />
   if (tiersQuery.isError) return <ErrorState onRetry={() => tiersQuery.refetch()} />
 
-  const tiers = tiersQuery.data ?? []
+  const tiers = [...(tiersQuery.data ?? [])].sort((left, right) =>
+    (left.sort_order ?? left.id) - (right.sort_order ?? right.id),
+  )
 
-  const create = async (event: React.FormEvent) => {
-    event.preventDefault()
+  const toggleSellable = async (tier: Tier) => {
     setError('')
+    setUpdatingTier(tier.id)
     try {
-      await createTier.mutateAsync({ name: name.trim(), description: description.trim() || undefined })
-      setName('')
-      setDescription('')
-      setShowForm(false)
+      await updateTier.mutateAsync({ id: tier.id, is_sellable: !(tier.is_sellable ?? tier.is_active) })
     } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Не удалось создать тариф')
-    }
-  }
-
-  const remove = async () => {
-    if (!deleteTarget) return
-    setError('')
-    try {
-      await deleteTier.mutateAsync(deleteTarget.id)
-      setDeleteTarget(null)
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Не удалось удалить тариф')
-      setDeleteTarget(null)
+      setError(cause instanceof ApiError ? cause.message : 'Не удалось изменить доступность тарифа')
+    } finally {
+      setUpdatingTier(null)
     }
   }
 
   return (
     <section className="panel panel--flush">
       <div className="section-toolbar">
-        <div><h2>Тарифы подписок</h2><p>Например Plus, Pro или Team. Используются в аккаунтах и ценовых правилах.</p></div>
-        <button className="button button--primary" onClick={() => setShowForm((value) => !value)}><Icon name={showForm ? 'close' : 'plus'} />{showForm ? 'Закрыть форму' : 'Новый тариф'}</button>
+        <div><h2>Системный каталог тарифов</h2><p>Free, Go, Plus и варианты Pro распознаются автоматически по данным аккаунта.</p></div>
+        <span className="soft-badge"><Icon name="shield" size={14} />Синхронизируется системой</span>
       </div>
+      <div className="form-alert form-alert--info catalog-system-note"><Icon name="activity" /><span>Названия и состав каталога защищены от ручного изменения. Вы можете только разрешить или запретить продажу конкретного тарифа.</span></div>
       {error && <div className="form-alert form-alert--error"><Icon name="warning" /><span>{error}</span></div>}
-      {showForm && (
-        <form className="inline-create-card" onSubmit={create}>
-          <label className="field"><span className="field__label">Название</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Например, Plus" autoFocus required /></label>
-          <label className="field field--grow"><span className="field__label">Описание</span><input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Коротко опишите назначение тарифа" /></label>
-          <button className="button button--primary" type="submit" disabled={createTier.isPending || !name.trim()}>{createTier.isPending ? 'Создаём…' : 'Создать'}</button>
-        </form>
-      )}
       {tiers.length === 0 ? (
-        <EmptyState icon="catalog" title="Тарифов ещё нет" description="Создайте первый тариф, чтобы можно было добавлять аккаунты и настраивать цены." action={<button className="button button--primary" onClick={() => setShowForm(true)}><Icon name="plus" />Создать тариф</button>} />
+        <EmptyState icon="catalog" title="Системный каталог не инициализирован" description="Перезапустите bootstrap backend: тарифы создаются автоматически и не требуют ручного ввода." action={<button className="button button--secondary" onClick={() => tiersQuery.refetch()}><Icon name="refresh" />Обновить</button>} />
       ) : (
-        <TableShell><table className="data-table"><thead><tr><th>Название</th><th>Описание</th><th>Статус</th><th><span className="sr-only">Действия</span></th></tr></thead><tbody>{tiers.map((tier) => (
-          <tr key={tier.id}><td><div className="identity-cell"><span className="identity-avatar identity-avatar--violet">{tier.name.slice(0, 1).toUpperCase()}</span><span><strong>{tier.name}</strong><small>ID {tier.id}</small></span></div></td><td>{tier.description || 'Без описания'}</td><td><StatusBadge value={tier.is_active ? 'active' : 'paused'} /></td><td><div className="row-actions"><button className="icon-button icon-button--danger" onClick={() => setDeleteTarget(tier)} aria-label={`Удалить тариф ${tier.name}`}><Icon name="trash" /></button></div></td></tr>
+        <TableShell><table className="data-table tier-catalog-table"><thead><tr><th>Тариф</th><th>Описание</th><th>Коэффициент</th><th>Состояние</th><th>Продажа</th></tr></thead><tbody>{tiers.map((tier) => (
+          <tr key={tier.id}>
+            <td><div className="identity-cell"><span className="identity-avatar identity-avatar--violet">{tier.name.slice(0, 1).toUpperCase()}</span><span><strong>{tier.name}</strong><small>{tier.code ?? `system-${tier.id}`} · системный</small></span></div></td>
+            <td>{tier.description || 'Канонический план ChatGPT'}</td>
+            <td>{tier.usage_multiplier == null ? '—' : `×${tier.usage_multiplier}`}</td>
+            <td><StatusBadge value={tier.is_active ? 'active' : 'paused'} /></td>
+            <td>
+              <label className="switch-control">
+                <input type="checkbox" checked={tier.is_sellable ?? tier.is_active} onChange={() => toggleSellable(tier)} disabled={updatingTier === tier.id || !tier.is_active} />
+                <span aria-hidden="true" />
+                <strong>{(tier.is_sellable ?? tier.is_active) ? 'Разрешён' : 'Выключен'}</strong>
+              </label>
+            </td>
+          </tr>
         ))}</tbody></table></TableShell>
       )}
-      {deleteTarget && <ConfirmCatalogDelete name={deleteTarget.name} pending={deleteTier.isPending} onCancel={() => setDeleteTarget(null)} onConfirm={remove} />}
     </section>
   )
 }
@@ -131,8 +121,4 @@ function ScopesTab() {
       )}
     </section>
   )
-}
-
-function ConfirmCatalogDelete({ name, pending, onCancel, onConfirm }: { name: string; pending: boolean; onCancel: () => void; onConfirm: () => void }) {
-  return <div className="modal-overlay" role="presentation"><div className="modal modal--compact" role="alertdialog" aria-modal="true"><div className="modal__danger-icon"><Icon name="trash" /></div><h2>Удалить тариф «{name}»?</h2><p>Удаление невозможно, если тариф уже используется аккаунтами, лотами или ценовыми правилами.</p><div className="modal__actions"><button className="button button--secondary" onClick={onCancel}>Отмена</button><button className="button button--danger" onClick={onConfirm} disabled={pending}>{pending ? 'Удаляем…' : 'Удалить'}</button></div></div></div>
 }

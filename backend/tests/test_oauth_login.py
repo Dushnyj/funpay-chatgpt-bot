@@ -15,10 +15,13 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 
 from app.integrations.playwright.oauth_login import (
+    OAuthErrorCode,
     OAuthLoginError,
     _do_post_password_steps,
     _parse_oauth_callback,
+    raise_if_cloudflare,
 )
+from app.integrations.email.provider import EmailErrorCode, EmailProviderError
 
 
 def _make_input_locator(*, raises_on_wait: bool = False) -> MagicMock:
@@ -121,6 +124,24 @@ async def test_post_password_email_code_then_totp():
     assert page.continue_btn.click.await_count == 2
 
 
+async def test_post_password_existing_totp_does_not_mistake_it_for_email_code():
+    page = _make_page([True])
+    page.url = "https://auth.openai.com/mfa"
+    page.text_content = AsyncMock(return_value="Enter code from your authenticator app")
+    provider = _make_email_provider(code="111111")
+
+    await _do_post_password_steps(
+        page,
+        "JBSWY3DPEHPK3PXP",
+        email_provider=provider,
+    )
+
+    provider.fetch_verification_code.assert_not_awaited()
+    assert len(page.inputs) == 1
+    filled_code = page.inputs[0].fill.call_args.args[0]
+    assert filled_code.isdigit() and len(filled_code) == 6
+
+
 async def test_post_password_no_email_code_skips_provider():
     """email_provider задан, но input не появился → провайдер не вызывается."""
     page = _make_page([False, False])  # email-code не появился; totp пуст → 2FA не идём
@@ -161,6 +182,33 @@ async def test_post_password_email_code_none_raises():
 
     with pytest.raises(OAuthLoginError):
         await _do_post_password_steps(page, totp_secret="", email_provider=provider)
+
+
+async def test_email_provider_error_keeps_safe_machine_code():
+    page = _make_page([True])
+    provider = _make_email_provider()
+    provider.fetch_verification_code.side_effect = EmailProviderError(
+        EmailErrorCode.AUTH_FAILED,
+        "Почтовый сервер отклонил логин или пароль приложения.",
+    )
+
+    with pytest.raises(OAuthLoginError) as error:
+        await _do_post_password_steps(page, totp_secret="", email_provider=provider)
+    assert error.value.code is OAuthErrorCode.EMAIL_AUTH_FAILED
+    assert error.value.stage == "email_code"
+
+
+async def test_cloudflare_is_detected_without_bypass_attempt():
+    page = MagicMock()
+    page.url = "https://auth.openai.com/cdn-cgi/challenge-platform/"
+    page.title = AsyncMock(return_value="Just a moment...")
+    page.text_content = AsyncMock(return_value="Verify you are human")
+    page.query_selector = AsyncMock(return_value=object())
+
+    with pytest.raises(OAuthLoginError) as error:
+        await raise_if_cloudflare(page, "authorize")
+    assert error.value.code is OAuthErrorCode.CLOUDFLARE_CHALLENGE
+    assert error.value.stage == "authorize"
 
 
 async def test_login_and_get_auth_code_backward_compat_positional(monkeypatch):
@@ -225,9 +273,10 @@ def test_parse_oauth_callback_validates_state_and_endpoint():
 
 
 def test_parse_oauth_callback_propagates_provider_error():
-    with pytest.raises(OAuthLoginError, match="access denied"):
+    with pytest.raises(OAuthLoginError, match="отказал в авторизации") as error:
         _parse_oauth_callback(
             "http://localhost:1455/auth/callback?error=access_denied"
             "&error_description=access%20denied&state=expected",
             "expected",
         )
+    assert "access denied" not in error.value.detail

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import re
 from typing import Protocol, runtime_checkable
 
@@ -8,12 +9,32 @@ from typing import Protocol, runtime_checkable
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 
 
+class EmailErrorCode(str, enum.Enum):
+    AUTH_FAILED = "email_auth_failed"
+    NO_CODE = "email_code_not_found"
+    UNSUPPORTED = "email_provider_unsupported"
+    CONNECTION_FAILED = "email_connection_failed"
+
+
+class EmailProviderError(RuntimeError):
+    """Safe, stage-aware failure from an email verification provider."""
+
+    def __init__(self, code: EmailErrorCode, detail: str) -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(detail)
+
+
 @runtime_checkable
 class EmailProvider(Protocol):
     """Абстракция источника email-кодов для подтверждения логина OpenAI."""
 
+    async def preflight(self) -> None:
+        """Проверяет доступ и запоминает уже существующие письма."""
+        ...
+
     async def fetch_verification_code(self, timeout: float = 60.0) -> str | None:
-        """Ждёт письмо с кодом от OpenAI, возвращает код или None при таймауте."""
+        """Ждёт новый код OpenAI; при диагностируемом сбое поднимает ошибку."""
         ...
 
 

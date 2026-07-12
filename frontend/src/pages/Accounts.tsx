@@ -1,16 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
-import { useAccounts, useCreateAccount, useDeleteAccount } from '../api/accounts'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { getDeviceAuthStatus, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useStartDeviceAuth } from '../api/accounts'
 import { useTiers } from '../api/catalog'
 import { api, ApiError } from '../api/client'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
-import type { Account, Tier, TotpExport } from '../types/api'
+import type { Account, DeviceAuthSession, DeviceAuthStatus, TotpExport } from '../types/api'
 import { formatDate } from '../utils/format'
 
 export default function Accounts() {
   const accountsQuery = useAccounts()
   const tiersQuery = useTiers()
   const deleteAccount = useDeleteAccount()
+  const recheckAccount = useRecheckAccount()
+  const startDeviceAuthMutation = useStartDeviceAuth()
+  const refetchAccounts = accountsQuery.refetch
   const [showForm, setShowForm] = useState(false)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('all')
@@ -18,6 +21,10 @@ export default function Accounts() {
   const [totpLoading, setTotpLoading] = useState<number | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Account | null>(null)
   const [actionError, setActionError] = useState('')
+  const [actionSuccess, setActionSuccess] = useState('')
+  const [recheckTarget, setRecheckTarget] = useState<number | null>(null)
+  const [deviceAuthTarget, setDeviceAuthTarget] = useState<number | null>(null)
+  const [deviceAuthModal, setDeviceAuthModal] = useState<{ account: Account; session: DeviceAuthSession } | null>(null)
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])
   const tiers = tiersQuery.data ?? []
@@ -25,17 +32,27 @@ export default function Accounts() {
     const query = search.trim().toLowerCase()
     return accounts.filter((account) => {
       const matchesSearch = !query || account.login.toLowerCase().includes(query) || account.email?.toLowerCase().includes(query)
-      const matchesStatus = status === 'all' || account.status === status
+      const matchesStatus = status === 'all' || validationState(account) === status
       return matchesSearch && matchesStatus
     })
   }, [accounts, search, status])
 
+  const completeDeviceAuth = useCallback(async () => {
+    setDeviceAuthModal(null)
+    setActionError('')
+    setActionSuccess('Вход подтверждён. Аккаунт и его тариф успешно обновлены.')
+    await refetchAccounts()
+  }, [refetchAccounts])
+
   if (accountsQuery.isLoading) return <LoadingState label="Загружаем пул аккаунтов" />
   if (accountsQuery.isError) return <ErrorState onRetry={() => accountsQuery.refetch()} />
 
-  const tierName = (id: number) => tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
-  const activeCount = accounts.filter((account) => account.status === 'active').length
-  const attentionCount = accounts.filter((account) => ['maintenance', 'banned'].includes(account.status)).length
+  const tierName = (id: number | null) => id === null
+    ? 'Определяется'
+    : tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
+  const activeCount = accounts.filter((account) => validationState(account) === 'active').length
+  const attentionCount = accounts.filter((account) => validationState(account) === 'validation_failed').length
+  const hasDeviceAuthCandidate = accounts.some(isDeviceAuthEligible)
 
   const exportTotp = async (account: Account) => {
     setActionError('')
@@ -62,6 +79,46 @@ export default function Accounts() {
     }
   }
 
+  const recheck = async (account: Account) => {
+    setActionError('')
+    setActionSuccess('')
+    setRecheckTarget(account.id)
+    try {
+      await recheckAccount.mutateAsync(account.id)
+    } catch (cause) {
+      setActionError(cause instanceof ApiError ? cause.message : 'Не удалось повторно запустить проверку')
+    } finally {
+      setRecheckTarget(null)
+    }
+  }
+
+  const startDeviceAuth = async (account: Account) => {
+    setActionError('')
+    setActionSuccess('')
+    setDeviceAuthTarget(account.id)
+
+    // Открываем вкладку прямо из пользовательского клика, иначе браузер может
+    // заблокировать её как popup после завершения сетевого запроса.
+    const authTab = window.open('about:blank', '_blank')
+    if (authTab) authTab.opener = null
+
+    try {
+      const session = await startDeviceAuthMutation.mutateAsync(account.id)
+      const verificationUrl = normalizeVerificationUrl(session.verification_url)
+      if (authTab) {
+        authTab.location.replace(verificationUrl)
+      } else {
+        window.open(verificationUrl, '_blank', 'noopener,noreferrer')
+      }
+      setDeviceAuthModal({ account, session: { ...session, verification_url: verificationUrl } })
+    } catch (cause) {
+      authTab?.close()
+      setActionError(cause instanceof ApiError ? cause.message : 'Не удалось начать проверку через браузер')
+    } finally {
+      setDeviceAuthTarget(null)
+    }
+  }
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -69,7 +126,7 @@ export default function Accounts() {
         title="Аккаунты"
         description="ChatGPT-аккаунты, их готовность к выдаче и состояние проверки."
         actions={
-          <button className="button button--primary" onClick={() => setShowForm(true)} disabled={!tiers.length} title={!tiers.length ? 'Сначала создайте тариф' : undefined}>
+          <button className="button button--primary" onClick={() => setShowForm(true)}>
             <Icon name="plus" />Добавить аккаунт
           </button>
         }
@@ -78,14 +135,15 @@ export default function Accounts() {
       <section className="summary-strip" aria-label="Сводка по аккаунтам">
         <div><span>Всего в пуле</span><strong>{accounts.length}</strong></div>
         <div><span className="summary-dot summary-dot--success" /> <span>Активны</span><strong>{activeCount}</strong></div>
-        <div><span className="summary-dot summary-dot--warning" /> <span>Проверяются</span><strong>{accounts.filter((account) => account.status === 'pending_validation').length}</strong></div>
+        <div><span className="summary-dot summary-dot--warning" /> <span>Определяются</span><strong>{accounts.filter((account) => validationState(account) === 'detecting').length}</strong></div>
         <div><span className="summary-dot summary-dot--danger" /> <span>Требуют внимания</span><strong>{attentionCount}</strong></div>
       </section>
 
-      {!tiers.length && (
-        <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Перед добавлением аккаунта создайте хотя бы один тариф в разделе «Справочники».</span></div>
-      )}
       {actionError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{actionError}</span></div>}
+      {actionSuccess && <div className="form-alert form-alert--success" role="status"><Icon name="check" /><span>{actionSuccess}</span></div>}
+      {hasDeviceAuthCandidate && !actionSuccess && (
+        <div className="form-alert form-alert--info"><Icon name="activity" /><span>Проверка через браузер — основной способ: вы подтверждаете вход в OpenAI лично. «Повторить автоматически» запускает headless-вход, который защита OpenAI может заблокировать.</span></div>
+      )}
 
       <section className="panel panel--flush">
         <div className="toolbar">
@@ -98,9 +156,8 @@ export default function Accounts() {
             <select value={status} onChange={(event) => setStatus(event.target.value)}>
               <option value="all">Все статусы</option>
               <option value="active">Активные</option>
-              <option value="pending_validation">Проверяются</option>
-              <option value="maintenance">Обслуживание</option>
-              <option value="banned">Заблокированные</option>
+              <option value="detecting">Определяются</option>
+              <option value="validation_failed">Ошибка проверки</option>
             </select>
             <Icon name="chevron-down" size={15} />
           </label>
@@ -112,26 +169,36 @@ export default function Accounts() {
             icon="accounts"
             title="Пул аккаунтов пуст"
             description="Добавьте первый ChatGPT-аккаунт. После сохранения система должна поставить его в очередь безопасной проверки."
-            action={tiers.length ? <button className="button button--primary" onClick={() => setShowForm(true)}><Icon name="plus" />Добавить аккаунт</button> : undefined}
+            action={<button className="button button--primary" onClick={() => setShowForm(true)}><Icon name="plus" />Добавить аккаунт</button>}
           />
         ) : filteredAccounts.length === 0 ? (
           <EmptyState icon="search" title="Ничего не найдено" description="Измените строку поиска или фильтр статуса." />
         ) : (
           <TableShell>
             <table className="data-table accounts-table">
-              <thead><tr><th>Аккаунт</th><th>Тариф</th><th>Подписка</th><th>Лимит аренд</th><th>Состояние</th><th><span className="sr-only">Действия</span></th></tr></thead>
+              <thead><tr><th>Аккаунт</th><th>Определённый план</th><th>Подписка</th><th>Лимит аренд</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
               <tbody>
                 {filteredAccounts.map((account) => (
                   <tr key={account.id}>
                     <td>
                       <div className="identity-cell"><span className="identity-avatar">{account.login.slice(0, 1).toUpperCase()}</span><span><strong>{account.login}</strong><small>{account.email ?? 'Email для восстановления не задан'}</small></span></div>
                     </td>
-                    <td><span className="soft-badge">{tierName(account.tier_id)}</span></td>
+                    <td><PlanDetection account={account} tierName={tierName(account.tier_id)} /></td>
                     <td>{formatDate(account.subscription_expires_at)}</td>
                     <td>{account.max_active_rentals ?? 'По умолчанию'}</td>
-                    <td><StatusBadge value={account.status} /></td>
+                    <td><ValidationStatus account={account} /></td>
                     <td>
                       <div className="row-actions">
+                        {isDeviceAuthEligible(account) && (
+                          <button className="button button--primary button--compact" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Проверить ${account.login} через браузер`}>
+                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}Проверить через браузер
+                          </button>
+                        )}
+                        {!isValidationInProgress(account) && (
+                          <button className="button button--secondary button--compact" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Автоматический вход без браузера может быть заблокирован защитой OpenAI">
+                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}Повторить автоматически
+                          </button>
+                        )}
                         <button className="icon-button" onClick={() => exportTotp(account)} disabled={totpLoading === account.id || account.status !== 'active'} aria-label={`Экспорт TOTP для ${account.login}`} title="Экспорт TOTP">
                           {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" />}
                         </button>
@@ -148,8 +215,15 @@ export default function Accounts() {
         )}
       </section>
 
-      {showForm && <AddAccountDialog tiers={tiers} onClose={() => setShowForm(false)} />}
+      {showForm && <AddAccountDialog onClose={() => setShowForm(false)} />}
       {totpModal && <TotpDialog modal={totpModal} onClose={() => setTotpModal(null)} />}
+      {deviceAuthModal && (
+        <DeviceAuthDialog
+          modal={deviceAuthModal}
+          onClose={() => setDeviceAuthModal(null)}
+          onCompleted={completeDeviceAuth}
+        />
+      )}
       {deleteTarget && (
         <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setDeleteTarget(null)}>
           <div className="modal modal--compact" role="alertdialog" aria-modal="true" aria-labelledby="delete-account-title">
@@ -167,25 +241,122 @@ export default function Accounts() {
   )
 }
 
-function AddAccountDialog({ tiers, onClose }: { tiers: Tier[]; onClose: () => void }) {
+function isDeviceAuthEligible(account: Account) {
+  const state = validationState(account)
+  return state === 'validation_failed' || state === 'detecting' || state === 'pending'
+}
+
+function normalizeVerificationUrl(value: string) {
+  const url = new URL(value)
+  if (url.protocol !== 'https:') throw new Error('OpenAI вернул небезопасный адрес страницы входа')
+  return url.toString()
+}
+
+function isValidationInProgress(account: Account) {
+  const jobStatus = account.validation_job?.status
+  if (jobStatus) return jobStatus === 'pending'
+    || jobStatus === 'running'
+    || jobStatus === 'processing'
+  return account.status === 'pending_validation'
+}
+
+function validationState(account: Account) {
+  if (account.validation_job?.status === 'failed' || account.status === 'validation_failed') return 'validation_failed'
+  if (isValidationInProgress(account)) return 'detecting'
+  return account.status
+}
+
+function PlanDetection({ account, tierName }: { account: Account; tierName: string }) {
+  const details = [
+    account.plan_raw_type ? `raw: ${account.plan_raw_type}` : null,
+    account.plan_source ? `источник: ${humanizePlanSource(account.plan_source)}` : null,
+    account.plan_confidence != null ? `уверенность: ${formatConfidence(account.plan_confidence)}` : null,
+  ].filter(Boolean)
+
+  return (
+    <div className="plan-detection">
+      <span className={`soft-badge ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName}</span>
+      {details.length > 0 && <small>{details.join(' · ')}</small>}
+      {account.plan_detected_at && <small>Определён {formatDate(account.plan_detected_at)}</small>}
+    </div>
+  )
+}
+
+function humanizePlanSource(source: string) {
+  const labels: Record<string, string> = {
+    accounts_check: 'OpenAI account',
+    wham_usage: 'OpenAI usage',
+    id_token: 'OpenAI ID token',
+    account_api: 'OpenAI API',
+    usage_api: 'Usage API',
+    heuristic: 'сопоставление',
+  }
+  return source.split('+').map((item) => labels[item] ?? item).join(' + ')
+}
+
+function formatConfidence(value: number) {
+  const percent = value <= 1 ? value * 100 : value
+  return `${Math.round(percent)}%`
+}
+
+function ValidationStatus({ account }: { account: Account }) {
+  const job = account.validation_job
+  const state = validationState(account)
+  const label = state === 'detecting'
+    ? 'Определяется'
+    : state === 'validation_failed'
+      ? 'Ошибка проверки'
+      : undefined
+
+  return (
+    <div className="validation-state">
+      <StatusBadge value={state} label={label} />
+      {job?.stage && <small>Этап: {humanizeValidationStage(job.stage)}</small>}
+      {state === 'validation_failed' && (job?.error_detail || job?.error_code) && (
+        <small className="validation-state__error" title={job.error_detail ?? job.error_code ?? undefined}>
+          {job.error_detail ?? humanizeValidationError(job.error_code ?? '')}
+        </small>
+      )}
+    </div>
+  )
+}
+
+function humanizeValidationStage(stage: string) {
+  const labels: Record<string, string> = {
+    queued: 'ожидание в очереди',
+    login: 'вход в ChatGPT',
+    two_factor: 'двухфакторная защита',
+    oauth: 'получение сессии',
+    plan_detection: 'определение тарифа',
+    limits: 'проверка лимитов',
+    completed: 'завершено',
+  }
+  return labels[stage] ?? stage.replaceAll('_', ' ')
+}
+
+function humanizeValidationError(code: string) {
+  const labels: Record<string, string> = {
+    invalid_credentials: 'Неверный логин или пароль',
+    totp_failed: 'Не удалось подтвердить код 2FA',
+    setup_2fa_failed: 'Не удалось настроить 2FA',
+    email_code_failed: 'Не удалось получить код из почты',
+    login_failed: 'Не удалось войти в ChatGPT',
+    plan_detection_failed: 'Не удалось определить тариф',
+  }
+  return labels[code] ?? code.replaceAll('_', ' ')
+}
+
+function AddAccountDialog({ onClose }: { onClose: () => void }) {
   const createAccount = useCreateAccount()
   const [mode, setMode] = useState<'totp' | 'email'>('totp')
   const [error, setError] = useState('')
   const [form, setForm] = useState({
-    login: '', password: '', totp_secret: '', email: '', email_password: '', tier_id: tiers[0]?.id ?? 0,
+    login: '', password: '', totp_secret: '', email: '', email_password: '',
   })
-
-  useEffect(() => {
-    if (!form.tier_id && tiers[0]) setForm((current) => ({ ...current, tier_id: tiers[0].id }))
-  }, [tiers, form.tier_id])
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault()
     setError('')
-    if (!form.tier_id) {
-      setError('Сначала выберите тариф.')
-      return
-    }
     if (mode === 'totp' && !form.totp_secret.trim()) {
       setError('Укажите TOTP setup key или выберите настройку через email.')
       return
@@ -216,11 +387,12 @@ function AddAccountDialog({ tiers, onClose }: { tiers: Tier[]; onClose: () => vo
         </div>
         <form onSubmit={submit} className="form-stack">
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
-          <div className="form-grid form-grid--3">
+          <div className="form-grid">
             <label className="field"><span className="field__label">Логин ChatGPT</span><input value={form.login} onChange={(event) => setForm({ ...form, login: event.target.value })} placeholder="name@example.com" autoComplete="off" required /></label>
             <label className="field"><span className="field__label">Пароль ChatGPT</span><input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Пароль аккаунта" autoComplete="new-password" required /></label>
-            <label className="field"><span className="field__label">Тариф</span><select value={form.tier_id} onChange={(event) => setForm({ ...form, tier_id: Number(event.target.value) })} required><option value={0} disabled>Выберите тариф</option>{tiers.map((tier) => <option key={tier.id} value={tier.id}>{tier.name}</option>)}</select></label>
           </div>
+
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>План назначать вручную не нужно: система определит Free, Go, Plus или вариант Pro по данным самого аккаунта во время проверки.</span></div>
 
           <fieldset className="segmented-fieldset">
             <legend>Как настроить двухфакторную защиту</legend>
@@ -239,7 +411,7 @@ function AddAccountDialog({ tiers, onClose }: { tiers: Tier[]; onClose: () => vo
             </div>
           )}
 
-          <div className="form-alert form-alert--info"><Icon name="activity" /><span>После сохранения аккаунт должен попасть в очередь первичной проверки. Сейчас этот backend-trigger требует доработки и отмечен в ревью.</span></div>
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>После сохранения аккаунт попадёт в очередь первичной проверки. Статус и этапы будут обновляться автоматически.</span></div>
           <div className="modal__actions"><button type="button" className="button button--secondary" onClick={onClose}>Отмена</button><button type="submit" className="button button--primary" disabled={createAccount.isPending}>{createAccount.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <>Добавить аккаунт<Icon name="arrow-right" /></>}</button></div>
         </form>
       </div>
@@ -274,4 +446,129 @@ function TotpDialog({ modal, onClose }: { modal: { account: Account; data: TotpE
       </div>
     </div>
   )
+}
+
+function DeviceAuthDialog({
+  modal,
+  onClose,
+  onCompleted,
+}: {
+  modal: { account: Account; session: DeviceAuthSession }
+  onClose: () => void
+  onCompleted: () => Promise<void>
+}) {
+  const [result, setResult] = useState<DeviceAuthStatus>({ status: 'pending' })
+  const [pollError, setPollError] = useState('')
+  const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState('')
+  const intervalMs = Math.max(1, modal.session.interval_seconds) * 1_000
+
+  useEffect(() => {
+    let cancelled = false
+    let timer: number | undefined
+
+    const poll = async () => {
+      try {
+        const next = await getDeviceAuthStatus(modal.account.id, modal.session.session_id)
+        if (cancelled) return
+        setPollError('')
+        setResult(next)
+        if (next.status === 'completed') {
+          await onCompleted()
+          return
+        }
+        if (next.status === 'pending') timer = window.setTimeout(poll, intervalMs)
+      } catch (cause) {
+        if (cancelled) return
+        if (cause instanceof ApiError && cause.status === 404) {
+          setResult({ status: 'failed', error_code: 'device_auth_state_lost', error_detail: cause.message })
+          return
+        }
+        setPollError(cause instanceof ApiError ? cause.message : 'Не удалось получить состояние проверки')
+        timer = window.setTimeout(poll, intervalMs)
+      }
+    }
+
+    timer = window.setTimeout(poll, intervalMs)
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [intervalMs, modal.account.id, modal.session.session_id, onCompleted])
+
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  const copyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(modal.session.user_code)
+      setCopyError('')
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1600)
+    } catch {
+      setCopyError('Не удалось скопировать код автоматически. Выделите его вручную.')
+    }
+  }
+
+  const failed = result.status === 'failed' || result.status === 'expired'
+  const errorText = result.status === 'expired'
+    ? 'Срок действия кода истёк. Закройте окно и начните проверку заново.'
+    : result.error_detail ?? humanizeDeviceAuthError(result.error_code ?? '')
+
+  return (
+    <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="modal device-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="device-auth-title">
+        <div className="modal__header">
+          <div><span className="eyebrow">Проверка с вашим участием</span><h2 id="device-auth-title">Подтвердите вход в браузере</h2><p>Страница входа открыта в новой вкладке. Аккаунт обновится автоматически после подтверждения.</p></div>
+          <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>
+        </div>
+
+        <div className="form-alert form-alert--info"><Icon name="shield" /><span>На открывшейся странице введите только этот одноразовый код. Пароль и другие данные в админ-панели повторно вводить не нужно.</span></div>
+
+        <div className="device-auth-code" aria-label={`Одноразовый код ${modal.session.user_code}`}>
+          <span>{modal.session.user_code}</span>
+          <button type="button" onClick={copyCode}><Icon name={copied ? 'check' : 'copy'} />{copied ? 'Скопировано' : 'Копировать код'}</button>
+        </div>
+
+        <div className={`device-auth-status ${failed ? 'device-auth-status--error' : ''}`} role={failed ? 'alert' : 'status'}>
+          {result.status === 'pending' && <span className="spinner" />}
+          {failed && <Icon name="warning" />}
+          <div>
+            <strong>{result.status === 'pending' ? 'Ожидаем подтверждение' : result.status === 'expired' ? 'Код просрочен' : 'Проверка не завершена'}</strong>
+            <p>{failed ? errorText : `Проверяем автоматически каждые ${Math.max(1, modal.session.interval_seconds)} сек. Код действует до ${formatDeviceAuthExpiry(modal.session.expires_at)}.`}</p>
+          </div>
+        </div>
+
+        {pollError && <div className="form-alert form-alert--warning" role="status"><Icon name="warning" /><span>{pollError}. Повторим запрос автоматически.</span></div>}
+        {copyError && <div className="form-alert form-alert--warning" role="status"><Icon name="warning" /><span>{copyError}</span></div>}
+
+        <div className="modal__actions">
+          <button className="button button--secondary" onClick={onClose}>Закрыть</button>
+          <a className="button button--primary" href={modal.session.verification_url} target="_blank" rel="noreferrer"><Icon name="external" />Открыть страницу входа</a>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function formatDeviceAuthExpiry(value: string) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return 'истечения сессии'
+  return new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(date)
+}
+
+function humanizeDeviceAuthError(code: string) {
+  const labels: Record<string, string> = {
+    access_denied: 'Вход был отклонён на странице OpenAI.',
+    authorization_declined: 'Подтверждение входа отменено.',
+    expired_token: 'Одноразовый код больше не действует.',
+    invalid_grant: 'OpenAI отклонил или уже использовал этот код.',
+    login_failed: 'OpenAI не подтвердил вход в аккаунт.',
+    plan_detection_failed: 'Вход выполнен, но тариф аккаунта определить не удалось.',
+    device_auth_state_lost: 'Состояние проверки потеряно. Начните вход заново.',
+  }
+  return labels[code] ?? (code ? code.replaceAll('_', ' ') : 'OpenAI не подтвердил вход. Начните проверку заново.')
 }

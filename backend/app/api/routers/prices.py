@@ -60,6 +60,6 @@ async def update_prices(
         except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"Prices saved, but FunPay reconciliation failed: {exc}",
+                detail="Prices saved, but FunPay reconciliation failed",
             ) from exc
     return PriceUpdateResponse(updated=len(req.items))

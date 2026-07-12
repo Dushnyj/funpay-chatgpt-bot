@@ -1,8 +1,13 @@
+from __future__ import annotations
+
 import enum
+import json
+import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.email.imap_provider import detect_imap_provider
+from app.integrations.email.provider import EmailProvider, EmailProviderError
 from app.integrations.openai.oauth import (
     IdTokenClaims,
     exchange_code_for_tokens,
@@ -15,53 +20,168 @@ from app.models.account import Account, AccountLimits
 from app.services.account_limits import MeasureResult, measure_account_limits
 from app.services.totp import is_valid_base32
 
+logger = logging.getLogger(__name__)
+
 _REDIRECT_URI = "http://localhost:1455/auth/callback"
 
 
-class ValidationOutcome(enum.Enum):
+class ValidationOutcome(str, enum.Enum):
+    """Successful terminal outcome. Failures use ``AccountValidationError``."""
+
     OK = "ok"
+    # Compatibility for injected validators used by the replacement handler.
+    # validate_account itself never returns these failure values anymore.
     LOGIN_FAILED = "login_failed"
     MEASURE_FAILED = "measure_failed"
-    INVALID_2FA = "invalid_2fa"  # totp_secret кривой или нет данных для включения
-    SETUP_2FA_FAILED = "setup_2fa_failed"  # попытка включить 2FA провалилась
+    INVALID_2FA = "invalid_2fa"
+    SETUP_2FA_FAILED = "setup_2fa_failed"
+
+
+class ValidationStage(str, enum.Enum):
+    INPUT = "input"
+    EMAIL_PREFLIGHT = "email_preflight"
+    LOGIN = "login"
+    SETUP_2FA = "setup_2fa"
+    TOKEN_EXCHANGE = "token_exchange"
+    LIMIT_MEASUREMENT = "limit_measurement"
+    INTERNAL = "internal"
+
+
+class ValidationCode(str, enum.Enum):
+    INVALID_TOTP = "invalid_totp"
+    MISSING_2FA_DATA = "missing_2fa_data"
+    INVALID_CREDENTIALS = "invalid_credentials"
+    LOGIN_TIMEOUT = "login_timeout"
+    OAUTH_REJECTED = "oauth_rejected"
+    OAUTH_CALLBACK_INVALID = "oauth_callback_invalid"
+    CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
+    EMAIL_AUTH_FAILED = "email_auth_failed"
+    EMAIL_CODE_NOT_FOUND = "email_code_not_found"
+    EMAIL_PROVIDER_UNSUPPORTED = "email_provider_unsupported"
+    EMAIL_CONNECTION_FAILED = "email_connection_failed"
+    SETUP_2FA_FAILED = "setup_2fa_failed"
+    SETUP_2FA_UI_TIMEOUT = "setup_2fa_ui_timeout"
+    SETUP_2FA_BUTTON_NOT_FOUND = "setup_2fa_button_not_found"
+    SETUP_2FA_QR_NOT_FOUND = "setup_2fa_qr_not_found"
+    SETUP_2FA_QR_INVALID = "setup_2fa_qr_invalid"
+    TOKEN_EXCHANGE_FAILED = "token_exchange_failed"
+    MEASURE_FAILED = "measure_failed"
+    INTERNAL_ERROR = "internal_error"
+
+
+class AccountValidationError(RuntimeError):
+    """A secret-free validation failure persisted verbatim in the job record."""
+
+    def __init__(
+        self,
+        stage: ValidationStage | str,
+        code: ValidationCode | str,
+        detail: str,
+    ) -> None:
+        self.stage = stage.value if isinstance(stage, ValidationStage) else stage
+        self.code = code.value if isinstance(code, ValidationCode) else code
+        self.detail = detail
+        super().__init__(detail)
+
+    def as_dict(self) -> dict[str, str]:
+        return {"stage": self.stage, "code": self.code, "detail": self.detail}
+
+    def to_json(self) -> str:
+        return json.dumps(self.as_dict(), ensure_ascii=False, separators=(",", ":"))
 
 
 async def validate_account(session: AsyncSession, account_id: int) -> ValidationOutcome:
-    """Первичная валидация аккаунта через Playwright OAuth flow.
+    """Run the complete login, token and limits validation pipeline.
 
-    Ветвление по 2FA:
-      - totp_secret валиден → обычный flow с существующим TOTP.
-      - totp_secret кривой → INVALID_2FA.
-      - totp_secret пуст + email задан → пробуем включить 2FA автоматически.
-      - иначе → INVALID_2FA (нечем работать).
+    ``active`` is written only after all stages succeed. Every diagnosed failure
+    marks the account ``validation_failed`` and raises ``AccountValidationError``
+    so the worker can persist a structured, user-facing reason on the job.
     """
     account = await session.get(Account, account_id)
     if account is None:
         raise ValueError(f"Account not found: {account_id}")
 
-    login = account.login
-    password = account.password_encrypted
-    totp_secret = account.totp_secret_encrypted
-    email = account.email
-    email_password = (
-        account.email_password_encrypted if account.email_password_encrypted else None
-    )
+    try:
+        login = account.login
+        password = account.password_encrypted
+        totp_secret = account.totp_secret_encrypted
+        email = account.email
+        email_password = account.email_password_encrypted or None
 
-    # Ветвление по 2FA
-    if totp_secret and is_valid_base32(totp_secret):
-        # Обычный flow с существующим TOTP
-        return await _validate_with_existing_totp(session, account, login, password, totp_secret)
-    elif totp_secret and not is_valid_base32(totp_secret):
-        # Секрет передан но кривой
-        return ValidationOutcome.INVALID_2FA
-    elif email and email_password:
-        # Нет TOTP, но есть email → пробуем включить 2FA
-        return await _validate_and_enable_2fa(
-            session, account, login, password, email, email_password
+        if totp_secret and not is_valid_base32(totp_secret):
+            raise AccountValidationError(
+                ValidationStage.INPUT,
+                ValidationCode.INVALID_TOTP,
+                "Сохранённый TOTP-секрет имеет неверный формат.",
+            )
+
+        email_provider = await _prepare_email_provider(email, email_password)
+
+        if totp_secret:
+            return await _validate_with_existing_totp(
+                session,
+                account,
+                login,
+                password,
+                totp_secret,
+                email_provider,
+            )
+        if email_provider is not None:
+            return await _validate_and_enable_2fa(
+                session,
+                account,
+                login,
+                password,
+                email_provider,
+            )
+
+        raise AccountValidationError(
+            ValidationStage.INPUT,
+            ValidationCode.MISSING_2FA_DATA,
+            "Нужен корректный TOTP-секрет либо почта с паролем приложения.",
         )
-    else:
-        # Нет TOTP и нет email — нечем работать
-        return ValidationOutcome.INVALID_2FA
+    except AccountValidationError:
+        account.status = "validation_failed"
+        await session.flush()
+        raise
+    except Exception as exc:
+        account.status = "validation_failed"
+        await session.flush()
+        logger.exception("Unexpected account validation failure for account %s", account_id)
+        raise AccountValidationError(
+            ValidationStage.INTERNAL,
+            ValidationCode.INTERNAL_ERROR,
+            "Внутренняя ошибка проверки аккаунта.",
+        ) from exc
+
+
+async def _prepare_email_provider(
+    email: str | None,
+    email_password: str | None,
+) -> EmailProvider | None:
+    if not email or not email_password:
+        return None
+
+    provider = detect_imap_provider(email, email_password)
+    try:
+        await provider.preflight()
+    except EmailProviderError as exc:
+        raise AccountValidationError(
+            ValidationStage.EMAIL_PREFLIGHT,
+            exc.code.value,
+            exc.detail,
+        ) from exc
+    except Exception as exc:
+        raise AccountValidationError(
+            ValidationStage.EMAIL_PREFLIGHT,
+            ValidationCode.EMAIL_CONNECTION_FAILED,
+            "Не удалось подключиться к почтовому серверу.",
+        ) from exc
+    return provider
+
+
+def _from_oauth_error(exc: OAuthLoginError) -> AccountValidationError:
+    return AccountValidationError(exc.stage, exc.code.value, exc.detail)
 
 
 async def _validate_with_existing_totp(
@@ -70,18 +190,21 @@ async def _validate_with_existing_totp(
     login: str,
     password: str,
     totp_secret: str,
+    email_provider: EmailProvider | None,
 ) -> ValidationOutcome:
-    """Текущий flow: логин с существующим TOTP → токены → замер лимитов."""
-    # Playwright OAuth flow: получаем auth code + PKCE verifier одним вызовом
     try:
         async with browser_context() as context:
             auth_code, code_verifier = await login_and_get_auth_code(
-                context, login, password, totp_secret
+                context,
+                login,
+                password,
+                totp_secret,
+                email_provider=email_provider,
             )
-            tokens = await exchange_code_for_tokens(auth_code, code_verifier, _REDIRECT_URI)
-    except OAuthLoginError:
-        return ValidationOutcome.LOGIN_FAILED
+    except OAuthLoginError as exc:
+        raise _from_oauth_error(exc) from exc
 
+    tokens = await _exchange_tokens(auth_code, code_verifier)
     return await _save_tokens_and_measure(session, account, tokens)
 
 
@@ -90,32 +213,39 @@ async def _validate_and_enable_2fa(
     account: Account,
     login: str,
     password: str,
-    email: str,
-    email_password: str,
+    email_provider: EmailProvider,
 ) -> ValidationOutcome:
-    """Flow: логин → включение 2FA → сохранение secret → обычная валидация."""
-    email_provider = detect_imap_provider(email, email_password)
     try:
         async with browser_context() as context:
-            # Шаг 1: включаем 2FA, получаем secret
             secret = await enable_2fa(context, login, password, email_provider)
-            # FernetEncrypted encrypts on write; ORM attributes stay plaintext.
             account.totp_secret_encrypted = secret
-            await session.commit()
+            await session.flush()
 
-            # Шаг 2: логин с новым TOTP для получения токенов
             auth_code, code_verifier = await login_and_get_auth_code(
-                context, login, password, secret
+                context,
+                login,
+                password,
+                secret,
+                email_provider=email_provider,
             )
-            tokens = await exchange_code_for_tokens(auth_code, code_verifier, _REDIRECT_URI)
-    except OAuthLoginError:
-        return ValidationOutcome.LOGIN_FAILED
-    except Enable2FAError:
-        return ValidationOutcome.SETUP_2FA_FAILED
-    except Exception:
-        return ValidationOutcome.SETUP_2FA_FAILED
+    except OAuthLoginError as exc:
+        raise _from_oauth_error(exc) from exc
+    except Enable2FAError as exc:
+        raise AccountValidationError(exc.stage, exc.code, exc.detail) from exc
 
+    tokens = await _exchange_tokens(auth_code, code_verifier)
     return await _save_tokens_and_measure(session, account, tokens)
+
+
+async def _exchange_tokens(auth_code: str, code_verifier: str):
+    try:
+        return await exchange_code_for_tokens(auth_code, code_verifier, _REDIRECT_URI)
+    except Exception as exc:
+        raise AccountValidationError(
+            ValidationStage.TOKEN_EXCHANGE,
+            ValidationCode.TOKEN_EXCHANGE_FAILED,
+            "OpenAI не выдал токены после успешного входа.",
+        ) from exc
 
 
 async def _save_tokens_and_measure(
@@ -123,11 +253,8 @@ async def _save_tokens_and_measure(
     account: Account,
     tokens,
 ) -> ValidationOutcome:
-    """Общий хвост валидации: парсинг claims → сохранение токенов → замер → active."""
-    # Парсинг id_token → claims (email, plan_type, account_id, ...)
     claims = parse_id_token(tokens.id_token) if tokens.id_token else IdTokenClaims()
 
-    # Создание/обновление AccountLimits с полученными токенами
     limits = await session.get(AccountLimits, account.id)
     if limits is None:
         limits = AccountLimits(account_id=account.id, refresh_token_encrypted=tokens.refresh_token)
@@ -139,17 +266,30 @@ async def _save_tokens_and_measure(
     limits.refresh_status = "ok"
     limits.refresh_recover_attempts = 0
 
-    # Подписка из claims — полезно для прогноза истечения аренды
     if claims.subscription_expires_at:
         account.subscription_expires_at = claims.subscription_expires_at
 
-    await session.commit()
+    await session.flush()
 
-    # Первичный замер лимитов: аккаунт валиден, но если замер упал — это не блокер
-    result = await measure_account_limits(session, account.id)
-    if result != MeasureResult.OK:
-        return ValidationOutcome.MEASURE_FAILED
+    try:
+        result = await measure_account_limits(
+            session,
+            account.id,
+            claim_plan_type=claims.plan_type,
+        )
+    except Exception as exc:
+        raise AccountValidationError(
+            ValidationStage.LIMIT_MEASUREMENT,
+            ValidationCode.MEASURE_FAILED,
+            "Вход выполнен, но лимиты аккаунта получить не удалось.",
+        ) from exc
+    if result is not MeasureResult.OK:
+        raise AccountValidationError(
+            ValidationStage.LIMIT_MEASUREMENT,
+            ValidationCode.MEASURE_FAILED,
+            "Вход выполнен, но лимиты аккаунта получить не удалось.",
+        )
 
     account.status = "active"
-    await session.commit()
+    await session.flush()
     return ValidationOutcome.OK

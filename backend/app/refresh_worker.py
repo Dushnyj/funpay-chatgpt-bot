@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.check_job_queue import CheckJobQueue
-from app.services.account_validation import ValidationOutcome, validate_account
+from app.models.account import Account
+from app.services.account_validation import (
+    AccountValidationError,
+    ValidationCode,
+    ValidationOutcome,
+    ValidationStage,
+    validate_account,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +43,34 @@ class RefreshRecoveryWorker:
             outcome = await validate_account(session, job.account_id)
             if outcome is ValidationOutcome.OK:
                 await self._queue.mark_done(session, job, result="ok")
-            else:
-                await self._queue.mark_failed(session, job, error=outcome.value)
             await session.commit()
+        except AccountValidationError as exc:
+            account = await session.get(Account, job.account_id)
+            if account is not None:
+                account.status = "validation_failed"
+            await self._queue.mark_failed(session, job, error=exc.to_json())
+            await session.commit()
+            logger.info(
+                "Validation job %s failed for account %s at %s (%s)",
+                job.id,
+                job.account_id,
+                exc.stage,
+                exc.code,
+            )
         except Exception as exc:
-            await self._queue.mark_failed(session, job, error=str(exc))
+            account = await session.get(Account, job.account_id)
+            if account is not None:
+                account.status = "validation_failed"
+            safe_error = json.dumps(
+                {
+                    "stage": ValidationStage.INTERNAL.value,
+                    "code": ValidationCode.INTERNAL_ERROR.value,
+                    "detail": "Внутренняя ошибка проверки аккаунта.",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            await self._queue.mark_failed(session, job, error=safe_error)
             await session.commit()
             logger.exception("Job %s failed for account %s", job.id, job.account_id)
 

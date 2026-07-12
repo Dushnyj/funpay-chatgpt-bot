@@ -27,7 +27,7 @@ export function PageHeader({
 export function StatusBadge({ value, label }: { value: string; label?: string }) {
   const normalized = value.toLowerCase().replaceAll(' ', '_')
   const positive = ['active', 'connected', 'completed', 'ok', 'healthy'].includes(normalized)
-  const warning = ['pending', 'pending_validation', 'paused', 'maintenance', 'unknown'].includes(normalized)
+  const warning = ['pending', 'pending_validation', 'detecting', 'paused', 'maintenance', 'unknown'].includes(normalized)
   const tone = positive ? 'success' : warning ? 'warning' : 'danger'
   const dot = tone === 'success' ? 'status-dot--success' : tone === 'warning' ? 'status-dot--warning' : 'status-dot--danger'
   return (

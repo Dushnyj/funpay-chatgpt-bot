@@ -64,3 +64,10 @@ async def test_seed_catalog_is_complete_idempotent_and_preserves_existing(sessio
     plus = next(tier for tier in tiers if tier.name == "Plus")
     assert plus.description == "operator value"
     assert plus.is_active is False
+    assert plus.code == "plus"
+    assert plus.system_managed is True
+    assert plus.is_sellable is True
+    assert {tier.code for tier in tiers} == {
+        "free", "go", "plus", "pro_5x", "pro_20x", "business",
+        "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
+    }

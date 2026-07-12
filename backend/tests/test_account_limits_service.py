@@ -69,7 +69,7 @@ async def test_measure_and_update_success(session, httpx_mock):
         method="GET",
         json={
             "accounts": {
-                "default": {
+                "acc-openai-1": {
                     "account": {"plan_type": "plus"},
                     "entitlement": {"expires_at": "2026-08-15T00:00:00Z"},
                 }
@@ -84,13 +84,19 @@ async def test_measure_and_update_success(session, httpx_mock):
     reloaded = await session.get(AccountLimits, acc.id)
     assert reloaded.access_token_encrypted == "fresh-access"
     assert reloaded.refresh_token_encrypted == "fresh-refresh"
-    assert reloaded.chat_5h_remaining_pct == 80  # 100 - 20
-    assert reloaded.codex_5h_remaining_pct == 80  # то же (общий лимит)
-    assert reloaded.chat_weekly_remaining_pct == 50
+    assert reloaded.chat_5h_remaining_pct is None
+    assert reloaded.codex_5h_remaining_pct == 80
+    assert reloaded.chat_weekly_remaining_pct is None
     assert reloaded.codex_weekly_remaining_pct == 50
     assert reloaded.plan_type == "plus"
     assert reloaded.measured_at is not None
     assert reloaded.refresh_status == "ok"
+    reloaded_account = await session.get(Account, acc.id)
+    assert reloaded_account.tier_id == tier.id
+    assert reloaded_account.plan_raw_type == "plus"
+    assert reloaded_account.plan_source == "accounts_check+wham_usage"
+    assert reloaded_account.plan_confidence == pytest.approx(0.92)
+    assert reloaded_account.plan_detected_at is not None
 
 
 @pytest.mark.asyncio
@@ -168,7 +174,7 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     httpx_mock.add_response(
         url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
         method="GET",
-        json={"accounts": {"default": {"account": {"plan_type": "plus"}, "entitlement": {"expires_at": None}}}},
+        json={"accounts": {"acc-1": {"account": {"plan_type": "plus"}, "entitlement": {"expires_at": None}}}},
     )
 
     result = await measure_account_limits(session, acc.id)
@@ -177,6 +183,100 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     reloaded = await session.get(AccountLimits, acc.id)
     # access_token не изменился
     assert reloaded.access_token_encrypted == "valid-access"
+
+
+@pytest.mark.asyncio
+async def test_measure_conflicting_plan_signals_clear_sellable_tier(session, httpx_mock):
+    tier = SubscriptionTier(name="Plus", is_active=True)
+    session.add(tier)
+    await session.flush()
+    acc = Account(
+        login="conflict@e.com",
+        password_encrypted="p",
+        totp_secret_encrypted="t",
+        tier_id=tier.id,
+        status="active",
+    )
+    session.add(acc)
+    await session.flush()
+    session.add(
+        AccountLimits(
+            account_id=acc.id,
+            refresh_token_encrypted="rt",
+            access_token_encrypted="valid-access",
+            access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            account_id_openai="acc-conflict",
+        )
+    )
+    await session.commit()
+
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/wham/usage",
+        method="GET",
+        json={"plan_type": "plus", "rate_limit": None},
+    )
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        method="GET",
+        json={
+            "accounts": {
+                "acc-conflict": {
+                    "account": {"plan_type": "pro"},
+                    "entitlement": {"expires_at": None},
+                }
+            }
+        },
+    )
+
+    assert await measure_account_limits(session, acc.id) == MeasureResult.OK
+    await session.refresh(acc)
+    limits = await session.get(AccountLimits, acc.id)
+    assert acc.tier_id is None
+    assert acc.plan_raw_type == "pro | plus"
+    assert acc.plan_confidence == 0.0
+    assert limits.plan_type == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_measure_uses_id_token_plan_as_conservative_fallback(session, httpx_mock):
+    account = Account(
+        login="fallback@e.com",
+        password_encrypted="p",
+        totp_secret_encrypted="t",
+        tier_id=None,
+        status="pending_validation",
+    )
+    session.add(account)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="rt",
+        access_token_encrypted="valid-access",
+        access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        account_id_openai="workspace",
+    ))
+    await session.commit()
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/wham/usage",
+        method="GET",
+        json={"plan_type": None, "rate_limit": None},
+    )
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        method="GET",
+        json={"accounts": {}},
+    )
+
+    assert await measure_account_limits(
+        session,
+        account.id,
+        claim_plan_type="go",
+    ) == MeasureResult.OK
+    await session.refresh(account)
+    assert account.plan_raw_type == "go"
+    assert account.plan_source == "id_token"
+    assert account.tier_id is not None
+    assert (await session.get(SubscriptionTier, account.tier_id)).code == "go"
 
 
 # Вспомогательная для JWT

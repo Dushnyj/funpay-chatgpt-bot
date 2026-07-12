@@ -100,7 +100,7 @@ def _make_page(
         if role == "button" and name and "two-factor" in str(name):
             return enable_btn
         # Финальная кнопка подтверждения.
-        if role == "button" and name and "Continue" in str(name):
+        if role == "button" and name and "continue" in str(name).lower():
             confirm = MagicMock()
             confirm_btn = MagicMock()
             confirm_btn.click = AsyncMock(return_value=None)
@@ -193,7 +193,7 @@ async def test_enable_2fa_qr_not_decoded():
 
     with patch("app.integrations.playwright.enable_2fa._login", new_callable=AsyncMock), \
          patch("app.integrations.playwright.enable_2fa.decode_qr_secret", return_value=None):
-        with pytest.raises(Enable2FAError, match="не декодирован"):
+        with pytest.raises(Enable2FAError, match="декодировать"):
             await enable_2fa(context, "u@e.com", "pass", provider)
 
     page.close.assert_awaited_once()

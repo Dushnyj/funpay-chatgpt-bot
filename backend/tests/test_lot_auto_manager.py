@@ -11,7 +11,7 @@ from app.services.lot_auto_manager import LotAutoManager
 
 
 async def _seed_catalog(session: AsyncSession):
-    tier = SubscriptionTier(name="Plus", is_active=True)
+    tier = SubscriptionTier(name="Plus", is_active=True, is_sellable=True)
     session.add(tier)
     duration = Duration(days=7, is_enabled=True, sort_order=10)
     session.add(duration)

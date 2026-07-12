@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -16,7 +16,16 @@ class Account(Base):
     totp_secret_encrypted: Mapped[str] = mapped_column(FernetEncrypted)
     email: Mapped[str | None] = mapped_column(default=None)
     email_password_encrypted: Mapped[str | None] = mapped_column(FernetEncrypted, default=None)
-    tier_id: Mapped[int] = mapped_column(ForeignKey("subscription_tiers.id"))
+    # The tier is unknown until the first successful OpenAI metadata check.
+    tier_id: Mapped[int | None] = mapped_column(
+        ForeignKey("subscription_tiers.id"), default=None
+    )
+    plan_raw_type: Mapped[str | None] = mapped_column(String(255), default=None)
+    plan_source: Mapped[str | None] = mapped_column(String(128), default=None)
+    plan_confidence: Mapped[float | None] = mapped_column(Float, default=None)
+    plan_detected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     max_active_rentals: Mapped[int | None] = mapped_column(Integer, default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending_validation")

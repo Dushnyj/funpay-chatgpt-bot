@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,25 +17,27 @@ router = APIRouter(prefix="/api", tags=["catalog"], dependencies=[Depends(get_cu
 
 @router.get("/tiers", response_model=list[TierOut])
 async def list_tiers(session: AsyncSession = Depends(get_db_session)):
-    result = await session.execute(select(SubscriptionTier).order_by(SubscriptionTier.id))
+    result = await session.execute(
+        select(SubscriptionTier).order_by(SubscriptionTier.sort_order, SubscriptionTier.id)
+    )
     return result.scalars().all()
 
 
 @router.post("/tiers", response_model=TierOut, status_code=201)
 async def create_tier(req: TierCreate, session: AsyncSession = Depends(get_db_session)):
-    tier = SubscriptionTier(name=req.name, description=req.description, is_active=req.is_active)
-    session.add(tier)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(status_code=409, detail="Tier name already exists")
-    await session.refresh(tier)
-    return tier
+    raise HTTPException(
+        status_code=405,
+        detail="Subscription tiers are synchronized by the application",
+    )
 
 
 @router.patch("/tiers/{tier_id}", response_model=TierOut)
-async def update_tier(tier_id: int, req: TierUpdate, session: AsyncSession = Depends(get_db_session)):
+async def update_tier(
+    tier_id: int,
+    req: TierUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
     tier = await session.get(SubscriptionTier, tier_id)
     if tier is None:
         raise HTTPException(status_code=404, detail="Tier not found")
@@ -47,6 +49,15 @@ async def update_tier(tier_id: int, req: TierUpdate, session: AsyncSession = Dep
         await session.rollback()
         raise HTTPException(status_code=409, detail="Tier name already exists")
     await session.refresh(tier)
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is not None:
+        try:
+            await lifecycle.reconcile_lots()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Tier saved, but FunPay reconciliation failed",
+            ) from exc
     return tier
 
 
@@ -55,12 +66,10 @@ async def delete_tier(tier_id: int, session: AsyncSession = Depends(get_db_sessi
     tier = await session.get(SubscriptionTier, tier_id)
     if tier is None:
         raise HTTPException(status_code=404, detail="Tier not found")
-    await session.delete(tier)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(status_code=409, detail="Tier is used by accounts or lots")
+    raise HTTPException(
+        status_code=405,
+        detail="System subscription tiers cannot be deleted",
+    )
 
 
 @router.get("/durations", response_model=list[DurationOut])
