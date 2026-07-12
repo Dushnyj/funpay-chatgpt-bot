@@ -95,3 +95,73 @@ async def test_on_message_callback_dispatches_command(session: AsyncSession):
     # Распознанная команда без зарегистрированного хэндлера → UnhandledMessage,
     # но lifecycle ловит и логирует (не падает)
     await callbacks.on_message(msg)  # type: ignore
+
+
+async def test_on_new_sale_creates_rental_when_account_available(session: AsyncSession):
+    """Полный поток: new_sale → Order → Rental → welcome message."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.models.account import Account, AccountLimits
+    from app.models.rental import Rental
+    from app.models.settings import SellerSettings
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    tier = SubscriptionTier(name="Plus", is_active=True)
+    session.add(tier)
+    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    session.add(duration)
+    scope = LimitScope(code="any", name="Любой")
+    session.add(scope)
+    session.add(SellerSettings(id=1, default_max_active_rentals=1))
+    await session.flush()
+    acc = Account(
+        login="acc1",
+        password_encrypted="pass",
+        totp_secret_encrypted="totp",
+        tier_id=tier.id,
+        status="active",
+        subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    session.add(acc)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=acc.id,
+        refresh_token_encrypted="enc",
+        chat_5h_remaining_pct=80,
+        chat_weekly_remaining_pct=70,
+        codex_5h_remaining_pct=60,
+        codex_weekly_remaining_pct=50,
+        measured_at=datetime.now(timezone.utc),
+        refresh_status="ok",
+    ))
+    session.add(Lot(
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=True,
+    ))
+    await session.flush()
+
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="ord-99",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="test",
+        price=599.0,
+    ))
+    callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
+    await callbacks.on_new_sale("ord-99")  # type: ignore
+
+    rentals = (await session.execute(select(Rental))).scalars().all()
+    assert len(rentals) == 1
+    assert rentals[0].account_id == acc.id
+    assert len(gateway.sent_messages) >= 1

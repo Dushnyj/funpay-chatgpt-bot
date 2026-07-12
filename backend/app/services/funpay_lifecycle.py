@@ -8,8 +8,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.funpay.gateway import ChatGateway
 from app.integrations.funpay.runner import RunnerCallbacks
 from app.integrations.funpay.types import MessageInfo
+from app.services.command_handlers import (
+    CodeHandler,
+    HelpHandler,
+    SubscriptionHandler,
+    SellerHandler,
+    ReplaceHandler,
+)
+from app.services.command_parser import CommandType
 from app.services.command_router import CommandRouter, UnhandledMessage
 from app.services.order_processor import OrderProcessor, LotNotFoundError
+from app.services.rental_service import RentalService
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +40,51 @@ def build_callbacks(
     Фаза 4 расширит это: добавит AccountPool, RentalService, KickService callback'и.
     """
     order_processor = OrderProcessor()
+    rental_service = RentalService()
     router = command_router or CommandRouter()
+
+    # Регистрируем хэндлеры команд для on_message.
+    router.register(CommandType.CODE, CodeHandler())
+    router.register(CommandType.HELP, HelpHandler())
+    router.register(CommandType.SUBSCRIPTION, SubscriptionHandler())
+    router.register(CommandType.SELLER, SellerHandler())
+    router.register(CommandType.REPLACE, ReplaceHandler())
 
     async def on_new_sale(order_id: str) -> None:
         async with session_factory() as session:
             try:
-                await order_processor.process_new_sale(session, gateway, order_id)
+                order = await order_processor.process_new_sale(
+                    session, gateway, order_id,
+                )
+                # Order создаётся и коммитится отдельно от fulfill_order,
+                # чтобы сбой выдачи аккаунта не откатил сам заказ
+                # (Order нужен для последующих on_sale_closed/refunded).
                 await session.commit()
             except LotNotFoundError:
                 logger.warning("New sale %s: no matching lot", order_id)
+                return
             except Exception:
                 logger.exception("Failed to process new sale %s", order_id)
+                return
+
+            try:
+                # Выдача аккаунта + welcome сообщение.
+                # Если аккаунта нет — RentalService отправит no_account_available
+                # и вернёт None (покупатель получит уведомление о повторе).
+                from app.models.settings import SellerSettings
+                settings = await session.get(SellerSettings, 1)
+                max_rentals = (
+                    settings.default_max_active_rentals if settings else 1
+                )
+                await rental_service.fulfill_order(
+                    session, gateway, order.id, max_rentals,
+                )
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "Failed to fulfill order %s (order record saved)",
+                    order_id,
+                )
 
     async def on_sale_closed(order_id: str) -> None:
         async with session_factory() as session:
@@ -69,6 +112,9 @@ def build_callbacks(
                 lang="ru",
                 gateway=gateway,
             )
+            # Передаём session в контекст для хэндлеров команд
+            # (CommandContext — frozen dataclass, поэтому через object.__setattr__).
+            object.__setattr__(ctx, "_session", session)
             try:
                 await router.dispatch(ctx)
                 await session.commit()
