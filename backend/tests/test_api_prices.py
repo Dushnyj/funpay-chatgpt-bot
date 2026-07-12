@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import AsyncMock
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,3 +38,29 @@ async def test_update_and_get_prices(auth_client: AsyncClient, session: AsyncSes
     assert resp.status_code == 200
     assert len(resp.json()) == 1
     assert resp.json()[0]["price"] == 599
+
+
+async def test_price_update_triggers_immediate_lot_reconciliation(
+    auth_client: AsyncClient, session: AsyncSession,
+):
+    tier = SubscriptionTier(name="Plus", is_active=True)
+    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    scope = LimitScope(code="any", name="Любой")
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    lifecycle = type("Lifecycle", (), {"reconcile_lots": AsyncMock(return_value=[])})()
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.put("/api/prices", json={
+            "items": [{
+                "tier_id": tier.id,
+                "duration_id": duration.id,
+                "limit_scope_id": scope.id,
+                "price": 699,
+            }],
+        })
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 200
+    lifecycle.reconcile_lots.assert_awaited_once_with()

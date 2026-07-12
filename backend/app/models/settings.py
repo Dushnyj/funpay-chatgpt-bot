@@ -2,6 +2,7 @@ from sqlalchemy import Boolean, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.types.encrypted import FernetEncrypted
 
 
 class SellerSettings(Base):
@@ -9,10 +10,14 @@ class SellerSettings(Base):
 
     # Singleton-строка: единственный ряд настроек продавца
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    funpay_session_key: Mapped[str | None] = mapped_column(default=None)
+    funpay_session_key: Mapped[str | None] = mapped_column(
+        FernetEncrypted(allow_legacy_plaintext=True), default=None
+    )
     funpay_session_valid: Mapped[bool] = mapped_column(Boolean, default=False)
     funpay_node_id: Mapped[int | None] = mapped_column(default=None)
-    telegram_bot_token: Mapped[str | None] = mapped_column(default=None)
+    telegram_bot_token: Mapped[str | None] = mapped_column(
+        FernetEncrypted(allow_legacy_plaintext=True), default=None
+    )
     telegram_seller_chat_id: Mapped[str | None] = mapped_column(default=None)
     check_interval_minutes: Mapped[int] = mapped_column(default=10)
     limits_check_interval_minutes: Mapped[int] = mapped_column(default=5)
@@ -26,3 +31,4 @@ class SellerSettings(Base):
     funpay_commission_percent: Mapped[int] = mapped_column(default=15)
     limits_warn_threshold_pct: Mapped[int] = mapped_column(default=20)
     admin_password_hash: Mapped[str | None] = mapped_column(default=None)
+    admin_session_version: Mapped[int] = mapped_column(Integer, default=0)

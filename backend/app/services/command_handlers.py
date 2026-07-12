@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from collections.abc import Awaitable, Callable
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,19 +81,27 @@ def _fmt_remaining(expires_at: datetime, now: datetime) -> str:
     return f"{hours // 24}д"
 
 
-async def _find_rental_by_chat(session: AsyncSession, chat_id: int) -> Rental | None:
+async def _find_rental_by_chat(
+    session: AsyncSession,
+    chat_id: int,
+    *,
+    for_update: bool = False,
+) -> Rental | None:
     """Последняя аренда для чата FunPay (по started_at).
 
     Привязка покупателя идёт по buyer_funpay_chat_id (строка). Если аренд
     несколько — берётся последняя по started_at.
     """
-    result = await session.execute(
-        select(Rental).where(Rental.buyer_funpay_chat_id == str(chat_id))
+    stmt = (
+        select(Rental)
+        .where(Rental.buyer_funpay_chat_id == str(chat_id))
+        .order_by(Rental.started_at.desc())
+        .limit(1)
     )
-    rentals = result.scalars().all()
-    if not rentals:
-        return None
-    return max(rentals, key=lambda r: r.started_at)
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 class CodeHandler:
@@ -193,7 +203,20 @@ class SellerHandler:
 
 
 from app.models.catalog import Duration, LimitScope
+from app.models.audit import AuditLog
+from app.models.settings import SellerSettings
+from app.check_job_queue import CheckJobQueue
+from app.services.account_validation import ValidationOutcome, validate_account
 from app.services.account_pool import AccountCriteria, AccountPool
+from app.services.kick_service import KickResult, KickService
+
+
+AccountValidator = Callable[[AsyncSession, int], Awaitable[ValidationOutcome]]
+_REPLACEABLE_OUTCOMES = {
+    ValidationOutcome.LOGIN_FAILED,
+    ValidationOutcome.INVALID_2FA,
+    ValidationOutcome.SETUP_2FA_FAILED,
+}
 
 
 class ReplaceHandler:
@@ -203,17 +226,109 @@ class ReplaceHandler:
     на существующей Rental (replacement_count++), а не создание новой.
     """
 
-    def __init__(self, account_pool: AccountPool | None = None) -> None:
+    def __init__(
+        self,
+        account_pool: AccountPool | None = None,
+        *,
+        validator: AccountValidator = validate_account,
+        kick_service: KickService | None = None,
+        job_queue: CheckJobQueue | None = None,
+        max_replacements: int = 1,
+    ) -> None:
         self._pool = account_pool or AccountPool()
+        self._validator = validator
+        self._kick = kick_service or KickService()
+        self._jobs = job_queue or CheckJobQueue()
+        self._max_replacements = max(0, max_replacements)
 
     async def __call__(self, ctx: CommandContext) -> None:
         session = _session_from_ctx(ctx)
-        rental = await _find_rental_by_chat(session, ctx.chat_id)
+        rental = await _find_rental_by_chat(session, ctx.chat_id, for_update=True)
 
         if rental is None or rental.status != "active":
             text = await render_message(session, "replace_declined", ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
+
+        if rental.replacement_count >= self._max_replacements:
+            session.add(AuditLog(
+                event_type="replacement_limit_reached",
+                account_id=rental.account_id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+                metadata_={"limit": self._max_replacements},
+            ))
+            await session.flush()
+            text = await render_message(session, "seller_called", ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        try:
+            validation = await self._validator(session, rental.account_id)
+        except Exception as exc:
+            session.add(AuditLog(
+                event_type="replacement_validation_failed",
+                account_id=rental.account_id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+                metadata_={"error": str(exc)},
+            ))
+            await session.flush()
+            text = await render_message(session, "seller_called", ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        if validation not in _REPLACEABLE_OUTCOMES:
+            session.add(AuditLog(
+                event_type="replacement_declined",
+                account_id=rental.account_id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+                metadata_={"validation": validation.value},
+            ))
+            await session.flush()
+            template = (
+                "replace_declined"
+                if validation is ValidationOutcome.OK
+                else "seller_called"
+            )
+            text = await render_message(session, template, ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        old_account = await session.get(Account, rental.account_id)
+        if old_account is None:
+            text = await render_message(session, "seller_called", ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+        old_account.status = "maintenance"
+
+        # Revoke old credentials before exposing another account.  If revoke
+        # cannot be confirmed, stop and ask the seller to intervene: otherwise
+        # one buyer could retain credentials for multiple accounts.
+        try:
+            kick = await self._kick.kick(session, old_account.id)
+        except Exception as exc:
+            kick = KickResult(success=False, error=str(exc))
+        session.add(AuditLog(
+            event_type="replacement_kick",
+            account_id=old_account.id,
+            rental_id=rental.id,
+            chat_id=rental.buyer_funpay_chat_id,
+            metadata_={"success": kick.success, "error": kick.error},
+        ))
+        if not kick.success:
+            await session.commit()
+            text = await render_message(session, "seller_called", ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        await self._jobs.enqueue(
+            session,
+            account_id=old_account.id,
+            priority="refresh_recover",
+            job_type="refresh_recover",
+        )
 
         duration = await session.get(Duration, rental.duration_id)
         scope = await session.get(LimitScope, rental.limit_scope_id)
@@ -228,17 +343,27 @@ class ReplaceHandler:
             max_5h_pct=rental.max_5h_pct,
             max_weekly_pct=rental.max_weekly_pct,
         )
+        settings = await session.get(SellerSettings, 1)
+        default_max = settings.default_max_active_rentals if settings else 1
         new_account = await self._pool.acquire_excluding(
             session, criteria,
             exclude_account_id=rental.account_id,
-            default_max_active_rentals=5,
+            default_max_active_rentals=default_max,
         )
 
         if new_account is None:
+            session.add(AuditLog(
+                event_type="replacement_no_account",
+                account_id=old_account.id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+            ))
+            await session.commit()
             text = await render_message(session, "replace_no_account", ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
+        old_account_id = rental.account_id
         rental.account_id = new_account.id
         rental.replacement_count += 1
         limits = await session.get(AccountLimits, new_account.id)
@@ -247,7 +372,16 @@ class ReplaceHandler:
             rental.issued_chat_weekly_pct = limits.chat_weekly_remaining_pct
             rental.issued_codex_5h_pct = limits.codex_5h_remaining_pct
             rental.issued_codex_weekly_pct = limits.codex_weekly_remaining_pct
-        await session.flush()
+        session.add(AuditLog(
+            event_type="replacement_issued",
+            account_id=new_account.id,
+            rental_id=rental.id,
+            chat_id=rental.buyer_funpay_chat_id,
+            metadata_={"old_account_id": old_account_id},
+        ))
+        # Commit before sending the credentials.  If delivery fails, a replay
+        # sees replacement_count=1 and cannot disclose yet another account.
+        await session.commit()
 
         # password_encrypted — уже plaintext через FernetEncrypted
         password = new_account.password_encrypted

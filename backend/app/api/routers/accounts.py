@@ -1,30 +1,34 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import AccountCreate, AccountOut, AccountUpdate, AccountWithLimits
+from app.check_job_queue import CheckJobQueue
 from app.models.account import Account, AccountLimits
-from app.services.crypto import encrypt
+from app.models.audit import AuditLog
+from app.models.catalog import SubscriptionTier
+from app.models.rental import Rental
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depends(get_current_user)])
+_check_job_queue = CheckJobQueue()
 
 
 class BulkAccountItem(BaseModel):
-    login: str
-    password: str
-    totp_secret: str = ""
-    email: str | None = None
-    email_password: str | None = None
+    login: str = Field(min_length=1, max_length=320)
+    password: str = Field(min_length=1, max_length=4096)
+    totp_secret: str = Field(default="", max_length=256)
+    email: str | None = Field(default=None, max_length=320)
+    email_password: str | None = Field(default=None, max_length=4096)
 
 
 class BulkAccountRequest(BaseModel):
-    tier_id: int
-    accounts: list[BulkAccountItem]
+    tier_id: int = Field(gt=0)
+    accounts: list[BulkAccountItem] = Field(min_length=1, max_length=1000)
 
 
 class BulkAccountResponse(BaseModel):
@@ -39,12 +43,14 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
 
 @router.post("", response_model=AccountOut, status_code=201)
 async def create_account(req: AccountCreate, session: AsyncSession = Depends(get_db_session)):
+    if await session.get(SubscriptionTier, req.tier_id) is None:
+        raise HTTPException(status_code=422, detail="Unknown subscription tier")
     account = Account(
         login=req.login,
-        password_encrypted=encrypt(req.password),
-        totp_secret_encrypted=encrypt(req.totp_secret),
+        password_encrypted=req.password,
+        totp_secret_encrypted=req.totp_secret,
         email=req.email,
-        email_password_encrypted=encrypt(req.email_password) if req.email_password else None,
+        email_password_encrypted=req.email_password,
         tier_id=req.tier_id,
         subscription_expires_at=req.subscription_expires_at,
         max_active_rentals=req.max_active_rentals,
@@ -52,6 +58,10 @@ async def create_account(req: AccountCreate, session: AsyncSession = Depends(get
     )
     session.add(account)
     try:
+        await session.flush()
+        await _check_job_queue.enqueue(
+            session, account.id, priority="new", job_type="full_validation"
+        )
         await session.commit()
     except IntegrityError:
         await session.rollback()
@@ -62,18 +72,27 @@ async def create_account(req: AccountCreate, session: AsyncSession = Depends(get
 
 @router.post("/bulk", response_model=BulkAccountResponse, status_code=201)
 async def bulk_add_accounts(req: BulkAccountRequest, session: AsyncSession = Depends(get_db_session)):
+    if await session.get(SubscriptionTier, req.tier_id) is None:
+        raise HTTPException(status_code=422, detail="Unknown subscription tier")
+    accounts: list[Account] = []
     for item in req.accounts:
         account = Account(
             login=item.login,
-            password_encrypted=encrypt(item.password),
-            totp_secret_encrypted=encrypt(item.totp_secret) if item.totp_secret else encrypt(""),
+            password_encrypted=item.password,
+            totp_secret_encrypted=item.totp_secret,
             email=item.email,
-            email_password_encrypted=encrypt(item.email_password) if item.email_password else None,
+            email_password_encrypted=item.email_password,
             tier_id=req.tier_id,
             status="pending_validation",
         )
         session.add(account)
+        accounts.append(account)
     try:
+        await session.flush()
+        for account in accounts:
+            await _check_job_queue.enqueue(
+                session, account.id, priority="new", job_type="full_validation"
+            )
         await session.commit()
     except IntegrityError:
         await session.rollback()
@@ -114,8 +133,20 @@ async def delete_account(account_id: int, session: AsyncSession = Depends(get_db
     account = await session.get(Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    active_rental = await session.scalar(
+        select(Rental.id).where(
+            Rental.account_id == account_id,
+            Rental.status == "active",
+        ).limit(1)
+    )
+    if active_rental is not None:
+        raise HTTPException(status_code=409, detail="Account has an active rental")
     await session.delete(account)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Account is referenced by history")
 
 
 class TotpExportResponse(BaseModel):
@@ -125,21 +156,33 @@ class TotpExportResponse(BaseModel):
 
 
 @router.get("/{account_id}/totp-export", response_model=TotpExportResponse)
-async def export_totp(account_id: int, session: AsyncSession = Depends(get_db_session)):
+async def export_totp(
+    account_id: int,
+    response: Response,
+    session: AsyncSession = Depends(get_db_session),
+):
     """Экспорт TOTP: secret, otpauth:// URI, QR-код (base64 PNG) для импорта в приложение."""
     from app.services.otp_export import generate_otpauth_uri, generate_qr_base64
-    from app.services.crypto import decrypt
-
     account = await session.get(Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    secret = decrypt(account.totp_secret_encrypted) if account.totp_secret_encrypted else ""
+    secret = account.totp_secret_encrypted or ""
     if not secret:
         raise HTTPException(status_code=400, detail="Account has no TOTP secret")
 
     account_name = account.email or account.login
     uri = generate_otpauth_uri(secret, account_name)
     qr_b64 = generate_qr_base64(uri)
+    session.add(
+        AuditLog(
+            event_type="totp_export",
+            account_id=account.id,
+            metadata_={"actor": "admin"},
+        )
+    )
+    await session.commit()
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
     return TotpExportResponse(secret=secret, otpauth_uri=uri, qr_png_base64=qr_b64)
 

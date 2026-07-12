@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountLimits
@@ -40,6 +40,18 @@ class AccountPool:
         criteria: AccountCriteria,
         default_max_active_rentals: int,
     ) -> Account | None:
+        return await self._acquire(
+            session, criteria, default_max_active_rentals, exclude_account_id=None
+        )
+
+    async def _acquire(
+        self,
+        session: AsyncSession,
+        criteria: AccountCriteria,
+        default_max_active_rentals: int,
+        *,
+        exclude_account_id: int | None,
+    ) -> Account | None:
         now = datetime.now(timezone.utc)
         fresh_cutoff = now - _LIMITS_FRESH_THRESHOLD
         required_expires_at = now + timedelta(days=criteria.duration_days)
@@ -70,6 +82,8 @@ class AccountPool:
                 > func.coalesce(active_rentals.c.cnt, 0),
             )
         )
+        if exclude_account_id is not None:
+            stmt = stmt.where(Account.id != exclude_account_id)
 
         if criteria.scope == "any":
             if criteria.max_5h_pct is not None:
@@ -90,7 +104,7 @@ class AccountPool:
                     AccountLimits.chat_weekly_remaining_pct >= criteria.min_limit_pct,
                 )
             stmt = stmt.order_by(
-                func.min(
+                _lower_limit(
                     AccountLimits.chat_5h_remaining_pct,
                     AccountLimits.chat_weekly_remaining_pct,
                 ).desc()
@@ -102,13 +116,16 @@ class AccountPool:
                     AccountLimits.codex_weekly_remaining_pct >= criteria.min_limit_pct,
                 )
             stmt = stmt.order_by(
-                func.min(
+                _lower_limit(
                     AccountLimits.codex_5h_remaining_pct,
                     AccountLimits.codex_weekly_remaining_pct,
                 ).desc()
             )
 
-        stmt = stmt.limit(1)
+        # The row lock is held by the caller's transaction until it creates the
+        # Rental and commits. Concurrent workers skip the selected account
+        # instead of issuing the same final slot twice.
+        stmt = stmt.limit(1).with_for_update(of=Account, skip_locked=True)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -119,19 +136,15 @@ class AccountPool:
         exclude_account_id: int,
         default_max_active_rentals: int,
     ) -> Account | None:
-        """Как acquire, но исключает указанный аккаунт (для замены).
+        """Like ``acquire``, excluding the current account without mutation."""
+        return await self._acquire(
+            session,
+            criteria,
+            default_max_active_rentals,
+            exclude_account_id=exclude_account_id,
+        )
 
-        Временно помечает исключаемый аккаунт как maintenance, вызывает acquire,
-        затем восстанавливает исходный статус.
-        """
-        excluded = await session.get(Account, exclude_account_id)
-        if excluded is not None:
-            original_status = excluded.status
-            excluded.status = "maintenance"
-            await session.flush()
-            try:
-                return await self.acquire(session, criteria, default_max_active_rentals)
-            finally:
-                excluded.status = original_status
-                await session.flush()
-        return await self.acquire(session, criteria, default_max_active_rentals)
+
+def _lower_limit(left, right):
+    """Portable scalar minimum (SQLite and PostgreSQL)."""
+    return case((left <= right, left), else_=right)

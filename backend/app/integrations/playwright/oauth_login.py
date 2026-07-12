@@ -52,6 +52,38 @@ def _build_authorize_url(code_challenge: str, state: str) -> str:
     return f"{_AUTHORIZE_BASE}?{urlencode(params)}"
 
 
+def _parse_oauth_callback(url: str, expected_state: str) -> str | None:
+    """Validate a localhost OAuth callback and return its code.
+
+    A browser request event is used instead of a response event because no
+    process is normally listening on localhost:1455 on the server.  The
+    request still exists even when navigation ends with connection refused.
+    """
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise OAuthLoginError("некорректный OAuth callback URL") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"localhost", "127.0.0.1"}
+        or port != 1455
+        or parsed.path != "/auth/callback"
+    ):
+        return None
+
+    params = parse_qs(parsed.query)
+    if params.get("state", [None])[0] != expected_state:
+        raise OAuthLoginError("OAuth state mismatch")
+    if error := params.get("error", [None])[0]:
+        description = params.get("error_description", [error])[0]
+        raise OAuthLoginError(f"OAuth отказал в авторизации: {description}")
+    code = params.get("code", [None])[0]
+    if not code:
+        raise OAuthLoginError("OAuth callback не содержит authorization_code")
+    return code
+
+
 async def _do_post_password_steps(
     page: Page,
     totp_secret: str,
@@ -131,17 +163,36 @@ async def login_and_get_auth_code(
     auth_url = _build_authorize_url(challenge, state)
 
     page = await context.new_page()
-    auth_code_holder: dict[str, str] = {}
+    loop = asyncio.get_running_loop()
+    callback_future: asyncio.Future[str] = loop.create_future()
 
-    # Ловим redirect на localhost — там будет authorization_code
-    async def _capture_code(response) -> None:
-        if "/auth/callback" in response.url and "code=" in response.url:
-            params = parse_qs(urlparse(response.url).query)
-            code = params.get("code", [None])[0]
-            if code:
-                auth_code_holder["code"] = code
+    # The redirect may fail with ERR_CONNECTION_REFUSED, therefore capturing
+    # the outgoing request is the reliable Playwright interception point.
+    def _capture_code(request) -> None:
+        if callback_future.done():
+            return
+        try:
+            code = _parse_oauth_callback(request.url, state)
+        except OAuthLoginError as exc:
+            callback_future.set_exception(exc)
+        else:
+            if code is not None:
+                callback_future.set_result(code)
 
-    page.on("response", _capture_code)
+    page.on("request", _capture_code)
+
+    async def _serve_local_callback(route, request) -> None:
+        # Avoid ERR_CONNECTION_REFUSED on a headless server: capture the code
+        # and provide the tiny callback page that a local Codex CLI would have
+        # served on port 1455.
+        _capture_code(request)
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body="Authorization complete. You may close this page.",
+        )
+
+    await page.route("http://localhost:1455/auth/callback*", _serve_local_callback)
 
     try:
         await page.goto(auth_url, wait_until="networkidle", timeout=timeout_ms)
@@ -159,20 +210,20 @@ async def login_and_get_auth_code(
         # Шаг 3: email-code и/или 2FA (TOTP), если OpenAI требует.
         await _do_post_password_steps(page, totp_secret, email_provider)
 
-        # Ждём, пока redirect на callback принесёт код
-        await asyncio.wait_for(_wait_for_code(auth_code_holder), timeout=timeout_ms / 1000)
+        # Ждём, пока redirect на callback принесёт код.
+        auth_code = await asyncio.wait_for(
+            callback_future, timeout=timeout_ms / 1000,
+        )
 
     except PlaywrightTimeoutError as e:
         raise OAuthLoginError(f"таймаут при логине: {e}") from e
     except asyncio.TimeoutError as e:
         raise OAuthLoginError("не получен authorization_code за отведённое время") from e
     finally:
+        if not callback_future.done():
+            callback_future.cancel()
+        elif not callback_future.cancelled():
+            callback_future.exception()
         await page.close()
 
-    return auth_code_holder["code"], verifier
-
-
-async def _wait_for_code(holder: dict[str, str]) -> None:
-    """Поллинг-ожидание, пока обработчик response не положит код в holder."""
-    while "code" not in holder:
-        await asyncio.sleep(0.5)
+    return auth_code, verifier

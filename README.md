@@ -12,8 +12,11 @@
 - **Авто-лоты**: динамическое создание/снятие лотов на FunPay в зависимости от доступности аккаунтов и лимитов
 - **Команды в чатах сделок**: `!код`/`!code`, `!подписка`/`!sub`, `!замена`/`!replace`, `!продавец`/`!seller`, `!помощь`/`!help` (RU+EN)
 - **Кик при истечении**: logout all sessions → 2FA-код как барьер доступа
-- **Админ-панель**: React SPA (дашборд, аккаунты, лоты, заказы, настройки, шаблоны сообщений)
+- **Админ-панель**: адаптивная React SPA (дашборд, аккаунты, чаты, лоты, сделки, цены, настройки и шаблоны)
+- **Чаты покупателей**: входящие FunPay-сообщения, непрочитанные, история и ответы продавца прямо из админ-панели
 - **Telegram-уведомления**: 10 типов событий продавцу
+- **Безопасная конфигурация**: Golden Key и Telegram token задаются write-only через панель и шифруются в PostgreSQL
+- **Миграции и bootstrap**: Alembic обновляет существующую БД, а первый запуск создаёт настройки и справочники
 
 ## Технологии
 
@@ -84,11 +87,13 @@ DATABASE_URL=postgresql+asyncpg://funpay:PASSWORD@postgres:5432/funpay_bot
 ENCRYPTION_KEY=<Fernet ключ>
 SECRET_KEY=<случайная строка>
 ADMIN_PASSWORD_HASH=<bcrypt хеш>
-FUNPAY_SESSION_KEY=<golden_key>
+FUNPAY_SESSION_KEY=<опциональный env fallback для golden_key>
 TELEGRAM_BOT_TOKEN=<опционально>
 TELEGRAM_SELLER_CHAT_ID=<опционально>
 POSTGRES_PASSWORD=<пароль БД>
 ```
+
+После первого входа Golden Key и Telegram можно настроить в разделе **Настройки**. Секреты не возвращаются в браузер после сохранения.
 
 ## Документация
 
@@ -100,6 +105,6 @@ POSTGRES_PASSWORD=<пароль БД>
 ```bash
 cd backend
 pip install -e ".[dev]"
-pytest                    # 268+ тестов
-cd ../frontend && npm run build  # проверка сборки SPA
+pytest                    # 330+ тестов
+cd ../frontend && npm run lint && npm run build
 ```

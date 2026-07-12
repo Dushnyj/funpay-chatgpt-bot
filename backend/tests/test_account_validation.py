@@ -6,7 +6,6 @@ import pytest
 
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
-from app.services.crypto import decrypt, encrypt
 
 
 def _make_jwt(payload: dict) -> str:
@@ -29,8 +28,8 @@ async def test_validate_account_success(session, monkeypatch):
 
     acc = Account(
         login="new@e.com",
-        password_encrypted=encrypt("pass123"),
-        totp_secret_encrypted=encrypt("JBSWY3DPEHPK3PXP"),
+        password_encrypted="pass123",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
         tier_id=tier.id,
         status="pending_validation",
     )
@@ -80,7 +79,7 @@ async def test_validate_account_success(session, monkeypatch):
 
     limits = await session.get(AccountLimits, acc.id)
     assert limits is not None
-    assert decrypt(limits.refresh_token_encrypted) == "initial-refresh"
+    assert limits.refresh_token_encrypted == "initial-refresh"
     assert limits.account_id_openai == "openai-acc-1"
     assert limits.refresh_status == "ok"
 
@@ -97,8 +96,8 @@ async def test_validate_account_login_failure(session, monkeypatch):
 
     acc = Account(
         login="bad@e.com",
-        password_encrypted=encrypt("wrong"),
-        totp_secret_encrypted=encrypt("JBSWY3DPEHPK3PXP"),
+        password_encrypted="wrong",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
         tier_id=tier.id,
         status="pending_validation",
     )
@@ -136,10 +135,10 @@ async def test_validate_account_no_totp_with_email_enables_2fa(session, monkeypa
 
     acc = Account(
         login="auto2fa@e.com",
-        password_encrypted=encrypt("pass123"),
-        totp_secret_encrypted=encrypt(""),
+        password_encrypted="pass123",
+        totp_secret_encrypted="",
         email="auto2fa@gmail.com",
-        email_password_encrypted=encrypt("mailpass"),
+        email_password_encrypted="mailpass",
         tier_id=tier.id,
         status="pending_validation",
     )
@@ -187,11 +186,11 @@ async def test_validate_account_no_totp_with_email_enables_2fa(session, monkeypa
     reloaded_acc = await session.get(Account, acc.id)
     assert reloaded_acc.status == "active"
     # Секрет 2FA сохранён на аккаунте
-    assert decrypt(reloaded_acc.totp_secret_encrypted) == "JBSWY3DPEHPK3PXP"
+    assert reloaded_acc.totp_secret_encrypted == "JBSWY3DPEHPK3PXP"
 
     limits = await session.get(AccountLimits, acc.id)
     assert limits is not None
-    assert decrypt(limits.refresh_token_encrypted) == "initial-refresh"
+    assert limits.refresh_token_encrypted == "initial-refresh"
     assert limits.account_id_openai == "openai-acc-2"
 
 
@@ -206,8 +205,8 @@ async def test_validate_account_no_totp_no_email_invalid_2fa(session):
 
     acc = Account(
         login="nothing@e.com",
-        password_encrypted=encrypt("pass123"),
-        totp_secret_encrypted=encrypt(""),
+        password_encrypted="pass123",
+        totp_secret_encrypted="",
         tier_id=tier.id,
         status="pending_validation",
     )
@@ -232,8 +231,8 @@ async def test_validate_account_invalid_totp_secret(session):
 
     acc = Account(
         login="badsecret@e.com",
-        password_encrypted=encrypt("pass123"),
-        totp_secret_encrypted=encrypt("not-base32-@@@"),
+        password_encrypted="pass123",
+        totp_secret_encrypted="not-base32-@@@",
         tier_id=tier.id,
         status="pending_validation",
     )
@@ -259,10 +258,10 @@ async def test_validate_account_enable_2fa_failure(session, monkeypatch):
 
     acc = Account(
         login="enablefail@e.com",
-        password_encrypted=encrypt("pass123"),
-        totp_secret_encrypted=encrypt(""),
+        password_encrypted="pass123",
+        totp_secret_encrypted="",
         email="enablefail@gmail.com",
-        email_password_encrypted=encrypt("mailpass"),
+        email_password_encrypted="mailpass",
         tier_id=tier.id,
         status="pending_validation",
     )

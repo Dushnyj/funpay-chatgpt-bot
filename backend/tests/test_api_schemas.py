@@ -28,4 +28,5 @@ def test_metrics_out():
 def test_settings_out_excludes_admin_hash():
     fields = SettingsOut.model_fields
     assert "admin_password_hash" not in fields
+    assert "funpay_session_key" not in fields
     assert "telegram_bot_token" not in fields

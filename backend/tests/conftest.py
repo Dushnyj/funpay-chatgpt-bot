@@ -27,12 +27,19 @@ def _test_env(monkeypatch):
     monkeypatch.setenv("ENCRYPTION_KEY", _gen_fernet_key())
     monkeypatch.setenv("SECRET_KEY", "test-secret")
     monkeypatch.setenv("ADMIN_PASSWORD_HASH", "$2b$12$dummyhash")
+    monkeypatch.setenv("ADMIN_COOKIE_SECURE", "true")
     monkeypatch.setenv("FUNPAY_SESSION_KEY", "")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("TELEGRAM_SELLER_CHAT_ID", "")
 
     from app.config import get_settings
 
+    get_settings.cache_clear()
+    from app.api.routers.auth import _login_limiter
+
+    _login_limiter.clear()
+    yield
+    _login_limiter.clear()
     get_settings.cache_clear()
 
 

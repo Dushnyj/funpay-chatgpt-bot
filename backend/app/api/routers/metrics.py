@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
@@ -16,16 +16,10 @@ router = APIRouter(prefix="/api/metrics", tags=["metrics"], dependencies=[Depend
 
 
 @router.get("", response_model=MetricsOut)
-async def get_metrics(session: AsyncSession = Depends(get_db_session)):
+async def get_metrics(request: Request, session: AsyncSession = Depends(get_db_session)):
     active_rentals = (
         await session.execute(
             select(func.count()).select_from(Rental).where(Rental.status == "active")
-        )
-    ).scalar_one()
-
-    available_accounts = (
-        await session.execute(
-            select(func.count()).select_from(Account).where(Account.status == "active")
         )
     ).scalar_one()
 
@@ -48,7 +42,47 @@ async def get_metrics(session: AsyncSession = Depends(get_db_session)):
 
     settings = await session.get(SellerSettings, 1)
     commission = settings.funpay_commission_percent if settings else 15
+    default_capacity = settings.default_max_active_rentals if settings else 1
     revenue_netto = int(revenue_brutto * (100 - commission) / 100)
+
+    active_by_account = (
+        select(Rental.account_id, func.count(Rental.id).label("active_count"))
+        .where(Rental.status == "active")
+        .group_by(Rental.account_id)
+        .subquery()
+    )
+    active_count = func.coalesce(active_by_account.c.active_count, 0)
+    account_capacity = func.coalesce(Account.max_active_rentals, default_capacity)
+    free_capacity = case(
+        (account_capacity > active_count, account_capacity - active_count),
+        else_=0,
+    )
+    available_accounts = (
+        await session.execute(
+            select(func.coalesce(func.sum(free_capacity), 0))
+            .select_from(Account)
+            .outerjoin(active_by_account, active_by_account.c.account_id == Account.id)
+            .where(
+                Account.status == "active",
+                or_(
+                    Account.subscription_expires_at.is_(None),
+                    Account.subscription_expires_at > now,
+                ),
+            )
+        )
+    ).scalar_one()
+
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    runner = getattr(lifecycle, "runner", None)
+    runtime_error = getattr(lifecycle, "last_funpay_error", None) or getattr(
+        runner, "last_error", None,
+    )
+    if runtime_error:
+        bot_status = "error"
+    elif runner is not None and getattr(runner, "started", False):
+        bot_status = "connected"
+    else:
+        bot_status = "disconnected"
 
     return MetricsOut(
         active_rentals=active_rentals,
@@ -56,5 +90,5 @@ async def get_metrics(session: AsyncSession = Depends(get_db_session)):
         orders_today=orders_today,
         revenue_brutto=revenue_brutto,
         revenue_netto=revenue_netto,
-        bot_status="disconnected",
+        bot_status=bot_status,
     )

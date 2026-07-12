@@ -1,6 +1,9 @@
 import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from app.integrations.funpay.gateway import FakeChatGateway
+from app.integrations.funpay.exceptions import FunPayApiError, FunPayOfferResolutionError
+from app.integrations.funpay.gateway import FakeChatGateway, FunPayChatGateway
 from app.integrations.funpay.types import (
     OrderInfo,
     OfferInfo,
@@ -114,6 +117,72 @@ async def test_get_my_offers_returns_set(gw: FakeChatGateway):
     gw.set_my_offers(55, [offer])
     result = await gw.get_my_offers(subcategory_id=55)
     assert result == [offer]
+
+
+def _preview(offer_id: int, title: str, price: float):
+    return SimpleNamespace(
+        id=offer_id,
+        title=title,
+        price=SimpleNamespace(value=price),
+        disabled=False,
+        auto_delivery=False,
+    )
+
+
+async def test_engine_07_create_resolves_new_offer_id_from_snapshots():
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(side_effect=[
+            SimpleNamespace(offers={10: _preview(10, "Old", 10)}),
+            SimpleNamespace(offers={
+                10: _preview(10, "Old", 10),
+                42: _preview(42, "Target", 599),
+            }),
+        ]),
+        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        save_offer_fields=AsyncMock(return_value=True),
+    )
+    fields = OfferFieldsDTO(
+        offer_id=0, subcategory_id=55, title_ru="Target", title_en="Target",
+        desc_ru="", desc_en="", price=599, active=True, auto_delivery=False,
+    )
+
+    assert await FunPayChatGateway(bot).save_offer_fields(fields) == 42
+    bot.save_offer_fields.assert_awaited_once()
+
+
+async def test_engine_07_create_rejects_ambiguous_offer_id():
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(side_effect=[
+            SimpleNamespace(offers={}),
+            SimpleNamespace(offers={
+                41: _preview(41, "Target", 599),
+                42: _preview(42, "Target", 599),
+            }),
+        ]),
+        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        save_offer_fields=AsyncMock(return_value=True),
+    )
+    fields = OfferFieldsDTO(
+        offer_id=0, subcategory_id=55, title_ru="Target", title_en="Target",
+        desc_ru="", desc_en="", price=599, active=True, auto_delivery=False,
+    )
+
+    with pytest.raises(FunPayOfferResolutionError):
+        await FunPayChatGateway(bot).save_offer_fields(fields)
+
+
+async def test_engine_07_false_save_result_is_an_api_error():
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(return_value=SimpleNamespace(offers={})),
+        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        save_offer_fields=AsyncMock(return_value=False),
+    )
+    fields = OfferFieldsDTO(
+        offer_id=0, subcategory_id=55, title_ru="Target", title_en="Target",
+        desc_ru="", desc_en="", price=599, active=True, auto_delivery=False,
+    )
+    with pytest.raises(FunPayApiError):
+        await FunPayChatGateway(bot).save_offer_fields(fields)
 
 
 from app.integrations.funpay.gateway import (

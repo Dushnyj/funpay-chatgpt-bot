@@ -7,7 +7,6 @@ from app.integrations.openai.client import OpenAIClient
 from app.integrations.openai.exceptions import BackendApiError, RefreshFailedError, TokenExpiredError
 from app.integrations.openai.oauth import refresh_access_token
 from app.models.account import AccountLimits
-from app.services.crypto import decrypt, encrypt
 
 # access_token считается свежим, если истекает не раньше чем через это время
 _TOKEN_FRESH_THRESHOLD = timedelta(minutes=5)
@@ -31,7 +30,7 @@ async def measure_account_limits(session: AsyncSession, account_id: int) -> Meas
     if limits is None:
         raise ValueError(f"AccountLimits not found for account_id={account_id}")
 
-    access_token = decrypt(limits.access_token_encrypted) if limits.access_token_encrypted else None
+    access_token = limits.access_token_encrypted
     if access_token is None or _is_token_expired(limits.access_token_expires_at):
         refreshed = await _do_refresh(session, limits)
         if refreshed is None:
@@ -81,7 +80,7 @@ def _is_token_expired(expires_at: datetime | None) -> bool:
 async def _do_refresh(session: AsyncSession, limits: AccountLimits) -> str | None:
     """Обновляет access_token. При провале — ставит refresh_status=expired, возвращает None."""
     try:
-        refreshed = await refresh_access_token(decrypt(limits.refresh_token_encrypted))
+        refreshed = await refresh_access_token(limits.refresh_token_encrypted)
     except RefreshFailedError:
         limits.refresh_status = "expired"
         limits.refresh_failed_at = datetime.now(timezone.utc)
@@ -89,8 +88,8 @@ async def _do_refresh(session: AsyncSession, limits: AccountLimits) -> str | Non
         await session.commit()
         return None
 
-    limits.access_token_encrypted = encrypt(refreshed.access_token)
-    limits.refresh_token_encrypted = encrypt(refreshed.refresh_token)
+    limits.access_token_encrypted = refreshed.access_token
+    limits.refresh_token_encrypted = refreshed.refresh_token
     limits.access_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     limits.refresh_recover_attempts = 0
     limits.refresh_status = "ok"

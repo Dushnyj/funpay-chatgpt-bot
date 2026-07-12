@@ -35,7 +35,7 @@ class Rental(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), unique=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"))
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     buyer_funpay_id: Mapped[str] = mapped_column(String(64))
     buyer_funpay_chat_id: Mapped[str] = mapped_column(String(64))

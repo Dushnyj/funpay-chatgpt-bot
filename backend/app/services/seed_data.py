@@ -1,7 +1,20 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.message import MessageTemplate
+
+
+DEFAULT_TIERS: tuple[tuple[str, str], ...] = (
+    ("Plus", "ChatGPT Plus"),
+    ("Pro", "ChatGPT Pro"),
+)
+DEFAULT_DURATIONS: tuple[int, ...] = (1, 3, 5, 7, 15, 30)
+DEFAULT_LIMIT_SCOPES: tuple[tuple[str, str], ...] = (
+    ("any", "Без гарантии лимита"),
+    ("chat", "Chat"),
+    ("codex", "Codex"),
+)
 
 # Полный перечень ключей из спеки (секция MessageTemplate).
 # Каждый ключ имеет ru и en варианты с плейсхолдерами для str.format.
@@ -127,7 +140,40 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
-async def seed_message_templates(session: AsyncSession) -> None:
+async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
+    """Create the stable catalog defaults without overwriting operator data."""
+    existing_tiers = set(
+        (await session.execute(select(SubscriptionTier.name))).scalars().all()
+    )
+    for name, description in DEFAULT_TIERS:
+        if name not in existing_tiers:
+            session.add(
+                SubscriptionTier(name=name, description=description, is_active=True)
+            )
+
+    existing_durations = set(
+        (await session.execute(select(Duration.days))).scalars().all()
+    )
+    for sort_order, days in enumerate(DEFAULT_DURATIONS):
+        if days not in existing_durations:
+            session.add(Duration(days=days, is_enabled=True, sort_order=sort_order))
+
+    existing_scopes = set(
+        (await session.execute(select(LimitScope.code))).scalars().all()
+    )
+    for code, name in DEFAULT_LIMIT_SCOPES:
+        if code not in existing_scopes:
+            session.add(LimitScope(code=code, name=name))
+
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+
+
+async def seed_message_templates(
+    session: AsyncSession, *, commit: bool = True
+) -> None:
     """Заполняет таблицу MessageTemplate дефолтными значениями, если их нет.
 
     Идемпотентна: существующие шаблоны не перезаписываются, чтобы
@@ -143,4 +189,7 @@ async def seed_message_templates(session: AsyncSession) -> None:
             )
             if existing.scalar_one_or_none() is None:
                 session.add(MessageTemplate(key=key, lang=lang, content=content))
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()

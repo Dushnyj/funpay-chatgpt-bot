@@ -13,3 +13,7 @@ class FunPayApiError(FunPayError):
         self.status = status
         self.body = body
         super().__init__(f"FunPay API error {status}: {body}")
+
+
+class FunPayOfferResolutionError(FunPayError):
+    """Созданный offer нельзя однозначно найти после save_offer_fields()."""

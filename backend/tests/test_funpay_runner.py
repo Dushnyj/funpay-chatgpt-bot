@@ -1,4 +1,6 @@
+import asyncio
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,3 +60,108 @@ def test_runner_callbacks_is_dataclass():
     assert is_dataclass(RunnerCallbacks)
     assert is_dataclass(SaleHandlers)
     assert is_dataclass(MessageHandlers)
+
+
+async def test_runner_maps_message_from_me_flag():
+    class Dispatcher:
+        message_handler = None
+
+        def on_new_message(self):
+            def decorator(handler):
+                self.message_handler = handler
+                return handler
+            return decorator
+
+    callback = AsyncMock()
+    dispatcher = Dispatcher()
+    runner = FunPayRunner(
+        golden_key="test-key",
+        callbacks=RunnerCallbacks(on_message=callback),
+        category_id=1,
+        bot=object(),
+        dispatcher=dispatcher,
+    )
+    runner._register_handlers()
+    event = SimpleNamespace(message=SimpleNamespace(
+        id=10,
+        chat_id=20,
+        sender_id=30,
+        text="seller reply",
+        meta=None,
+        from_me=True,
+    ))
+
+    await dispatcher.message_handler(event)
+
+    mapped = callback.await_args.args[0]
+    assert mapped.from_me is True
+
+
+async def test_runner_tracks_listener_and_gateway_uses_same_bot():
+    async def _listen(_dp):
+        await asyncio.Event().wait()
+
+    bot = SimpleNamespace(
+        update=AsyncMock(),
+        listen_events=AsyncMock(side_effect=_listen),
+        stop_listening=AsyncMock(),
+    )
+    runner = FunPayRunner(
+        "key", RunnerCallbacks(), 1,
+        bot=bot, dispatcher=object(), reconnect_delay=0.01,
+    )
+
+    await runner.start()
+
+    assert runner.started is True
+    assert runner.listener_task is not None
+    assert runner.gateway._bot is bot
+    await runner.stop()
+    assert runner.listener_task is None
+    bot.stop_listening.assert_awaited_once()
+
+
+async def test_runner_sale_handlers_keep_distinct_callbacks():
+    class Dispatcher:
+        handlers = {}
+
+        def _decorator(self, name):
+            def register(handler):
+                self.handlers[name] = handler
+                return handler
+            return register
+
+        def on_new_sale(self):
+            return self._decorator("new")
+
+        def on_sale_closed(self):
+            return self._decorator("closed")
+
+        def on_sale_refunded(self):
+            return self._decorator("refunded")
+
+    new = AsyncMock()
+    closed = AsyncMock()
+    refunded = AsyncMock()
+    dispatcher = Dispatcher()
+    runner = FunPayRunner(
+        "key",
+        RunnerCallbacks(
+            on_new_sale=new,
+            on_sale_closed=closed,
+            on_sale_refunded=refunded,
+        ),
+        1,
+        bot=object(),
+        dispatcher=dispatcher,
+    )
+    runner._register_handlers()
+    event = SimpleNamespace(object=SimpleNamespace(meta=SimpleNamespace(order_id="O-1")))
+
+    await dispatcher.handlers["new"](event)
+    await dispatcher.handlers["closed"](event)
+    await dispatcher.handlers["refunded"](event)
+
+    new.assert_awaited_once_with("O-1")
+    closed.assert_awaited_once_with("O-1")
+    refunded.assert_awaited_once_with("O-1")

@@ -8,13 +8,16 @@
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from app.integrations.playwright.oauth_login import (
     OAuthLoginError,
     _do_post_password_steps,
+    _parse_oauth_callback,
 )
 
 
@@ -165,13 +168,22 @@ async def test_login_and_get_auth_code_backward_compat_positional(monkeypatch):
     from app.integrations.playwright import oauth_login
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-    async def _quick_wait(holder_dict):
-        holder_dict["code"] = "auth-code-123"
-
     page = MagicMock()
-    page.on = MagicMock()
+    request_handlers = []
+    page.on = MagicMock(
+        side_effect=lambda event, handler: request_handlers.append(handler)
+        if event == "request" else None
+    )
     page.close = AsyncMock()
-    page.goto = AsyncMock()
+    page.route = AsyncMock()
+
+    async def _goto(url, **_kwargs):
+        state = parse_qs(urlparse(url).query)["state"][0]
+        request_handlers[0](SimpleNamespace(
+            url=f"http://localhost:1455/auth/callback?code=auth-code-123&state={state}"
+        ))
+
+    page.goto = AsyncMock(side_effect=_goto)
 
     def _noop_locator(_selector: str):
         loc = MagicMock()
@@ -189,8 +201,6 @@ async def test_login_and_get_auth_code_backward_compat_positional(monkeypatch):
     context = MagicMock()
     context.new_page = AsyncMock(return_value=page)
 
-    monkeypatch.setattr(oauth_login, "_wait_for_code", _quick_wait)
-
     # Позиционный вызов как раньше: (context, login, password, totp_secret)
     code, verifier = await oauth_login.login_and_get_auth_code(
         context, "user@example.com", "pass", "JBSWY3DPEHPK3PXP"
@@ -199,3 +209,25 @@ async def test_login_and_get_auth_code_backward_compat_positional(monkeypatch):
     assert code == "auth-code-123"
     assert isinstance(verifier, str) and verifier
     page.close.assert_awaited_once()
+
+
+def test_parse_oauth_callback_validates_state_and_endpoint():
+    assert _parse_oauth_callback(
+        "http://localhost:1455/auth/callback?code=abc&state=expected",
+        "expected",
+    ) == "abc"
+    assert _parse_oauth_callback("https://example.com/?code=abc", "expected") is None
+    with pytest.raises(OAuthLoginError, match="state mismatch"):
+        _parse_oauth_callback(
+            "http://localhost:1455/auth/callback?code=abc&state=wrong",
+            "expected",
+        )
+
+
+def test_parse_oauth_callback_propagates_provider_error():
+    with pytest.raises(OAuthLoginError, match="access denied"):
+        _parse_oauth_callback(
+            "http://localhost:1455/auth/callback?error=access_denied"
+            "&error_description=access%20denied&state=expected",
+            "expected",
+        )

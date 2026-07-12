@@ -24,6 +24,11 @@ class OrderInfo:
     subcategory_id: int
     title: str | None
     price: float | None
+    # FunPayBotEngine 0.7 OrderPage does not currently expose this field, but
+    # keeping it in the boundary DTO lets adapters use it when FunPay adds it
+    # (or when another parser can recover it).  Domain matching always prefers
+    # this stable remote identifier over title/price fallbacks.
+    offer_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,7 @@ class MessageInfo:
     sender_id: int | None
     text: str | None
     order_id: str | None
+    from_me: bool = False
 
 
 @dataclass(frozen=True)

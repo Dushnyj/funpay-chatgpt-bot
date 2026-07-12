@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
@@ -36,7 +37,11 @@ async def create_lot(req: LotCreate, session: AsyncSession = Depends(get_db_sess
         auto_created=False,
     )
     session.add(lot)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Invalid or duplicate lot configuration")
     await session.refresh(lot)
     return lot
 

@@ -6,6 +6,7 @@ from app.integrations.funpay.gateway import FakeChatGateway
 from app.integrations.funpay.runner import RunnerCallbacks
 from app.integrations.funpay.types import MessageInfo, OrderInfo, SaleStatus
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
+from app.models.chat import ChatConversation, ChatMessage
 from app.models.lot import Lot
 from app.models.rental import Order
 from app.services.funpay_lifecycle import build_callbacks
@@ -95,6 +96,53 @@ async def test_on_message_callback_dispatches_command(session: AsyncSession):
     # Распознанная команда без зарегистрированного хэндлера → UnhandledMessage,
     # но lifecycle ловит и логирует (не падает)
     await callbacks.on_message(msg)  # type: ignore
+
+
+async def test_on_message_callback_persists_incoming_and_is_idempotent(session: AsyncSession):
+    gateway = FakeChatGateway()
+    callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
+    msg = MessageInfo(
+        message_id=501,
+        chat_id=100,
+        sender_id=200,
+        text="Обычное сообщение покупателя",
+        order_id="ord-1",
+    )
+
+    await callbacks.on_message(msg)  # type: ignore
+    await callbacks.on_message(msg)  # type: ignore
+
+    conversations = (await session.execute(select(ChatConversation))).scalars().all()
+    messages = (await session.execute(select(ChatMessage))).scalars().all()
+    assert len(conversations) == 1
+    assert conversations[0].unread_count == 1
+    assert conversations[0].buyer_funpay_id == "200"
+    assert len(messages) == 1
+    assert messages[0].delivery_status == "received"
+
+
+async def test_on_message_callback_stores_from_me_without_dispatch(session: AsyncSession):
+    gateway = FakeChatGateway()
+    callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
+    msg = MessageInfo(
+        message_id=502,
+        chat_id=100,
+        sender_id=999,
+        text="!помощь",
+        order_id=None,
+        from_me=True,
+    )
+
+    await callbacks.on_message(msg)  # type: ignore
+
+    conversation = (await session.execute(select(ChatConversation))).scalar_one()
+    stored = (await session.execute(select(ChatMessage))).scalar_one()
+    assert conversation.unread_count == 0
+    assert conversation.last_message_direction == "outgoing"
+    assert stored.direction == "outgoing"
+    assert stored.delivery_status == "sent"
+    assert stored.is_read is True
+    assert gateway.sent_messages == []
 
 
 async def test_on_new_sale_creates_rental_when_account_available(session: AsyncSession):

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _Base(BaseModel):
@@ -27,14 +28,14 @@ class TierOut(_Base):
 
 
 class TierCreate(BaseModel):
-    name: str
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
     is_active: bool = True
 
 
 class TierUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
     is_active: bool | None = None
 
 
@@ -46,7 +47,7 @@ class DurationOut(_Base):
 
 
 class DurationUpdate(BaseModel):
-    id: int
+    id: int = Field(gt=0)
     is_enabled: bool | None = None
     sort_order: int | None = None
 
@@ -71,22 +72,22 @@ class AccountOut(_Base):
 
 
 class AccountCreate(BaseModel):
-    login: str
-    password: str
-    totp_secret: str = ""
-    email: str | None = None
-    email_password: str | None = None
-    tier_id: int
+    login: str = Field(min_length=1, max_length=320)
+    password: str = Field(min_length=1, max_length=4096)
+    totp_secret: str = Field(default="", max_length=256)
+    email: str | None = Field(default=None, max_length=320)
+    email_password: str | None = Field(default=None, max_length=4096)
+    tier_id: int = Field(gt=0)
     subscription_expires_at: datetime | None = None
-    max_active_rentals: int | None = None
-    notes: str | None = None
+    max_active_rentals: int | None = Field(default=None, ge=1, le=100)
+    notes: str | None = Field(default=None, max_length=4000)
 
 
 class AccountUpdate(BaseModel):
     subscription_expires_at: datetime | None = None
-    max_active_rentals: int | None = None
-    status: str | None = None
-    notes: str | None = None
+    max_active_rentals: int | None = Field(default=None, ge=1, le=100)
+    status: Literal["pending_validation", "active", "maintenance", "disabled"] | None = None
+    notes: str | None = Field(default=None, max_length=4000)
 
 
 class AccountLimitsOut(_Base):
@@ -106,17 +107,17 @@ class AccountWithLimits(AccountOut):
 # --- Price Matrix ---
 
 class PriceMatrixItem(BaseModel):
-    tier_id: int
-    duration_id: int
-    limit_scope_id: int
-    min_limit_pct: int | None = None
-    max_5h_pct: int | None = None
-    max_weekly_pct: int | None = None
-    price: int
+    tier_id: int = Field(gt=0)
+    duration_id: int = Field(gt=0)
+    limit_scope_id: int = Field(gt=0)
+    min_limit_pct: int | None = Field(default=None, ge=0, le=100)
+    max_5h_pct: int | None = Field(default=None, ge=0, le=100)
+    max_weekly_pct: int | None = Field(default=None, ge=0, le=100)
+    price: int = Field(gt=0, le=100_000_000)
 
 
 class PriceMatrixUpdate(BaseModel):
-    items: list[PriceMatrixItem]
+    items: list[PriceMatrixItem] = Field(min_length=1, max_length=10_000)
 
 
 # --- Templates ---
@@ -128,13 +129,13 @@ class TemplateOut(_Base):
 
 
 class TemplateItem(BaseModel):
-    key: str
-    lang: str
-    content: str
+    key: str = Field(min_length=1, max_length=100)
+    lang: Literal["ru", "en"]
+    content: str = Field(min_length=1, max_length=20_000)
 
 
 class TemplateUpdate(BaseModel):
-    items: list[TemplateItem]
+    items: list[TemplateItem] = Field(min_length=1, max_length=500)
 
 
 # --- Lots ---
@@ -157,18 +158,18 @@ class LotOut(_Base):
 
 
 class LotCreate(BaseModel):
-    funpay_node_id: int | None = None
-    tier_id: int
-    duration_id: int
-    limit_scope_id: int
-    min_limit_pct: int | None = None
-    max_5h_pct: int | None = None
-    max_weekly_pct: int | None = None
-    price: int
-    title_ru: str
-    title_en: str
-    description_ru: str = ""
-    description_en: str = ""
+    funpay_node_id: int | None = Field(default=None, gt=0)
+    tier_id: int = Field(gt=0)
+    duration_id: int = Field(gt=0)
+    limit_scope_id: int = Field(gt=0)
+    min_limit_pct: int | None = Field(default=None, ge=0, le=100)
+    max_5h_pct: int | None = Field(default=None, ge=0, le=100)
+    max_weekly_pct: int | None = Field(default=None, ge=0, le=100)
+    price: int = Field(gt=0, le=100_000_000)
+    title_ru: str = Field(min_length=1, max_length=255)
+    title_en: str = Field(min_length=1, max_length=255)
+    description_ru: str = Field(default="", max_length=4000)
+    description_en: str = Field(default="", max_length=4000)
 
 
 # --- Orders / Rentals ---
@@ -205,7 +206,7 @@ class RentalOut(_Base):
 
 
 class RentalPatch(BaseModel):
-    status: str | None = None
+    status: Literal["active", "expired", "refunded", "replaced"] | None = None
 
 
 # --- Settings ---
@@ -222,14 +223,58 @@ class SettingsOut(_Base):
 
 
 class SettingsUpdate(BaseModel):
-    funpay_node_id: int | None = None
+    funpay_node_id: int | None = Field(default=None, gt=0)
     auto_bump_enabled: bool | None = None
-    bump_interval_hours: int | None = None
-    default_max_active_rentals: int | None = None
-    funpay_commission_percent: int | None = None
-    check_interval_minutes: int | None = None
-    limits_check_interval_minutes: int | None = None
-    limits_warn_threshold_pct: int | None = None
+    bump_interval_hours: int | None = Field(default=None, ge=1, le=168)
+    default_max_active_rentals: int | None = Field(default=None, ge=1, le=100)
+    funpay_commission_percent: int | None = Field(default=None, ge=0, le=100)
+    check_interval_minutes: int | None = Field(default=None, ge=1, le=10_080)
+    limits_check_interval_minutes: int | None = Field(default=None, ge=1, le=10_080)
+    limits_warn_threshold_pct: int | None = Field(default=None, ge=0, le=100)
+
+    @field_validator(
+        "auto_bump_enabled",
+        "bump_interval_hours",
+        "default_max_active_rentals",
+        "funpay_commission_percent",
+        "check_interval_minutes",
+        "limits_check_interval_minutes",
+        "limits_warn_threshold_pct",
+        mode="before",
+    )
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
+
+
+class FunPayKeyUpdate(BaseModel):
+    key: str = Field(min_length=16, max_length=4096)
+
+    @field_validator("key")
+    @classmethod
+    def normalize_key(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 16:
+            raise ValueError("FunPay key must contain at least 16 characters")
+        return value
+
+
+class FunPayKeyStatus(BaseModel):
+    configured: bool
+    last4: str | None = None
+
+
+class TelegramConfigUpdate(BaseModel):
+    token: str | None = Field(default=None, min_length=8, max_length=4096)
+    seller_chat_id: str | None = Field(default=None, max_length=128)
+
+
+class TelegramConfigStatus(BaseModel):
+    configured: bool
+    token_last4: str | None = None
+    seller_chat_id: str | None = None
 
 
 # --- Metrics ---

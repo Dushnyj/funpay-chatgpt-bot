@@ -27,6 +27,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-funpay}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-funpay_bot}
     ports:
       - "127.0.0.1:8000:8000"
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    stop_grace_period: 30s
 
 volumes:
   postgres_data:

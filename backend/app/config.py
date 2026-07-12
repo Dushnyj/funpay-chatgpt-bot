@@ -1,7 +1,7 @@
 from functools import lru_cache
 
 from cryptography.fernet import Fernet
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     encryption_key: str
     secret_key: str
     admin_password_hash: str = ""
+    admin_cookie_secure: bool = True
+    admin_login_max_attempts: int = Field(default=5, ge=1, le=100)
+    admin_login_window_seconds: int = Field(default=300, ge=1, le=86400)
     funpay_session_key: str = ""
     telegram_bot_token: str = ""
     telegram_seller_chat_id: str = ""

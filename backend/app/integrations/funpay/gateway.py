@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import math
+import re
+from collections.abc import Iterable, Mapping
 from typing import Protocol, runtime_checkable
 
+from app.integrations.funpay.exceptions import FunPayApiError, FunPayOfferResolutionError
 from app.integrations.funpay.types import (
     OrderInfo,
     OfferInfo,
@@ -33,6 +37,10 @@ class ChatGateway(Protocol):
         """Получить список своих лотов в подкатегории."""
         ...
 
+    async def get_category_id(self, subcategory_id: int) -> int | None:
+        """Resolve parent category id needed by FunPay raise_offers()."""
+        ...
+
     async def bump_category(self, category_id: int, subcategory_id: int) -> bool:
         """Поднять все лоты подкатегории (FunPay bump)."""
         ...
@@ -53,12 +61,16 @@ class FakeChatGateway:
         self.activity_changes: list[tuple[int, bool]] = []
         self.bumped: list[tuple[int, int]] = []
         self._my_offers: dict[int, list[OfferInfo]] = {}
+        self._category_ids: dict[int, int] = {}
 
     def set_order(self, order: OrderInfo) -> None:
         self._orders[order.order_id] = order
 
     def set_my_offers(self, subcategory_id: int, offers: list[OfferInfo]) -> None:
         self._my_offers[subcategory_id] = offers
+
+    def set_category_id(self, subcategory_id: int, category_id: int) -> None:
+        self._category_ids[subcategory_id] = category_id
 
     async def send_message(self, chat_id: int, text: str) -> int:
         msg_id = self._next_message_id
@@ -97,6 +109,9 @@ class FakeChatGateway:
 
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
         return self._my_offers.get(subcategory_id, [])
+
+    async def get_category_id(self, subcategory_id: int) -> int | None:
+        return self._category_ids.get(subcategory_id)
 
     async def bump_category(self, category_id: int, subcategory_id: int) -> bool:
         self.bumped.append((category_id, subcategory_id))
@@ -138,7 +153,45 @@ def _build_order_info(page) -> OrderInfo:
         subcategory_id=page.order_subcategory_id,
         title=page.short_description,
         price=price,
+        offer_id=_extract_order_offer_id(page),
     )
+
+
+def _extract_order_offer_id(page) -> int | None:
+    """Best-effort extraction of an offer id from parser/vendor extensions.
+
+    FunPayBotEngine 0.7 does not expose an offer id on ``OrderPage``.  Some
+    patched parsers and page payloads do, so the adapter accepts those values
+    without making the domain depend on their exact shape.
+    """
+    for attr in ("offer_id", "order_offer_id"):
+        value = getattr(page, attr, None)
+        parsed = _positive_int(value)
+        if parsed is not None:
+            return parsed
+
+    data = getattr(page, "data", None)
+    if isinstance(data, Mapping):
+        normalized = {str(key).strip().lower(): value for key, value in data.items()}
+        for key in ("offer_id", "offer id", "id лота", "id предложения"):
+            parsed = _positive_int(normalized.get(key))
+            if parsed is not None:
+                return parsed
+
+        # A patched parser may retain a canonical offer URL in the order data.
+        for value in normalized.values():
+            match = re.search(r"(?:offer\?id=|offer/)(\d+)", str(value))
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def _positive_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _build_offer_info(preview) -> OfferInfo:
@@ -176,6 +229,13 @@ class FunPayChatGateway:
         return _build_order_info(page)
 
     async def save_offer_fields(self, fields: OfferFieldsDTO) -> int:
+        if self._bot is None:
+            raise RuntimeError("FunPayChatGateway requires a bound Bot")
+
+        before: list[OfferInfo] = []
+        if fields.offer_id <= 0:
+            before = await self.get_my_offers(fields.subcategory_id)
+
         if fields.offer_id > 0:
             fp_fields = await self._bot.get_offer_fields(offer_id=fields.offer_id)
         else:
@@ -189,8 +249,14 @@ class FunPayChatGateway:
         fp_fields.auto_delivery = fields.auto_delivery
         if fields.offer_id > 0:
             fp_fields.offer_id = fields.offer_id
-        await self._bot.save_offer_fields(fp_fields)
-        return fields.offer_id if fields.offer_id > 0 else 0
+        saved = await self._bot.save_offer_fields(fp_fields)
+        if not saved:
+            raise FunPayApiError(0, "save_offer_fields returned false")
+        if fields.offer_id > 0:
+            return fields.offer_id
+
+        after = await self.get_my_offers(fields.subcategory_id)
+        return _resolve_created_offer_id(before, after, fields)
 
     async def set_offer_active(self, offer_id: int, active: bool) -> bool:
         fp_fields = await self._bot.get_offer_fields(offer_id=offer_id)
@@ -213,6 +279,54 @@ class FunPayChatGateway:
             ))
         return result
 
+    async def get_category_id(self, subcategory_id: int) -> int | None:
+        page = await self._bot.get_my_offers_page(subcategory_id=subcategory_id)
+        return _positive_int(page.category_id)
+
     async def bump_category(self, category_id: int, subcategory_id: int) -> bool:
         response = await self._bot.raise_offers(category_id, subcategory_id)
         return bool(response)
+
+
+def _resolve_created_offer_id(
+    before: Iterable[OfferInfo],
+    after: Iterable[OfferInfo],
+    requested: OfferFieldsDTO,
+) -> int:
+    """Resolve the ID created by FunPayBotEngine 0.7.
+
+    ``Bot.save_offer_fields`` returns only a boolean.  The reliable signal is
+    the set difference between ``get_my_offers_page`` snapshots.  A strict
+    title/price match is used only when the snapshot contains several new
+    offers; ambiguity is an error rather than silently persisting ``0`` or the
+    wrong offer id.
+    """
+    before_ids = {item.offer_id for item in before}
+    new_items = [item for item in after if item.offer_id not in before_ids]
+    if len(new_items) == 1:
+        return new_items[0].offer_id
+
+    requested_titles = {
+        _normalize_offer_title(requested.title_ru),
+        _normalize_offer_title(requested.title_en),
+    }
+    requested_titles.discard("")
+    matching = [
+        item
+        for item in new_items
+        if _normalize_offer_title(item.title) in requested_titles
+        and _same_price(item.price, requested.price)
+    ]
+    if len(matching) == 1:
+        return matching[0].offer_id
+    raise FunPayOfferResolutionError(
+        "FunPay accepted a new offer but its id could not be resolved uniquely"
+    )
+
+
+def _normalize_offer_title(value: str | None) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _same_price(left: float | None, right: float | None) -> bool:
+    return left is not None and right is not None and math.isclose(left, right, abs_tol=0.01)

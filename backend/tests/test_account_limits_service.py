@@ -9,7 +9,6 @@ import pytest
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.services.account_limits import MeasureResult, measure_account_limits
-from app.services.crypto import decrypt, encrypt
 
 
 @pytest.mark.asyncio
@@ -23,8 +22,8 @@ async def test_measure_and_update_success(session, httpx_mock):
 
     acc = Account(
         login="u@e.com",
-        password_encrypted=encrypt("pass"),
-        totp_secret_encrypted=encrypt("JBSWY3DPEHPK3PXP"),
+        password_encrypted="pass",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
         tier_id=tier.id,
         status="active",
     )
@@ -33,8 +32,8 @@ async def test_measure_and_update_success(session, httpx_mock):
 
     limits = AccountLimits(
         account_id=acc.id,
-        refresh_token_encrypted=encrypt("valid-refresh-token"),
-        access_token_encrypted=encrypt("old-expired-access"),
+        refresh_token_encrypted="valid-refresh-token",
+        access_token_encrypted="old-expired-access",
         access_token_expires_at=datetime(2020, 1, 1, tzinfo=timezone.utc),  # протух
         account_id_openai="acc-openai-1",
         refresh_status="ok",
@@ -83,8 +82,8 @@ async def test_measure_and_update_success(session, httpx_mock):
 
     # Проверяем обновлённые поля
     reloaded = await session.get(AccountLimits, acc.id)
-    assert decrypt(reloaded.access_token_encrypted) == "fresh-access"
-    assert decrypt(reloaded.refresh_token_encrypted) == "fresh-refresh"
+    assert reloaded.access_token_encrypted == "fresh-access"
+    assert reloaded.refresh_token_encrypted == "fresh-refresh"
     assert reloaded.chat_5h_remaining_pct == 80  # 100 - 20
     assert reloaded.codex_5h_remaining_pct == 80  # то же (общий лимит)
     assert reloaded.chat_weekly_remaining_pct == 50
@@ -103,8 +102,8 @@ async def test_measure_refresh_failed_sets_status(session, httpx_mock):
 
     acc = Account(
         login="bad@e.com",
-        password_encrypted=encrypt("pass"),
-        totp_secret_encrypted=encrypt("totp"),
+        password_encrypted="pass",
+        totp_secret_encrypted="totp",
         tier_id=tier.id,
         status="active",
     )
@@ -113,8 +112,8 @@ async def test_measure_refresh_failed_sets_status(session, httpx_mock):
 
     limits = AccountLimits(
         account_id=acc.id,
-        refresh_token_encrypted=encrypt("expired-refresh"),
-        access_token_encrypted=encrypt("expired-access"),
+        refresh_token_encrypted="expired-refresh",
+        access_token_encrypted="expired-access",
         access_token_expires_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         refresh_status="ok",
     )
@@ -143,7 +142,7 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     session.add(tier)
     await session.flush()
 
-    acc = Account(login="fresh@e.com", password_encrypted=encrypt("p"), totp_secret_encrypted=encrypt("t"), tier_id=tier.id, status="active")
+    acc = Account(login="fresh@e.com", password_encrypted="p", totp_secret_encrypted="t", tier_id=tier.id, status="active")
     session.add(acc)
     await session.flush()
 
@@ -151,8 +150,8 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     future = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=1)
     limits = AccountLimits(
         account_id=acc.id,
-        refresh_token_encrypted=encrypt("rt"),
-        access_token_encrypted=encrypt("valid-access"),
+        refresh_token_encrypted="rt",
+        access_token_encrypted="valid-access",
         access_token_expires_at=future,
         account_id_openai="acc-1",
         refresh_status="ok",
@@ -177,7 +176,7 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
 
     reloaded = await session.get(AccountLimits, acc.id)
     # access_token не изменился
-    assert decrypt(reloaded.access_token_encrypted) == "valid-access"
+    assert reloaded.access_token_encrypted == "valid-access"
 
 
 # Вспомогательная для JWT

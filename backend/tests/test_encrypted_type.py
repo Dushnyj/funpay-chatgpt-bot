@@ -4,6 +4,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 from app.types.encrypted import FernetEncrypted
+from app.services.crypto import encrypt
 
 
 class _SampleModel(Base):
@@ -34,3 +35,17 @@ async def test_encrypted_type_stores_ciphertext_not_plaintext(session):
     raw = await session.execute(text("SELECT secret FROM sample_for_encrypted_test"))
     raw_value = raw.scalar_one()
     assert raw_value != "plaintext-value"
+
+
+@pytest.mark.asyncio
+async def test_encrypted_type_reads_historical_double_encryption(session):
+    double_encrypted = encrypt(encrypt("legacy-secret"))
+    await session.execute(
+        text("INSERT INTO sample_for_encrypted_test (id, secret) VALUES (99, :secret)"),
+        {"secret": double_encrypted},
+    )
+    await session.commit()
+
+    fetched = await session.get(_SampleModel, 99)
+    assert fetched is not None
+    assert fetched.secret == "legacy-secret"

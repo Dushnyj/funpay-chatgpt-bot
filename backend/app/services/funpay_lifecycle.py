@@ -17,6 +17,7 @@ from app.services.command_handlers import (
 )
 from app.services.command_parser import CommandType
 from app.services.command_router import CommandRouter, UnhandledMessage
+from app.services.chat_service import ChatService
 from app.services.order_processor import OrderProcessor, LotNotFoundError
 from app.services.rental_service import RentalService
 
@@ -41,6 +42,7 @@ def build_callbacks(
     """
     order_processor = OrderProcessor()
     rental_service = RentalService()
+    chat_service = ChatService()
     router = command_router or CommandRouter()
 
     # Регистрируем хэндлеры команд для on_message.
@@ -104,6 +106,24 @@ def build_callbacks(
 
     async def on_message(msg: MessageInfo) -> None:
         async with session_factory() as session:
+            try:
+                _, created = await chat_service.record_event(session, msg)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.exception("Failed to persist message in chat %s", msg.chat_id)
+                created = True
+
+            # Duplicate FunPay events must not increment unread counters or run
+            # a buyer command twice.
+            if not created:
+                return
+
+            # Messages sent by the seller/bot are part of history, but must
+            # never be parsed as buyer commands.
+            if msg.from_me:
+                return
+
             ctx = router.build_context(
                 chat_id=msg.chat_id,
                 sender_id=msg.sender_id or 0,

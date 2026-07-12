@@ -150,3 +150,38 @@ export interface Metrics {
   revenue_netto: number
   bot_status: string
 }
+
+export interface FunPayKeyStatus {
+  configured: boolean
+  last4: string | null
+}
+
+export interface TelegramConfigStatus {
+  configured: boolean
+  token_last4: string | null
+  seller_chat_id: string | null
+}
+
+export interface ChatSummary {
+  id: number
+  funpay_chat_id: string
+  buyer_funpay_id: string | null
+  funpay_order_id: string | null
+  order_id: number | null
+  unread_count: number
+  last_message_text: string | null
+  last_message_direction: 'incoming' | 'outgoing' | null
+  last_message_at: string | null
+}
+
+export interface ChatMessage {
+  id: number
+  conversation_id: number
+  funpay_message_id: string | null
+  direction: 'incoming' | 'outgoing'
+  sender_funpay_id: string | null
+  text: string
+  delivery_status: 'received' | 'pending' | 'sent' | 'failed'
+  is_read: boolean
+  created_at: string
+}

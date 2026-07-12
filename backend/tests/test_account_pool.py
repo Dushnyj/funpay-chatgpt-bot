@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountLimits
@@ -187,3 +188,60 @@ async def test_acquire_fifo_orders_by_subscription_expires_asc(session: AsyncSes
     result = await pool.acquire(session, criteria, default_max_active_rentals=5)
     assert result is not None
     assert result.id == acc2.id
+
+
+async def test_postgresql_query_uses_portable_case_and_skip_locked():
+    class _Result:
+        def scalar_one_or_none(self):
+            return None
+
+    class _CaptureSession:
+        statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return _Result()
+
+    session = _CaptureSession()
+    criteria = AccountCriteria(
+        tier_id=1,
+        duration_days=7,
+        scope="chat",
+        min_limit_pct=50,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+    await AccountPool().acquire(session, criteria, default_max_active_rentals=1)
+
+    sql = str(
+        session.statement.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+    assert "CASE WHEN" in sql
+    assert "min(" not in sql.lower()
+    assert "FOR UPDATE OF accounts SKIP LOCKED" in sql
+
+
+async def test_acquire_excluding_does_not_mutate_excluded_account(session: AsyncSession):
+    tier, duration, _ = await _seed_tier_ds(session)
+    excluded = await _add_account(session, tier, login="excluded")
+    candidate = await _add_account(session, tier, login="candidate")
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_days=duration.days,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    result = await AccountPool().acquire_excluding(
+        session,
+        criteria,
+        exclude_account_id=excluded.id,
+        default_max_active_rentals=1,
+    )
+
+    assert result is not None and result.id == candidate.id
+    assert excluded.status == "active"

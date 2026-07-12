@@ -13,7 +13,6 @@ from app.integrations.playwright.enable_2fa import Enable2FAError, enable_2fa
 from app.integrations.playwright.oauth_login import OAuthLoginError, login_and_get_auth_code
 from app.models.account import Account, AccountLimits
 from app.services.account_limits import MeasureResult, measure_account_limits
-from app.services.crypto import decrypt, encrypt
 from app.services.totp import is_valid_base32
 
 _REDIRECT_URI = "http://localhost:1455/auth/callback"
@@ -41,11 +40,11 @@ async def validate_account(session: AsyncSession, account_id: int) -> Validation
         raise ValueError(f"Account not found: {account_id}")
 
     login = account.login
-    password = decrypt(account.password_encrypted)
-    totp_secret = decrypt(account.totp_secret_encrypted)
+    password = account.password_encrypted
+    totp_secret = account.totp_secret_encrypted
     email = account.email
     email_password = (
-        decrypt(account.email_password_encrypted) if account.email_password_encrypted else None
+        account.email_password_encrypted if account.email_password_encrypted else None
     )
 
     # Ветвление по 2FA
@@ -100,10 +99,8 @@ async def _validate_and_enable_2fa(
         async with browser_context() as context:
             # Шаг 1: включаем 2FA, получаем secret
             secret = await enable_2fa(context, login, password, email_provider)
-            # Сохраняем secret в модель (encrypt() вручную — TypeDecorator шифрует
-            # повторно при записи; при чтении нужен decrypt(), как и для других
-            # *_encrypted полей в этом модуле).
-            account.totp_secret_encrypted = encrypt(secret)
+            # FernetEncrypted encrypts on write; ORM attributes stay plaintext.
+            account.totp_secret_encrypted = secret
             await session.commit()
 
             # Шаг 2: логин с новым TOTP для получения токенов
@@ -133,11 +130,11 @@ async def _save_tokens_and_measure(
     # Создание/обновление AccountLimits с полученными токенами
     limits = await session.get(AccountLimits, account.id)
     if limits is None:
-        limits = AccountLimits(account_id=account.id, refresh_token_encrypted=encrypt(tokens.refresh_token))
+        limits = AccountLimits(account_id=account.id, refresh_token_encrypted=tokens.refresh_token)
         session.add(limits)
 
-    limits.refresh_token_encrypted = encrypt(tokens.refresh_token)
-    limits.access_token_encrypted = encrypt(tokens.access_token)
+    limits.refresh_token_encrypted = tokens.refresh_token
+    limits.access_token_encrypted = tokens.access_token
     limits.account_id_openai = claims.account_id
     limits.refresh_status = "ok"
     limits.refresh_recover_attempts = 0

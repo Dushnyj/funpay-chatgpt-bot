@@ -55,6 +55,8 @@ class LotSyncService:
             offer_id = 0
         fields = build_offer_fields(lot, offer_id=offer_id, active=active)
         result_id = await gateway.save_offer_fields(fields)
+        if result_id <= 0:
+            raise RuntimeError("FunPay did not return a valid offer id")
         if not lot.funpay_id:
             lot.funpay_id = str(result_id)
             await session.flush()

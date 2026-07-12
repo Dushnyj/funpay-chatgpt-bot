@@ -6,8 +6,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from telegram import Bot
 
 from app.models.settings import SellerSettings
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+async def get_effective_telegram_config(
+    session: AsyncSession,
+) -> tuple[str, str]:
+    settings = await session.get(SellerSettings, 1)
+    app_settings = get_settings()
+    token = (
+        settings.telegram_bot_token
+        if settings is not None and settings.telegram_bot_token
+        else app_settings.telegram_bot_token
+    )
+    chat_id = (
+        settings.telegram_seller_chat_id
+        if settings is not None and settings.telegram_seller_chat_id
+        else app_settings.telegram_seller_chat_id
+    )
+    return token or "", chat_id or ""
 
 
 class TelegramNotifier:
@@ -23,12 +42,21 @@ class TelegramNotifier:
 
     @classmethod
     async def from_settings(cls, session: AsyncSession) -> TelegramNotifier | None:
-        settings = await session.get(SellerSettings, 1)
-        if settings is None or not settings.telegram_bot_token:
+        token, chat_id = await get_effective_telegram_config(session)
+        if not token:
             return None
         return cls(
-            bot_token=settings.telegram_bot_token or "",
-            seller_chat_id=settings.telegram_seller_chat_id or "",
+            bot_token=token,
+            seller_chat_id=chat_id,
+        )
+
+    async def send_test(self) -> None:
+        """Send a test notification and surface errors to the settings API."""
+        if self._bot is None or not self._seller_chat_id:
+            raise RuntimeError("Telegram is not configured")
+        await self._bot.send_message(
+            chat_id=self._seller_chat_id,
+            text="✅ FunPay Bot: Telegram notifications are configured.",
         )
 
     async def notify(self, text: str) -> None:

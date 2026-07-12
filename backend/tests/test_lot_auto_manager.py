@@ -101,3 +101,94 @@ async def test_activates_lot_when_capacity_returns(session: AsyncSession):
     await session.refresh(lot)
     assert lot.status == "active"
     assert (200, True) in gateway.activity_changes
+
+
+async def test_full_account_capacity_pauses_lot(session: AsyncSession):
+    tier, duration, scope = await _seed_catalog(session)
+    account = await _add_account_with_limits(session, tier.id)
+    account.max_active_rentals = 0
+    matrix = PriceMatrix(
+        tier_id=tier.id, duration_id=duration.id, limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key, funpay_node_id=55, tier_id=tier.id,
+        duration_id=duration.id, limit_scope_id=scope.id, price=599,
+        title_ru="T", title_en="T", status="active", auto_created=True,
+        funpay_id="300",
+    )
+    session.add(lot)
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert any(action.action == "pause" for action in actions)
+
+
+async def test_price_change_is_synced_to_existing_offer(session: AsyncSession):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    matrix = PriceMatrix(
+        tier_id=tier.id, duration_id=duration.id, limit_scope_id=scope.id,
+        price=799,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key, funpay_node_id=55, tier_id=tier.id,
+        duration_id=duration.id, limit_scope_id=scope.id, price=599,
+        title_ru="T", title_en="T", status="active", auto_created=True,
+        funpay_id="400",
+    )
+    session.add(lot)
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    actions = await LotAutoManager(55).run(session, gateway)
+
+    assert any(action.action == "update" for action in actions)
+    assert gateway.saved_offers[400].price == 799
+
+
+async def test_manual_pause_is_not_automatically_reactivated(session: AsyncSession):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    matrix = PriceMatrix(
+        tier_id=tier.id, duration_id=duration.id, limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key, funpay_node_id=55, tier_id=tier.id,
+        duration_id=duration.id, limit_scope_id=scope.id, price=599,
+        title_ru="T", title_en="T", status="paused", paused_reason="manual",
+        auto_created=True, funpay_id="500",
+    )
+    session.add(lot)
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    await LotAutoManager(55).run(session, gateway)
+
+    assert lot.status == "paused"
+    assert gateway.activity_changes == []
+
+
+async def test_removed_price_config_pauses_orphaned_lot(session: AsyncSession):
+    tier, duration, scope = await _seed_catalog(session)
+    lot = Lot(
+        funpay_node_id=55, tier_id=tier.id, duration_id=duration.id,
+        limit_scope_id=scope.id, price=599, title_ru="T", title_en="T",
+        status="active", auto_created=True, funpay_id="600",
+    )
+    session.add(lot)
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    actions = await LotAutoManager(55).run(session, gateway)
+
+    assert any(action.action == "pause" for action in actions)
+    assert lot.paused_reason == "auto_no_config"

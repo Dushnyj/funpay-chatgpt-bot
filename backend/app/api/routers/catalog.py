@@ -41,7 +41,11 @@ async def update_tier(tier_id: int, req: TierUpdate, session: AsyncSession = Dep
         raise HTTPException(status_code=404, detail="Tier not found")
     for field, value in req.model_dump(exclude_unset=True).items():
         setattr(tier, field, value)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Tier name already exists")
     await session.refresh(tier)
     return tier
 
@@ -52,7 +56,11 @@ async def delete_tier(tier_id: int, session: AsyncSession = Depends(get_db_sessi
     if tier is None:
         raise HTTPException(status_code=404, detail="Tier not found")
     await session.delete(tier)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Tier is used by accounts or lots")
 
 
 @router.get("/durations", response_model=list[DurationOut])

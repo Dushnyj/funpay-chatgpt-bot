@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from jose import JWTError, jwt
@@ -14,25 +15,45 @@ _COOKIE_NAME = "access_token"
 COOKIE_NAME = _COOKIE_NAME
 
 
+@dataclass(frozen=True)
+class AccessTokenClaims:
+    subject: str
+    session_version: int
+
+
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.verify(plain, hashed)
 
 
-def create_access_token(subject: str = "admin") -> str:
+def hash_password(plain: str) -> str:
+    return bcrypt.hash(plain)
+
+
+def create_access_token(subject: str = "admin", *, session_version: int = 0) -> str:
     settings = get_settings()
     now = datetime.now(timezone.utc)
     payload = {
         "sub": subject,
         "iat": int(now.timestamp()),
         "exp": int((now + _TOKEN_TTL).timestamp()),
+        "sv": session_version,
     }
     return jwt.encode(payload, settings.secret_key, algorithm=_ALGORITHM)
 
 
 def decode_access_token(token: str) -> str | None:
+    claims = decode_access_token_claims(token)
+    return claims.subject if claims is not None else None
+
+
+def decode_access_token_claims(token: str) -> AccessTokenClaims | None:
     settings = get_settings()
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[_ALGORITHM])
-        return payload.get("sub")
+        subject = payload.get("sub")
+        session_version = payload.get("sv", 0)
+        if not isinstance(subject, str) or not isinstance(session_version, int):
+            return None
+        return AccessTokenClaims(subject=subject, session_version=session_version)
     except JWTError:
         return None

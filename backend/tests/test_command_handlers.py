@@ -174,6 +174,26 @@ async def test_seller_handler_responds(session: AsyncSession):
 
 
 from app.services.command_handlers import ReplaceHandler
+from app.services.account_validation import ValidationOutcome
+from app.services.kick_service import KickResult
+
+
+async def _invalid_validator(_session, _account_id):
+    return ValidationOutcome.LOGIN_FAILED
+
+
+async def _healthy_validator(_session, _account_id):
+    return ValidationOutcome.OK
+
+
+class FakeKickService:
+    def __init__(self, success: bool = True):
+        self.success = success
+        self.calls: list[int] = []
+
+    async def kick(self, _session, account_id: int):
+        self.calls.append(account_id)
+        return KickResult(success=self.success, error=None if self.success else "failed")
 
 
 async def test_replace_handler_switches_account(session: AsyncSession):
@@ -199,7 +219,8 @@ async def test_replace_handler_switches_account(session: AsyncSession):
     await session.flush()
 
     gateway = FakeChatGateway()
-    handler = ReplaceHandler()
+    kick = FakeKickService()
+    handler = ReplaceHandler(validator=_invalid_validator, kick_service=kick)
     ctx = _ctx(gateway, session, command=CommandType.REPLACE)
     await handler(ctx)
     assert len(gateway.sent_messages) == 1
@@ -208,6 +229,9 @@ async def test_replace_handler_switches_account(session: AsyncSession):
     await session.refresh(rental)
     assert rental.account_id != old_account_id
     assert rental.replacement_count == 1
+    old_account = await session.get(Account, old_account_id)
+    assert old_account.status == "maintenance"
+    assert kick.calls == [old_account_id]
 
 
 async def test_replace_handler_no_account_available(session: AsyncSession):
@@ -216,7 +240,10 @@ async def test_replace_handler_no_account_available(session: AsyncSession):
     await seed_message_templates(session)
 
     gateway = FakeChatGateway()
-    handler = ReplaceHandler()
+    handler = ReplaceHandler(
+        validator=_invalid_validator,
+        kick_service=FakeKickService(),
+    )
     ctx = _ctx(gateway, session, command=CommandType.REPLACE)
     await handler(ctx)
     assert len(gateway.sent_messages) == 1
@@ -230,3 +257,53 @@ async def test_replace_handler_no_active_rental(session: AsyncSession):
     ctx = _ctx(gateway, session, chat_id=999, command=CommandType.REPLACE)
     await handler(ctx)
     assert len(gateway.sent_messages) == 1
+
+
+async def test_replace_handler_declines_healthy_account(session: AsyncSession):
+    from app.services.seed_data import seed_message_templates
+    rental = await _seed_rental(session)
+    await seed_message_templates(session)
+    kick = FakeKickService()
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler(validator=_healthy_validator, kick_service=kick)
+
+    await handler(_ctx(gateway, session, command=CommandType.REPLACE))
+
+    await session.refresh(rental)
+    assert rental.replacement_count == 0
+    assert kick.calls == []
+
+
+async def test_replace_handler_does_not_issue_second_account(session: AsyncSession):
+    from app.services.seed_data import seed_message_templates
+    rental = await _seed_rental(session)
+    rental.replacement_count = 1
+    await seed_message_templates(session)
+    kick = FakeKickService()
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler(validator=_invalid_validator, kick_service=kick)
+
+    await handler(_ctx(gateway, session, command=CommandType.REPLACE))
+
+    assert kick.calls == []
+    assert len(gateway.sent_messages) == 1
+
+
+async def test_replace_handler_stops_when_old_credentials_cannot_be_revoked(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+    rental = await _seed_rental(session)
+    old_account_id = rental.account_id
+    await seed_message_templates(session)
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler(
+        validator=_invalid_validator,
+        kick_service=FakeKickService(success=False),
+    )
+
+    await handler(_ctx(gateway, session, command=CommandType.REPLACE))
+
+    await session.refresh(rental)
+    assert rental.account_id == old_account_id
+    assert rental.replacement_count == 0

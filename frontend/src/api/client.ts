@@ -14,13 +14,20 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
-  if (resp.status === 401) {
+  if (resp.status === 401 && window.location.pathname !== '/login') {
     window.location.href = '/login'
     throw new ApiError(401, 'Unauthorized')
   }
   if (!resp.ok) {
-    const text = await resp.text().catch(() => resp.statusText)
-    throw new ApiError(resp.status, text)
+    const raw = await resp.text().catch(() => resp.statusText)
+    let message = raw || resp.statusText
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string }
+      message = parsed.detail ?? message
+    } catch {
+      // Ответ не в JSON — сохраняем исходный текст.
+    }
+    throw new ApiError(resp.status, message)
   }
   if (resp.status === 204) return undefined as T
   return resp.json()
@@ -34,5 +41,5 @@ export const api = {
     request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
-  delete: (path: string) => request<void>(path, { method: 'DELETE' }),
+  delete: <T = void>(path: string) => request<T>(path, { method: 'DELETE' }),
 }

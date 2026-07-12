@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
@@ -17,7 +18,7 @@ class PriceUpdateResponse(BaseModel):
 
 
 class PriceUpdateRequest(BaseModel):
-    items: list[PriceMatrixItem]
+    items: list[PriceMatrixItem] = Field(min_length=1, max_length=10_000)
 
 
 @router.get("", response_model=list[PriceMatrixItem])
@@ -34,7 +35,11 @@ async def list_prices(session: AsyncSession = Depends(get_db_session)):
 
 
 @router.put("", response_model=PriceUpdateResponse)
-async def update_prices(req: PriceUpdateRequest, session: AsyncSession = Depends(get_db_session)):
+async def update_prices(
+    req: PriceUpdateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
     await session.execute(delete(PriceMatrix))
     for item in req.items:
         session.add(PriceMatrix(
@@ -43,5 +48,18 @@ async def update_prices(req: PriceUpdateRequest, session: AsyncSession = Depends
             min_limit_pct=item.min_limit_pct, max_5h_pct=item.max_5h_pct,
             max_weekly_pct=item.max_weekly_pct, price=item.price,
         ))
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Invalid or duplicate price configuration")
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is not None:
+        try:
+            await lifecycle.reconcile_lots()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Prices saved, but FunPay reconciliation failed: {exc}",
+            ) from exc
     return PriceUpdateResponse(updated=len(req.items))

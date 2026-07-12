@@ -1,9 +1,12 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
+from app.models.account import Account, AccountCheckJob
+from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier
 
 
@@ -41,6 +44,24 @@ async def test_create_account(auth_client: AsyncClient, session: AsyncSession):
     assert data["status"] == "pending_validation"
     assert "password" not in str(data)
     assert "totp_secret" not in str(data)
+    account = await session.get(Account, data["id"])
+    assert account is not None
+    assert account.password_encrypted == "pass"
+    raw_password = (
+        await session.execute(
+            text("SELECT password_encrypted FROM accounts WHERE id=:id"),
+            {"id": data["id"]},
+        )
+    ).scalar_one()
+    assert raw_password != "pass"
+    jobs = (
+        await session.execute(
+            select(AccountCheckJob).where(AccountCheckJob.account_id == data["id"])
+        )
+    ).scalars().all()
+    assert [(job.priority, job.job_type, job.status) for job in jobs] == [
+        ("new", "full_validation", "pending")
+    ]
 
 
 async def test_get_account_detail(auth_client: AsyncClient, session: AsyncSession):
@@ -76,6 +97,10 @@ async def test_bulk_add_accounts(auth_client: AsyncClient, session: AsyncSession
     })
     assert resp.status_code == 201
     assert resp.json()["created"] == 2
+    job_count = (
+        await session.execute(select(func.count()).select_from(AccountCheckJob))
+    ).scalar_one()
+    assert job_count == 2
 
 
 async def test_patch_account_status(auth_client: AsyncClient, session: AsyncSession):
@@ -158,3 +183,34 @@ async def test_bulk_add_accounts_without_totp(auth_client: AsyncClient, session:
     })
     assert resp.status_code == 201
     assert resp.json()["created"] == 2
+
+
+async def test_totp_export_is_not_cacheable_and_is_audited(
+    auth_client: AsyncClient, session: AsyncSession
+):
+    tier_id = await _seed_tier(session)
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "totp-audit",
+            "password": "pass",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "tier_id": tier_id,
+        },
+    )
+
+    response = await auth_client.get(
+        f"/api/accounts/{created.json()['id']}/totp-export"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    audit = (
+        await session.execute(
+            select(AuditLog).where(AuditLog.event_type == "totp_export")
+        )
+    ).scalar_one()
+    assert audit.account_id == created.json()["id"]
+    assert audit.metadata_ == {"actor": "admin"}
+    assert audit.message_text is None

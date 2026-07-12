@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 
 import aioimaplib
 
@@ -27,6 +28,19 @@ _KNOWN_HOSTS = {
 
 _DEFAULT_PORT = 993
 _DEFAULT_FALLBACK_HOST = "imap.gmail.com"
+
+
+class IMAPResponseError(RuntimeError):
+    """An IMAP command completed with a non-OK protocol response."""
+
+
+def _require_ok(response, operation: str) -> None:
+    result = getattr(response, "result", "")
+    if isinstance(result, bytes):
+        result = result.decode(errors="replace")
+    if str(result).upper() != "OK":
+        lines = getattr(response, "lines", None)
+        raise IMAPResponseError(f"IMAP {operation} failed: {result} {lines}")
 
 
 class IMAPProvider:
@@ -55,42 +69,48 @@ class IMAPProvider:
         """
         try:
             return await asyncio.wait_for(self._do_fetch(), timeout=timeout)
-        except (asyncio.TimeoutError, Exception):
+        except Exception:
             logger.warning("IMAP fetch_verification_code failed for %s", self.email, exc_info=True)
             return None
 
     async def _do_fetch(self) -> str | None:
-        client = aioimaplib.IMAP4(host=self.imap_host, port=self.imap_port)
+        client = aioimaplib.IMAP4_SSL(
+            host=self.imap_host,
+            port=self.imap_port,
+            ssl_context=ssl.create_default_context(),
+        )
         try:
             await client.wait_hello_from_server()
-            await client.login(self.email, self._password)
-            await client.select("INBOX")
+            _require_ok(await client.login(self.email, self._password), "login")
+            _require_ok(await client.select("INBOX"), "select")
 
             # Ищем свежие непрочитанные от OpenAI
             result = await client.search("UNSEEN", "FROM", "openai.com")
-            if result.result != "OK" or not result.lines:
+            _require_ok(result, "search")
+            if not result.lines:
                 return None
 
             # Берём последнее (старший UID)
-            uids = result.lines[0]
-            if isinstance(uids, bytes):
-                uids = uids.decode()
-            uid_list = uids.split()
+            uid_list: list[str] = []
+            for line in result.lines:
+                if isinstance(line, bytes):
+                    line = line.decode(errors="ignore")
+                uid_list.extend(token for token in str(line).split() if token.isdigit())
             if not uid_list:
                 return None
             last_uid = uid_list[-1]
 
             # Загружаем тело
             fetch_result = await client.fetch(last_uid, "(BODY.PEEK[TEXT])")
-            for response in fetch_result:
-                for line in getattr(response, "lines", []):
-                    if isinstance(line, bytes):
-                        text = line.decode("utf-8", errors="ignore")
-                    else:
-                        text = str(line)
-                    code = parse_verification_code(text)
-                    if code:
-                        return code
+            _require_ok(fetch_result, "fetch")
+            for line in fetch_result.lines:
+                if isinstance(line, bytes):
+                    text = line.decode("utf-8", errors="ignore")
+                else:
+                    text = str(line)
+                code = parse_verification_code(text)
+                if code:
+                    return code
             return None
         finally:
             try:
