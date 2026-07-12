@@ -63,6 +63,7 @@ class AccountOut(_Base):
     id: int
     login: str
     tier_id: int
+    email: str | None = None
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = None
     status: str
@@ -72,7 +73,9 @@ class AccountOut(_Base):
 class AccountCreate(BaseModel):
     login: str
     password: str
-    totp_secret: str
+    totp_secret: str = ""
+    email: str | None = None
+    email_password: str | None = None
     tier_id: int
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = None

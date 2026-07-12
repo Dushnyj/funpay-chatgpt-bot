@@ -42,6 +42,7 @@ export interface Account {
   id: number
   login: string
   tier_id: number
+  email: string | null
   subscription_expires_at: string | null
   max_active_rentals: number | null
   status: string
@@ -51,11 +52,19 @@ export interface Account {
 export interface AccountCreate {
   login: string
   password: string
-  totp_secret: string
+  totp_secret?: string
+  email?: string
+  email_password?: string
   tier_id: number
   subscription_expires_at?: string
   max_active_rentals?: number
   notes?: string
+}
+
+export interface TotpExport {
+  secret: string
+  otpauth_uri: string
+  qr_png_base64: string
 }
 
 export interface PriceMatrixItem {

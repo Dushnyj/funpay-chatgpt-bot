@@ -17,7 +17,9 @@ router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depe
 class BulkAccountItem(BaseModel):
     login: str
     password: str
-    totp_secret: str
+    totp_secret: str = ""
+    email: str | None = None
+    email_password: str | None = None
 
 
 class BulkAccountRequest(BaseModel):
@@ -41,6 +43,8 @@ async def create_account(req: AccountCreate, session: AsyncSession = Depends(get
         login=req.login,
         password_encrypted=encrypt(req.password),
         totp_secret_encrypted=encrypt(req.totp_secret),
+        email=req.email,
+        email_password_encrypted=encrypt(req.email_password) if req.email_password else None,
         tier_id=req.tier_id,
         subscription_expires_at=req.subscription_expires_at,
         max_active_rentals=req.max_active_rentals,
@@ -62,7 +66,9 @@ async def bulk_add_accounts(req: BulkAccountRequest, session: AsyncSession = Dep
         account = Account(
             login=item.login,
             password_encrypted=encrypt(item.password),
-            totp_secret_encrypted=encrypt(item.totp_secret),
+            totp_secret_encrypted=encrypt(item.totp_secret) if item.totp_secret else encrypt(""),
+            email=item.email,
+            email_password_encrypted=encrypt(item.email_password) if item.email_password else None,
             tier_id=req.tier_id,
             status="pending_validation",
         )
@@ -83,6 +89,7 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
     limits = await session.get(AccountLimits, account_id)
     return AccountWithLimits(
         id=account.id, login=account.login, tier_id=account.tier_id,
+        email=account.email,
         subscription_expires_at=account.subscription_expires_at,
         max_active_rentals=account.max_active_rentals,
         status=account.status, notes=account.notes,
@@ -109,3 +116,30 @@ async def delete_account(account_id: int, session: AsyncSession = Depends(get_db
         raise HTTPException(status_code=404, detail="Account not found")
     await session.delete(account)
     await session.commit()
+
+
+class TotpExportResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+    qr_png_base64: str
+
+
+@router.get("/{account_id}/totp-export", response_model=TotpExportResponse)
+async def export_totp(account_id: int, session: AsyncSession = Depends(get_db_session)):
+    """Экспорт TOTP: secret, otpauth:// URI, QR-код (base64 PNG) для импорта в приложение."""
+    from app.services.otp_export import generate_otpauth_uri, generate_qr_base64
+    from app.services.crypto import decrypt
+
+    account = await session.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    secret = decrypt(account.totp_secret_encrypted) if account.totp_secret_encrypted else ""
+    if not secret:
+        raise HTTPException(status_code=400, detail="Account has no TOTP secret")
+
+    account_name = account.email or account.login
+    uri = generate_otpauth_uri(secret, account_name)
+    qr_b64 = generate_qr_base64(uri)
+    return TotpExportResponse(secret=secret, otpauth_uri=uri, qr_png_base64=qr_b64)
+

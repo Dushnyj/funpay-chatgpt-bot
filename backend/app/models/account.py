@@ -14,6 +14,8 @@ class Account(Base):
     login: Mapped[str] = mapped_column(unique=True)
     password_encrypted: Mapped[str] = mapped_column(FernetEncrypted)
     totp_secret_encrypted: Mapped[str] = mapped_column(FernetEncrypted)
+    email: Mapped[str | None] = mapped_column(default=None)
+    email_password_encrypted: Mapped[str | None] = mapped_column(FernetEncrypted, default=None)
     tier_id: Mapped[int] = mapped_column(ForeignKey("subscription_tiers.id"))
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     max_active_rentals: Mapped[int | None] = mapped_column(Integer, default=None)
