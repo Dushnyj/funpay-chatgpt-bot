@@ -19,7 +19,7 @@ from app.api.schemas import (
     DeviceAuthStatusOut,
     ValidationJobOut,
 )
-from app.check_job_queue import CheckJobQueue
+from app.check_job_queue import ActiveJobConflict, CheckJobQueue
 from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.audit import AuditLog
 from app.models.rental import Rental
@@ -181,10 +181,20 @@ async def recheck_account(
     account = await session.get(Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    try:
+        job = await _check_job_queue.enqueue_exclusive(
+            session,
+            account.id,
+            priority="manual",
+            job_type="full_validation",
+            superseded_by="manual_recheck",
+        )
+    except ActiveJobConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Validation job {exc.job_type} is already running",
+        ) from exc
     account.status = "pending_validation"
-    job = await _check_job_queue.enqueue(
-        session, account.id, priority="manual", job_type="full_validation"
-    )
     session.add(
         AuditLog(
             event_type="account_validation_requeued",
@@ -212,6 +222,11 @@ async def start_device_auth(
         raise HTTPException(status_code=404, detail="Account not found")
     try:
         auth_session = await account_device_auth_manager.start(session, account)
+    except ActiveJobConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Validation job {exc.job_type} is already running",
+        ) from exc
     except DeviceAuthError as exc:
         raise HTTPException(
             status_code=503,

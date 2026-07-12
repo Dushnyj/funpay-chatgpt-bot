@@ -1,9 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.check_job_queue import CheckJobQueue
+from app.check_job_queue import ActiveJobConflict, CheckJobQueue
 from app.models.account import Account, AccountCheckJob
 from app.models.catalog import SubscriptionTier
 
@@ -47,6 +47,30 @@ async def test_higher_priority_overrides_lower(session: AsyncSession):
     assert low.status == "done"
     assert high.priority == "new"
     assert high.job_type == "full_validation"
+
+
+async def test_regular_enqueue_does_not_supersede_running_job(
+    session: AsyncSession,
+):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    running = await queue.enqueue(
+        session,
+        account_id=account.id,
+        priority="manual",
+        job_type="device_auth",
+    )
+    await queue.mark_running(session, running)
+
+    result = await queue.enqueue(
+        session,
+        account_id=account.id,
+        priority="new",
+        job_type="full_validation",
+    )
+
+    assert result.id == running.id
+    assert running.status == "running"
 
 
 async def test_fetch_next_pending_returns_oldest(session: AsyncSession):
@@ -99,3 +123,69 @@ async def test_mark_failed_updates_error(session: AsyncSession):
     await session.refresh(job)
     assert job.status == "failed"
     assert job.error == "connection timeout"
+
+
+async def test_exclusive_job_supersedes_all_pending_validation_jobs(
+    session: AsyncSession,
+):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    old = await queue.enqueue(
+        session, account.id, priority="new", job_type="full_validation"
+    )
+
+    device = await queue.enqueue_exclusive(
+        session,
+        account.id,
+        priority="manual",
+        job_type="device_auth",
+        superseded_by="device_auth",
+    )
+
+    assert old.status == "done"
+    assert old.result == "superseded:device_auth"
+    assert device.status == "pending"
+
+
+async def test_exclusive_job_rejects_live_running_validation(session: AsyncSession):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    running = await queue.enqueue(
+        session, account.id, priority="new", job_type="full_validation"
+    )
+    await queue.mark_running(session, running)
+
+    with pytest.raises(ActiveJobConflict) as error:
+        await queue.enqueue_exclusive(
+            session,
+            account.id,
+            priority="manual",
+            job_type="device_auth",
+            superseded_by="device_auth",
+        )
+
+    assert error.value.job_id == running.id
+    assert running.status == "running"
+
+
+async def test_exclusive_job_recovers_expired_running_lease(session: AsyncSession):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    stale = await queue.enqueue(
+        session, account.id, priority="new", job_type="full_validation"
+    )
+    stale.status = "running"
+    stale.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    await session.flush()
+
+    replacement = await queue.enqueue_exclusive(
+        session,
+        account.id,
+        priority="manual",
+        job_type="device_auth",
+        superseded_by="device_auth",
+    )
+
+    assert stale.status == "failed"
+    assert stale.error == "stale_worker_lease"
+    assert replacement.status == "pending"

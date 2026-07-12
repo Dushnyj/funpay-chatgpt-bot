@@ -1,7 +1,9 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { Navigate } from 'react-router-dom'
 import { useLogin } from '../api/auth'
-import { ApiError } from '../api/client'
+import { api, ApiError } from '../api/client'
 import { Icon } from '../components/Icon'
 
 export default function Login() {
@@ -9,6 +11,22 @@ export default function Login() {
   const [error, setError] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const login = useLogin()
+  const authCheck = useQuery({
+    queryKey: ['auth-check'],
+    queryFn: () => api.get('/metrics'),
+    retry: false,
+  })
+
+  if (authCheck.isLoading) {
+    return (
+      <div className="auth-loading" role="status">
+        <div className="brand__mark brand__mark--large"><span>F</span></div>
+        <span className="spinner" />
+        <p>Проверяем защищённую сессию…</p>
+      </div>
+    )
+  }
+  if (authCheck.isSuccess) return <Navigate to="/" replace />
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
@@ -92,7 +110,7 @@ export default function Login() {
 
           <div className="login-security-note">
             <Icon name="shield" />
-            <span>Пароль передаётся по защищённому HTTPS-соединению и не сохраняется в браузере.</span>
+            <span>Пароль передаётся по защищённому HTTPS-соединению; приложение не сохраняет пароль.</span>
           </div>
         </form>
       </section>

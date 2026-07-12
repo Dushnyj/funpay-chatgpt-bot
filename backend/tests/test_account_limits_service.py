@@ -148,7 +148,15 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     session.add(tier)
     await session.flush()
 
-    acc = Account(login="fresh@e.com", password_encrypted="p", totp_secret_encrypted="t", tier_id=tier.id, status="active")
+    known_expiry = datetime.now(timezone.utc) + timedelta(days=30)
+    acc = Account(
+        login="fresh@e.com",
+        password_encrypted="p",
+        totp_secret_encrypted="t",
+        tier_id=tier.id,
+        status="active",
+        subscription_expires_at=known_expiry,
+    )
     session.add(acc)
     await session.flush()
 
@@ -183,6 +191,8 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     reloaded = await session.get(AccountLimits, acc.id)
     # access_token не изменился
     assert reloaded.access_token_encrypted == "valid-access"
+    assert acc.subscription_expires_at == known_expiry
+    assert reloaded.subscription_expires_at == known_expiry
 
 
 @pytest.mark.asyncio

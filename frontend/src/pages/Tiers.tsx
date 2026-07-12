@@ -70,8 +70,8 @@ function TiersTab() {
       ) : (
         <TableShell><table className="data-table tier-catalog-table"><thead><tr><th>Тариф</th><th>Описание</th><th>Коэффициент</th><th>Состояние</th><th>Продажа</th></tr></thead><tbody>{tiers.map((tier) => (
           <tr key={tier.id}>
-            <td><div className="identity-cell"><span className="identity-avatar identity-avatar--violet">{tier.name.slice(0, 1).toUpperCase()}</span><span><strong>{tier.name}</strong><small>{tier.code ?? `system-${tier.id}`} · системный</small></span></div></td>
-            <td>{tier.description || 'Канонический план ChatGPT'}</td>
+            <td><div className="identity-cell"><span className="identity-avatar identity-avatar--violet">{displayTierName(tier).slice(0, 1).toUpperCase()}</span><span><strong>{displayTierName(tier)}</strong><small title={`Системный код: ${tier.code ?? `system-${tier.id}`}`}>Системный тариф</small></span></div></td>
+            <td>{displayTierDescription(tier)}</td>
             <td>{tier.usage_multiplier == null ? '—' : `×${tier.usage_multiplier}`}</td>
             <td><StatusBadge value={tier.is_active ? 'active' : 'paused'} /></td>
             <td>
@@ -95,7 +95,7 @@ function DurationsTab() {
   const durations = query.data ?? []
   return (
     <section className="panel panel--flush">
-      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен.</p></div><span className="soft-badge"><Icon name="warning" size={14} />Редактирование требует API</span></div>
+      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен.</p></div><span className="soft-badge"><Icon name="shield" size={14} />Только просмотр</span></div>
       {durations.length === 0 ? <EmptyState icon="clock" title="Сроки не инициализированы" description="Backend должен создать набор сроков от 1 до 30 дней при первоначальном запуске." /> : (
         <div className="duration-grid">{durations.map((duration) => <article className={`duration-card ${duration.is_enabled ? 'duration-card--active' : ''}`} key={duration.id}><span>{duration.days}</span><strong>{duration.days === 1 ? 'день' : duration.days < 5 ? 'дня' : 'дней'}</strong><StatusBadge value={duration.is_enabled ? 'active' : 'paused'} /></article>)}</div>
       )}
@@ -115,10 +115,23 @@ function ScopesTab() {
   }
   return (
     <section className="panel panel--flush">
-      <div className="section-toolbar"><div><h2>Типы лимитов</h2><p>Определяют, какие показатели учитываются при подборе аккаунта.</p></div><span className="soft-badge"><Icon name="warning" size={14} />Редактирование требует API</span></div>
+      <div className="section-toolbar"><div><h2>Типы лимитов</h2><p>Определяют, какие показатели учитываются при подборе аккаунта.</p></div><span className="soft-badge"><Icon name="shield" size={14} />Только просмотр</span></div>
       {scopes.length === 0 ? <EmptyState icon="activity" title="Типы лимитов не инициализированы" description="Ожидаются системные значения any, chat и codex." /> : (
         <div className="scope-grid">{scopes.map((scope) => <article className="scope-card" key={scope.id}><div className="scope-card__icon"><Icon name={scope.code === 'codex' ? 'templates' : scope.code === 'chat' ? 'activity' : 'catalog'} /></div><div><span className="eyebrow">{scope.code}</span><h3>{scope.name}</h3><p>{descriptions[scope.code] ?? 'Системное правило подбора аккаунтов.'}</p></div></article>)}</div>
       )}
     </section>
   )
+}
+
+function displayTierName(tier: Tier) {
+  return tier.name.replace(/\s*\/\s*usage-based\s*$/i, '')
+}
+
+function displayTierDescription(tier: Tier) {
+  if (!tier.description) return 'Канонический план ChatGPT'
+  return tier.description
+    .replace(/\s*\(raw:\s*[^)]+\)/gi, '')
+    .replace(/,\s*включая прежнее raw-имя\s+[^,.]+/gi, '')
+    .replace(/с usage-based конфигурацией/gi, 'с оплатой по фактическому использованию')
+    .trim()
 }

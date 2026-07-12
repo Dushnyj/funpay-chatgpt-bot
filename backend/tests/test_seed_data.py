@@ -71,3 +71,21 @@ async def test_seed_catalog_is_complete_idempotent_and_preserves_existing(sessio
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
     }
+
+
+@pytest.mark.asyncio
+async def test_seed_catalog_preserves_operator_sellable_override(session):
+    await seed_catalog(session)
+    plus = (
+        await session.execute(
+            select(SubscriptionTier).where(SubscriptionTier.code == "plus")
+        )
+    ).scalar_one()
+    plus.is_sellable = False
+    await session.commit()
+
+    await seed_catalog(session)
+    await session.refresh(plus)
+
+    assert plus.system_managed is True
+    assert plus.is_sellable is False

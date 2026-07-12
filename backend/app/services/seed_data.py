@@ -154,17 +154,25 @@ async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
             tier = tiers_by_name.get("Pro")
             if tier is not None:
                 tier.name = plan.name
+        initialize_sellable = (
+            tier is None or not tier.system_managed or not tier.code
+        )
         if tier is None:
             tier = SubscriptionTier(
                 code=plan.code,
                 name=plan.name,
                 description=plan.description,
                 is_active=True,
+                system_managed=True,
+                is_sellable=plan.is_sellable,
+                sort_order=plan.sort_order,
+                usage_multiplier=plan.usage_multiplier,
             )
             session.add(tier)
         tier.code = plan.code
         tier.system_managed = True
-        tier.is_sellable = plan.is_sellable
+        if initialize_sellable:
+            tier.is_sellable = plan.is_sellable
         tier.sort_order = plan.sort_order
         tier.usage_multiplier = plan.usage_multiplier
 

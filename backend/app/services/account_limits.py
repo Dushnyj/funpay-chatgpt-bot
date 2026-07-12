@@ -87,8 +87,13 @@ async def measure_account_limits(
         )
     )
     await _store_resolved_plan(session, account, limits, resolved_plan)
-    limits.subscription_expires_at = metadata.subscription_expires_at
-    account.subscription_expires_at = metadata.subscription_expires_at
+    if metadata.subscription_expires_at is not None:
+        limits.subscription_expires_at = metadata.subscription_expires_at
+        account.subscription_expires_at = metadata.subscription_expires_at
+    elif limits.subscription_expires_at is None and account.subscription_expires_at is not None:
+        # /accounts/check legitimately omits expiry for some responses. Keep
+        # stronger evidence already stored from an ID token or prior measure.
+        limits.subscription_expires_at = account.subscription_expires_at
     limits.measured_at = datetime.now(timezone.utc)
     limits.refresh_status = "ok"
     limits.refresh_failed_at = None

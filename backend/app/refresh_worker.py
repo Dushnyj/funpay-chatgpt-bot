@@ -39,6 +39,10 @@ class RefreshRecoveryWorker:
             return False
 
         await self._queue.mark_running(session, job)
+        # Publish the running lease before browser/network work. Device auth or
+        # manual recheck can then reject a conflicting validation instead of
+        # racing token and account status updates.
+        await session.commit()
         try:
             outcome = await validate_account(session, job.account_id)
             if outcome is ValidationOutcome.OK:

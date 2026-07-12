@@ -178,8 +178,13 @@ export default function Accounts() {
             <table className="data-table accounts-table">
               <thead><tr><th>Аккаунт</th><th>Определённый план</th><th>Подписка</th><th>Лимит аренд</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
               <tbody>
-                {filteredAccounts.map((account) => (
-                  <tr key={account.id}>
+                {filteredAccounts.map((account) => {
+                  const totpUnavailable = account.status !== 'active'
+                  const totpHint = totpUnavailable
+                    ? 'TOTP станет доступен после успешной проверки и активации аккаунта'
+                    : 'Экспортировать TOTP'
+                  return (
+                    <tr key={account.id}>
                     <td>
                       <div className="identity-cell"><span className="identity-avatar">{account.login.slice(0, 1).toUpperCase()}</span><span><strong>{account.login}</strong><small>{account.email ?? 'Email для восстановления не задан'}</small></span></div>
                     </td>
@@ -191,24 +196,27 @@ export default function Accounts() {
                       <div className="row-actions">
                         {isDeviceAuthEligible(account) && (
                           <button className="button button--primary button--compact" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Проверить ${account.login} через браузер`}>
-                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}Проверить через браузер
+                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}Через браузер
                           </button>
                         )}
                         {!isValidationInProgress(account) && (
-                          <button className="button button--secondary button--compact" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Автоматический вход без браузера может быть заблокирован защитой OpenAI">
-                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}Повторить автоматически
+                          <button className="icon-button" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Повторить автоматически — защита OpenAI может заблокировать headless-вход">
+                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
                           </button>
                         )}
-                        <button className="icon-button" onClick={() => exportTotp(account)} disabled={totpLoading === account.id || account.status !== 'active'} aria-label={`Экспорт TOTP для ${account.login}`} title="Экспорт TOTP">
-                          {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" />}
-                        </button>
+                        <span className="action-help" title={totpHint} tabIndex={totpUnavailable ? 0 : undefined} aria-label={totpUnavailable ? totpHint : undefined}>
+                          <button className="icon-button" onClick={() => exportTotp(account)} disabled={totpLoading === account.id || totpUnavailable} aria-label={totpUnavailable ? `Экспорт TOTP для ${account.login} недоступен: аккаунт должен пройти проверку` : `Экспорт TOTP для ${account.login}`}>
+                            {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" />}
+                          </button>
+                        </span>
                         <button className="icon-button icon-button--danger" onClick={() => setDeleteTarget(account)} aria-label={`Удалить ${account.login}`} title="Удалить">
                           <Icon name="trash" />
                         </button>
                       </div>
                     </td>
-                  </tr>
-                ))}
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </TableShell>

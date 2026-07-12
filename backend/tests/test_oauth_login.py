@@ -142,6 +142,28 @@ async def test_post_password_existing_totp_does_not_mistake_it_for_email_code():
     assert filled_code.isdigit() and len(filled_code) == 6
 
 
+async def test_optional_email_preflight_failure_does_not_block_totp():
+    page = _make_page([True])
+    page.url = "https://auth.openai.com/mfa"
+    page.text_content = AsyncMock(return_value="Enter code from your authenticator app")
+    provider = _make_email_provider(code="111111")
+    preflight_error = EmailProviderError(
+        EmailErrorCode.AUTH_FAILED,
+        "Старый пароль почты больше не работает.",
+    )
+
+    await _do_post_password_steps(
+        page,
+        "JBSWY3DPEHPK3PXP",
+        email_provider=provider,
+        email_preflight_error=preflight_error,
+    )
+
+    provider.fetch_verification_code.assert_not_awaited()
+    filled_code = page.inputs[0].fill.call_args.args[0]
+    assert filled_code.isdigit() and len(filled_code) == 6
+
+
 async def test_post_password_no_email_code_skips_provider():
     """email_provider задан, но input не появился → провайдер не вызывается."""
     page = _make_page([False, False])  # email-code не появился; totp пуст → 2FA не идём

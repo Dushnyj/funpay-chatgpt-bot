@@ -18,6 +18,7 @@ from app.integrations.openai.device_auth import (
 from app.integrations.openai.oauth import parse_id_token
 from app.models.account import Account, AccountCheckJob
 from app.models.audit import AuditLog
+from app.check_job_queue import CheckJobQueue
 from app.services.account_validation import (
     AccountValidationError,
     ValidationCode,
@@ -54,6 +55,7 @@ class AccountDeviceAuthManager:
     def __init__(self) -> None:
         self._sessions: dict[str, DeviceAuthSession] = {}
         self._lock = asyncio.Lock()
+        self._queue = CheckJobQueue()
 
     async def start(
         self,
@@ -63,19 +65,17 @@ class AccountDeviceAuthManager:
         code = await request_device_code()
         now = datetime.now(timezone.utc)
         async with self._lock:
+            job = await self._queue.enqueue_exclusive(
+                session,
+                account.id,
+                priority="manual",
+                job_type="device_auth",
+                superseded_by="device_auth",
+            )
             for existing in self._sessions.values():
                 if existing.account_id == account.id and existing.status == "pending":
                     existing.status = "expired"
                     existing.code = None
-
-            job = AccountCheckJob(
-                account_id=account.id,
-                priority="manual",
-                job_type="device_auth",
-                status="pending",
-            )
-            session.add(job)
-            await session.flush()
             account.status = "pending_validation"
             session.add(AuditLog(
                 event_type="account_device_auth_started",
@@ -136,7 +136,15 @@ class AccountDeviceAuthManager:
             auth_session.next_poll_at = now + timedelta(seconds=code.interval_seconds)
 
             job = await db.get(AccountCheckJob, auth_session.job_id)
-            if job is not None and job.status == "pending":
+            if job is None or job.status not in {"pending", "running"}:
+                # A manual recheck or a newer device-auth session may have
+                # durably superseded this job while its browser code was still
+                # present in this process. Never let that stale session race
+                # the replacement validation.
+                auth_session.status = "expired"
+                auth_session.code = None
+                return auth_session
+            if job.status == "pending":
                 job.status = "running"
                 job.started_at = now
                 await db.commit()

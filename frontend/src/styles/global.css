@@ -222,6 +222,18 @@ h3 { margin: 0; font-size: 15px; }
 .identity-avatar--violet { color: #5925dc; background: #f4f3ff; }
 .identity-avatar--blue { color: #175cd3; background: #eff8ff; }
 .row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; min-width: 210px; }
+.action-help { display: inline-flex; border-radius: 9px; }
+.action-help:focus-visible { outline: 3px solid rgba(79, 70, 229, .28); outline-offset: 2px; }
+.accounts-table { min-width: 900px; table-layout: fixed; }
+.accounts-table th:nth-child(1) { width: 22%; }
+.accounts-table th:nth-child(2) { width: 14%; }
+.accounts-table th:nth-child(3) { width: 9%; }
+.accounts-table th:nth-child(4) { width: 10%; }
+.accounts-table th:nth-child(5) { width: 20%; }
+.accounts-table th:nth-child(6) { width: 25%; }
+.accounts-table .identity-cell, .accounts-table .plan-detection, .accounts-table .validation-state { min-width: 0; }
+.accounts-table .identity-cell strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.accounts-table .row-actions { min-width: 0; flex-wrap: nowrap; }
 .empty-state { min-height: 280px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 40px 20px; text-align: center; }
 .empty-state__icon { width: 46px; height: 46px; display: grid; place-items: center; margin-bottom: 13px; border-radius: 13px; color: var(--primary); background: var(--primary-soft); }
 .empty-state__icon--danger { color: var(--danger); background: #fee4e2; }

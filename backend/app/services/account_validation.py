@@ -115,7 +115,7 @@ async def validate_account(session: AsyncSession, account_id: int) -> Validation
                 "Сохранённый TOTP-секрет имеет неверный формат.",
             )
 
-        email_provider = await _prepare_email_provider(email, email_password)
+        email_provider = _build_email_provider(email, email_password)
 
         if totp_secret:
             return await _validate_with_existing_totp(
@@ -127,6 +127,7 @@ async def validate_account(session: AsyncSession, account_id: int) -> Validation
                 email_provider,
             )
         if email_provider is not None:
+            await _preflight_email_provider(email_provider)
             return await _validate_and_enable_2fa(
                 session,
                 account,
@@ -155,14 +156,16 @@ async def validate_account(session: AsyncSession, account_id: int) -> Validation
         ) from exc
 
 
-async def _prepare_email_provider(
+def _build_email_provider(
     email: str | None,
     email_password: str | None,
 ) -> EmailProvider | None:
     if not email or not email_password:
         return None
+    return detect_imap_provider(email, email_password)
 
-    provider = detect_imap_provider(email, email_password)
+
+async def _preflight_email_provider(provider: EmailProvider) -> None:
     try:
         await provider.preflight()
     except EmailProviderError as exc:
@@ -177,7 +180,6 @@ async def _prepare_email_provider(
             ValidationCode.EMAIL_CONNECTION_FAILED,
             "Не удалось подключиться к почтовому серверу.",
         ) from exc
-    return provider
 
 
 def _from_oauth_error(exc: OAuthLoginError) -> AccountValidationError:
@@ -219,7 +221,10 @@ async def _validate_and_enable_2fa(
         async with browser_context() as context:
             secret = await enable_2fa(context, login, password, email_provider)
             account.totp_secret_encrypted = secret
-            await session.flush()
+            # Enabling 2FA is a remote irreversible side effect. Persist the
+            # returned secret before any subsequent browser/token work so a
+            # process cancellation cannot lock the account with an unknown key.
+            await session.commit()
 
             auth_code, code_verifier = await login_and_get_auth_code(
                 context,

@@ -45,7 +45,9 @@ async def test_validate_account_success(session, monkeypatch):
         yield object()
 
     provider = MagicMock()
-    provider.preflight = AsyncMock()
+    provider.preflight = AsyncMock(
+        side_effect=RuntimeError("optional IMAP is unavailable")
+    )
 
     # Мокаем Playwright-логин: возвращает tuple (auth_code, code_verifier)
     async def fake_login_and_get_auth_code(context, login, password, totp_secret, **kw):
@@ -84,6 +86,7 @@ async def test_validate_account_success(session, monkeypatch):
 
     outcome = await validate_account(session, acc.id)
     assert outcome == ValidationOutcome.OK
+    provider.preflight.assert_not_awaited()
 
     # Проверяем: аккаунт active, AccountLimits создан с токенами
     reloaded_acc = await session.get(Account, acc.id)
@@ -218,6 +221,61 @@ async def test_validate_account_no_totp_with_email_enables_2fa(session, monkeypa
     assert limits is not None
     assert limits.refresh_token_encrypted == "initial-refresh"
     assert limits.account_id_openai == "openai-acc-2"
+
+
+@pytest.mark.asyncio
+async def test_new_totp_secret_survives_cancellation_before_second_login(
+    session, monkeypatch
+):
+    import asyncio
+
+    from app.services.account_validation import validate_account
+
+    account = Account(
+        login="cancelled@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="",
+        email="cancelled@gmail.com",
+        email_password_encrypted="mailpass",
+        tier_id=None,
+        status="pending_validation",
+    )
+    session.add(account)
+    await session.commit()
+    account_id = account.id
+
+    provider = MagicMock()
+    provider.preflight = AsyncMock()
+
+    @asynccontextmanager
+    async def fake_browser_context(*_args, **_kwargs):
+        yield object()
+
+    async def fake_enable(*_args, **_kwargs):
+        return "JBSWY3DPEHPK3PXP"
+
+    async def cancelled_login(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "app.services.account_validation.detect_imap_provider", lambda *_: provider
+    )
+    monkeypatch.setattr(
+        "app.services.account_validation.browser_context", fake_browser_context
+    )
+    monkeypatch.setattr("app.services.account_validation.enable_2fa", fake_enable)
+    monkeypatch.setattr(
+        "app.services.account_validation.login_and_get_auth_code", cancelled_login
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await validate_account(session, account_id)
+    await session.rollback()
+    session.expire_all()
+
+    reloaded = await session.get(Account, account_id)
+    assert reloaded is not None
+    assert reloaded.totp_secret_encrypted == "JBSWY3DPEHPK3PXP"
 
 
 @pytest.mark.asyncio

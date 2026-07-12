@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
@@ -143,6 +145,36 @@ async def test_failed_account_can_be_requeued_with_visible_job(
     assert payload["status"] == "pending_validation"
     assert payload["validation_job"]["status"] == "pending"
     assert payload["validation_job"]["priority"] == "manual"
+
+
+async def test_recheck_rejects_live_validation_without_mutating_account(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "running-account",
+            "password": "pass",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+        },
+    )
+    account = await session.get(Account, created.json()["id"])
+    job = (
+        await session.execute(
+            select(AccountCheckJob).where(AccountCheckJob.account_id == account.id)
+        )
+    ).scalar_one()
+    account.status = "active"
+    job.status = "running"
+    job.started_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    response = await auth_client.post(f"/api/accounts/{account.id}/recheck")
+
+    assert response.status_code == 409
+    assert account.status == "active"
+    assert job.status == "running"
 
 
 async def test_create_account_with_email(auth_client: AsyncClient, session: AsyncSession):
