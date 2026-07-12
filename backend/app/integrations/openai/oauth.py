@@ -118,3 +118,38 @@ async def refresh_access_token(refresh_token: str) -> RefreshedTokens:
 
 async def _short_backoff(attempt: int) -> None:
     await asyncio.sleep(0.25 * attempt)
+
+
+async def exchange_code_for_tokens(
+    code: str, code_verifier: str, redirect_uri: str
+) -> RefreshedTokens:
+    """Обменивает authorization_code на токены (первичный вход через Playwright OAuth).
+
+    PKCE code_verifier должен совпадать с тем, что сгенерирован в login_and_get_auth_code.
+    """
+    body = (
+        f"grant_type=authorization_code"
+        f"&code={code}"
+        f"&redirect_uri={redirect_uri}"
+        f"&client_id={OPENAI_CLIENT_ID}"
+        f"&code_verifier={code_verifier}"
+    )
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{OPENAI_ISSUER}/oauth/token",
+            content=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    if not response.is_success:
+        raise RefreshFailedError(
+            f"token exchange failed: {response.status_code} {response.text}"
+        )
+
+    data = response.json()
+    return RefreshedTokens(
+        access_token=data["access_token"],
+        refresh_token=data["refresh_token"],
+        id_token=data.get("id_token"),
+    )
