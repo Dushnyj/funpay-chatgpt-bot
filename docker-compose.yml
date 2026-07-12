@@ -13,30 +13,20 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-    # Не экспонируем порт наружу — только internal сеть
-
-  frontend-build:
-    build: ./frontend
-    volumes:
-      - frontend_dist:/app/dist
 
   backend:
     build:
-      context: ./backend
+      context: .
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
-      frontend-build:
-        condition: service_completed_successfully
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-funpay}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-funpay_bot}
-    volumes:
-      - frontend_dist:/app/frontend/dist:ro
     ports:
       - "127.0.0.1:8000:8000"
 
 volumes:
   postgres_data:
-  frontend_dist:

@@ -22,6 +22,11 @@ from app.db.session import engine
 async def lifespan(app: FastAPI):
     from app.app_lifecycle import AppLifecycle
     from app.config import get_settings
+    from app.db.base import Base
+
+    # Авто-создание таблиц (idempotent — безопасно при каждом старте)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     settings = get_settings()
     lifecycle = AppLifecycle(
