@@ -52,3 +52,20 @@ async def session(test_engine) -> AsyncGenerator[AsyncSession, None]:
     factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
     async with factory() as s:
         yield s
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _override_app_db(session):
+    """Подменяет БД для FastAPI-зависимостей на тестовую session.
+
+    Безопасно для unit-тестов: они не используют FastAPI.
+    """
+    from app.api.deps import get_db_session
+    from app.main import app
+
+    async def _override():
+        yield session
+
+    app.dependency_overrides[get_db_session] = _override
+    yield
+    app.dependency_overrides.clear()
