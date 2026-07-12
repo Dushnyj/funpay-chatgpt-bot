@@ -20,8 +20,18 @@ from app.db.session import engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.app_lifecycle import AppLifecycle
+    from app.config import get_settings
+
+    settings = get_settings()
+    lifecycle = AppLifecycle(
+        golden_key=settings.funpay_session_key,
+        category_id=0,
+    )
+    app.state.lifecycle = lifecycle
+    await lifecycle.start()
     yield
-    # Корректно освобождаем пул соединений при остановке приложения
+    await lifecycle.stop()
     await engine.dispose()
 
 
