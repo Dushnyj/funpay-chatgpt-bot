@@ -114,3 +114,23 @@ async def test_get_my_offers_returns_set(gw: FakeChatGateway):
     gw.set_my_offers(55, [offer])
     result = await gw.get_my_offers(subcategory_id=55)
     assert result == [offer]
+
+
+from app.integrations.funpay.gateway import (
+    _map_order_status,
+    _build_order_info,
+    _build_offer_info,
+)
+from app.integrations.funpay.types import SaleStatus
+
+
+def test_map_order_status_paid():
+    from funpayparsers.types.enums import OrderStatus as FPOrderStatus
+    assert _map_order_status(FPOrderStatus.PAID) is SaleStatus.PAID
+    assert _map_order_status(FPOrderStatus.COMPLETED) is SaleStatus.COMPLETED
+    assert _map_order_status(FPOrderStatus.REFUNDED) is SaleStatus.REFUNDED
+
+
+def test_map_order_status_unknown_default():
+    from funpayparsers.types.enums import OrderStatus as FPOrderStatus
+    assert _map_order_status(FPOrderStatus.UNKNOWN) is SaleStatus.UNKNOWN
