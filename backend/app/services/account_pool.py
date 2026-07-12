@@ -111,3 +111,27 @@ class AccountPool:
         stmt = stmt.limit(1)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def acquire_excluding(
+        self,
+        session: AsyncSession,
+        criteria: AccountCriteria,
+        exclude_account_id: int,
+        default_max_active_rentals: int,
+    ) -> Account | None:
+        """Как acquire, но исключает указанный аккаунт (для замены).
+
+        Временно помечает исключаемый аккаунт как maintenance, вызывает acquire,
+        затем восстанавливает исходный статус.
+        """
+        excluded = await session.get(Account, exclude_account_id)
+        if excluded is not None:
+            original_status = excluded.status
+            excluded.status = "maintenance"
+            await session.flush()
+            try:
+                return await self.acquire(session, criteria, default_max_active_rentals)
+            finally:
+                excluded.status = original_status
+                await session.flush()
+        return await self.acquire(session, criteria, default_max_active_rentals)

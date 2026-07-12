@@ -190,3 +190,78 @@ class SellerHandler:
         session = _session_from_ctx(ctx)
         text = await render_message(session, "seller_called", ctx.lang)
         await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+
+
+from app.models.catalog import Duration, LimitScope
+from app.services.account_pool import AccountCriteria, AccountPool
+
+
+class ReplaceHandler:
+    """Обработка !замена/!replace: смена аккаунта на той же аренде.
+
+    Rental.order_id имеет UNIQUE constraint — замена = смена account_id
+    на существующей Rental (replacement_count++), а не создание новой.
+    """
+
+    def __init__(self, account_pool: AccountPool | None = None) -> None:
+        self._pool = account_pool or AccountPool()
+
+    async def __call__(self, ctx: CommandContext) -> None:
+        session = _session_from_ctx(ctx)
+        rental = await _find_rental_by_chat(session, ctx.chat_id)
+
+        if rental is None or rental.status != "active":
+            text = await render_message(session, "replace_declined", ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        duration = await session.get(Duration, rental.duration_id)
+        scope = await session.get(LimitScope, rental.limit_scope_id)
+        if duration is None:
+            return
+
+        criteria = AccountCriteria(
+            tier_id=rental.tier_id,
+            duration_days=duration.days,
+            scope=scope.code if scope else "any",
+            min_limit_pct=rental.min_limit_pct,
+            max_5h_pct=rental.max_5h_pct,
+            max_weekly_pct=rental.max_weekly_pct,
+        )
+        new_account = await self._pool.acquire_excluding(
+            session, criteria,
+            exclude_account_id=rental.account_id,
+            default_max_active_rentals=5,
+        )
+
+        if new_account is None:
+            text = await render_message(session, "replace_no_account", ctx.lang)
+            await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        rental.account_id = new_account.id
+        rental.replacement_count += 1
+        limits = await session.get(AccountLimits, new_account.id)
+        if limits:
+            rental.issued_chat_5h_pct = limits.chat_5h_remaining_pct
+            rental.issued_chat_weekly_pct = limits.chat_weekly_remaining_pct
+            rental.issued_codex_5h_pct = limits.codex_5h_remaining_pct
+            rental.issued_codex_weekly_pct = limits.codex_weekly_remaining_pct
+        await session.flush()
+
+        # password_encrypted — уже plaintext через FernetEncrypted
+        password = new_account.password_encrypted
+        tier = await session.get(SubscriptionTier, new_account.tier_id)
+        text = await render_message(
+            session, "replace_success", ctx.lang,
+            login=new_account.login,
+            password=password,
+            tier=tier.name if tier else "",
+            days=duration.days,
+            expires_at=_fmt_date(new_account.subscription_expires_at),
+            chat_5h=_pct_val(limits, "chat_5h") if limits else "—",
+            chat_weekly=_pct_val(limits, "chat_weekly") if limits else "—",
+            codex_5h=_pct_val(limits, "codex_5h") if limits else "—",
+            codex_weekly=_pct_val(limits, "codex_weekly") if limits else "—",
+        )
+        await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)

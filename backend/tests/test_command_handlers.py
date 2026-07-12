@@ -171,3 +171,62 @@ async def test_seller_handler_responds(session: AsyncSession):
     ctx = _ctx(gateway, session, command=CommandType.SELLER)
     await handler(ctx)
     assert len(gateway.sent_messages) == 1
+
+
+from app.services.command_handlers import ReplaceHandler
+
+
+async def test_replace_handler_switches_account(session: AsyncSession):
+    from app.services.seed_data import seed_message_templates
+    rental = await _seed_rental(session)
+    old_account_id = rental.account_id
+    await seed_message_templates(session)
+
+    tier = await session.get(SubscriptionTier, rental.tier_id)
+    acc2 = Account(
+        login="acc2", password_encrypted="pass2", totp_secret_encrypted="enc_totp",
+        tier_id=tier.id, status="active",
+        subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    session.add(acc2)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=acc2.id, refresh_token_encrypted="enc",
+        chat_5h_remaining_pct=90, chat_weekly_remaining_pct=80,
+        codex_5h_remaining_pct=70, codex_weekly_remaining_pct=60,
+        measured_at=datetime.now(timezone.utc), refresh_status="ok",
+    ))
+    await session.flush()
+
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler()
+    ctx = _ctx(gateway, session, command=CommandType.REPLACE)
+    await handler(ctx)
+    assert len(gateway.sent_messages) == 1
+    _, text = gateway.sent_messages[0]
+    assert "acc2" in text or "pass2" in text
+    await session.refresh(rental)
+    assert rental.account_id != old_account_id
+    assert rental.replacement_count == 1
+
+
+async def test_replace_handler_no_account_available(session: AsyncSession):
+    from app.services.seed_data import seed_message_templates
+    await _seed_rental(session)
+    await seed_message_templates(session)
+
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler()
+    ctx = _ctx(gateway, session, command=CommandType.REPLACE)
+    await handler(ctx)
+    assert len(gateway.sent_messages) == 1
+
+
+async def test_replace_handler_no_active_rental(session: AsyncSession):
+    from app.services.seed_data import seed_message_templates
+    await seed_message_templates(session)
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler()
+    ctx = _ctx(gateway, session, chat_id=999, command=CommandType.REPLACE)
+    await handler(ctx)
+    assert len(gateway.sent_messages) == 1
