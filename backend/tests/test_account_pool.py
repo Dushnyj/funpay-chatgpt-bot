@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.rental import Rental, Order
-from app.models.settings import SellerSettings
 from app.services.account_pool import AccountPool, AccountCriteria
 
 
