@@ -1,5 +1,3 @@
-from datetime import datetime, timezone
-
 from app.integrations.funpay.types import (
     OrderInfo,
     OfferInfo,
