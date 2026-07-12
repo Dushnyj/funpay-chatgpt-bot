@@ -1,7 +1,12 @@
+import asyncio
 import base64
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+import httpx
+
+from app.integrations.openai.exceptions import RefreshFailedError
 
 # Константы из codex-switcher (реверс-инжиниринг OpenAI OAuth)
 OPENAI_ISSUER = "https://auth.openai.com"
@@ -64,3 +69,52 @@ def _parse_unix(value: int | None) -> datetime | None:
     if value is None:
         return None
     return datetime.fromtimestamp(value, tz=timezone.utc)
+
+
+@dataclass
+class RefreshedTokens:
+    access_token: str
+    refresh_token: str
+    id_token: str | None
+
+
+async def refresh_access_token(refresh_token: str) -> RefreshedTokens:
+    """Обновляет access_token через refresh_token.
+
+    POST https://auth.openai.com/oauth/token
+    Возвращает новые токены. При 401/400 — RefreshFailedError (нужен перезаход).
+    """
+    body = (
+        f"grant_type=refresh_token"
+        f"&refresh_token={refresh_token}"
+        f"&client_id={OPENAI_CLIENT_ID}"
+    )
+
+    async with httpx.AsyncClient() as client:
+        for attempt in range(1, 4):
+            try:
+                response = await client.post(
+                    f"{OPENAI_ISSUER}/oauth/token",
+                    content=body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                break
+            except httpx.HTTPError:
+                if attempt == 3:
+                    raise
+                await _short_backoff(attempt)
+
+    if response.status_code in (400, 401):
+        raise RefreshFailedError(f"refresh failed: {response.status_code} {response.text}")
+    response.raise_for_status()
+
+    data = response.json()
+    return RefreshedTokens(
+        access_token=data["access_token"],
+        refresh_token=data.get("refresh_token") or refresh_token,
+        id_token=data.get("id_token"),
+    )
+
+
+async def _short_backoff(attempt: int) -> None:
+    await asyncio.sleep(0.25 * attempt)
