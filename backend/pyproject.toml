@@ -19,6 +19,7 @@ dependencies = [
     "passlib[bcrypt]>=1.7",
     "playwright>=1.41",
     "python-telegram-bot>=21.0",
+    "funpaybotengine>=0.7.0",
 ]
 
 [project.optional-dependencies]
