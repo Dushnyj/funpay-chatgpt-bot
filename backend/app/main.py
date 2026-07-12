@@ -58,9 +58,11 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# Раздача собранной SPA — только если frontend/dist существует.
-# Статика (assets) монтируется на /assets, остальные роуты → index.html (SPA fallback).
-_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
+# Раздача собранной SPA — ищет frontend/dist относительно CWD или пакета app.
+# В Docker CWD=/app → /app/frontend/dist. В dev — относительно репозитория.
+_FRONTEND_DIST = os.path.join(os.getcwd(), "frontend", "dist")
+if not os.path.isdir(_FRONTEND_DIST):
+    _FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
 _INDEX_HTML = os.path.join(_FRONTEND_DIST, "index.html")
 
 if os.path.isdir(_FRONTEND_DIST):
