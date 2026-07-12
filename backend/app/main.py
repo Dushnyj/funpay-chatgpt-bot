@@ -1,6 +1,9 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routers.accounts import router as accounts_router
 from app.api.routers.auth import router as auth_router
@@ -38,3 +41,18 @@ app.include_router(metrics_router)
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# Раздача собранной SPA — только если frontend/dist существует.
+# Статика (assets) монтируется на /assets, остальные роуты → index.html (SPA fallback).
+_FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
+_INDEX_HTML = os.path.join(_FRONTEND_DIST, "index.html")
+
+if os.path.isdir(_FRONTEND_DIST):
+    app.mount("/assets", StaticFiles(directory=os.path.join(_FRONTEND_DIST, "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str) -> FileResponse:
+        """SPA fallback: все неизвестные пути возвращают index.html (клиентский роутинг)."""
+        return FileResponse(_INDEX_HTML)
+
