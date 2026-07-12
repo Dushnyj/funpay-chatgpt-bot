@@ -116,3 +116,30 @@ async def delete_account(account_id: int, session: AsyncSession = Depends(get_db
         raise HTTPException(status_code=404, detail="Account not found")
     await session.delete(account)
     await session.commit()
+
+
+class TotpExportResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+    qr_png_base64: str
+
+
+@router.get("/{account_id}/totp-export", response_model=TotpExportResponse)
+async def export_totp(account_id: int, session: AsyncSession = Depends(get_db_session)):
+    """Экспорт TOTP: secret, otpauth:// URI, QR-код (base64 PNG) для импорта в приложение."""
+    from app.services.otp_export import generate_otpauth_uri, generate_qr_base64
+    from app.services.crypto import decrypt
+
+    account = await session.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    secret = decrypt(account.totp_secret_encrypted) if account.totp_secret_encrypted else ""
+    if not secret:
+        raise HTTPException(status_code=400, detail="Account has no TOTP secret")
+
+    account_name = account.email or account.login
+    uri = generate_otpauth_uri(secret, account_name)
+    qr_b64 = generate_qr_base64(uri)
+    return TotpExportResponse(secret=secret, otpauth_uri=uri, qr_png_base64=qr_b64)
+
