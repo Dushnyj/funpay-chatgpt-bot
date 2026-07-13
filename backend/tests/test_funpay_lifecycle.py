@@ -8,9 +8,27 @@ from app.integrations.funpay.runner import RunnerCallbacks
 from app.integrations.funpay.types import MessageInfo, OrderInfo, SaleStatus
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.chat import ChatConversation, ChatMessage
+from app.models.funpay_sale import FunPaySale
 from app.models.lot import Lot
 from app.models.rental import Order
 from app.services.funpay_lifecycle import build_callbacks
+from app.services.sale_registry import SaleRegistryService
+
+
+async def _seed_verified_sale(
+    session: AsyncSession,
+    *,
+    order_id: str = "ord-1",
+    chat_id: int = 100,
+    buyer_id: int = 200,
+) -> None:
+    session.add(FunPaySale(
+        funpay_order_id=order_id,
+        funpay_chat_id=str(chat_id),
+        buyer_funpay_id=str(buyer_id),
+        status="paid",
+    ))
+    await session.flush()
 
 
 async def _seed_lot(session: AsyncSession) -> int:
@@ -67,6 +85,63 @@ async def test_on_new_sale_callback_processes_order(session: AsyncSession):
     assert result.scalar_one_or_none() is not None
 
 
+async def test_new_sale_continues_after_concurrent_registry_insert(
+    session: AsyncSession,
+):
+    """A preview-sync winner must not make the event lose fulfillment."""
+
+    await _seed_lot(session)
+    await _seed_verified_sale(
+        session,
+        order_id="race-sale",
+        chat_id=710,
+        buyer_id=810,
+    )
+    await session.commit()
+
+    class StaleFirstReadRegistry(SaleRegistryService):
+        def __init__(self) -> None:
+            self.lookup_count = 0
+
+        async def _get_by_remote_order(self, db, order_id):
+            self.lookup_count += 1
+            if self.lookup_count == 1:
+                # Deterministically model a SELECT that raced just before the
+                # periodic sync committed its unique-key winner.
+                return None
+            return await super()._get_by_remote_order(db, order_id)
+
+    registry = StaleFirstReadRegistry()
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="race-sale",
+        status=SaleStatus.PAID,
+        chat_id=710,
+        buyer_id=810,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+    ))
+    callbacks = build_callbacks(
+        session_factory=lambda: session,
+        gateway=gateway,
+        sale_registry=registry,
+    )
+
+    await callbacks.on_new_sale("race-sale")  # type: ignore[misc]
+
+    sales = list((await session.execute(
+        select(FunPaySale).where(FunPaySale.funpay_order_id == "race-sale")
+    )).scalars())
+    order = await session.scalar(
+        select(Order).where(Order.funpay_order_id == "race-sale")
+    )
+    assert registry.lookup_count >= 2
+    assert len(sales) == 1
+    assert order is not None
+    assert sales[0].order_id == order.id
+
+
 async def test_on_sale_closed_callback_updates_status(session: AsyncSession):
     await _seed_lot(session)
     gateway = FakeChatGateway()
@@ -86,7 +161,47 @@ async def test_on_sale_closed_callback_updates_status(session: AsyncSession):
     assert order.status == "completed"
 
 
+async def test_unmatched_sale_keeps_provenance_and_remote_status(
+    session: AsyncSession,
+):
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="unmatched-sale",
+        status=SaleStatus.PAID,
+        chat_id=301,
+        buyer_id=401,
+        subcategory_id=999999,
+        title="Unknown lot",
+        price=123.0,
+        buyer_username="real-buyer",
+    ))
+    callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
+
+    await callbacks.on_new_sale("unmatched-sale")  # type: ignore
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.funpay_order_id == "unmatched-sale")
+    )
+    assert sale is not None
+    assert sale.status == "paid"
+    assert sale.order_id is None
+    assert await session.scalar(
+        select(Order).where(Order.funpay_order_id == "unmatched-sale")
+    ) is None
+
+    await callbacks.on_sale_closed("unmatched-sale")  # type: ignore
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.funpay_order_id == "unmatched-sale")
+    )
+    assert sale.status == "completed"
+    await callbacks.on_sale_refunded("unmatched-sale")  # type: ignore
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.funpay_order_id == "unmatched-sale")
+    )
+    assert sale.status == "refunded"
+
+
 async def test_on_message_callback_dispatches_command(session: AsyncSession):
+    await _seed_verified_sale(session)
     gateway = FakeChatGateway()
     callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
     msg = MessageInfo(
@@ -102,6 +217,7 @@ async def test_on_message_callback_dispatches_command(session: AsyncSession):
 
 
 async def test_on_message_callback_persists_incoming_and_is_idempotent(session: AsyncSession):
+    await _seed_verified_sale(session)
     gateway = FakeChatGateway()
     callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
     msg = MessageInfo(
@@ -151,6 +267,7 @@ async def test_on_message_never_dispatches_without_durable_idempotency_record(
 
 
 async def test_on_message_callback_stores_from_me_without_dispatch(session: AsyncSession):
+    await _seed_verified_sale(session)
     gateway = FakeChatGateway()
     callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
     msg = MessageInfo(

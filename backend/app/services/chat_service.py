@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import dataclass
 import re
 
 from sqlalchemy import select, update
@@ -8,11 +9,44 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.types import MessageInfo
 from app.models.chat import ChatConversation, ChatMessage
-from app.models.rental import Order
+from app.models.funpay_sale import FunPaySale
+from app.services.sale_registry import SaleRegistryService
 
 
 class ConversationNotFoundError(LookupError):
     pass
+
+
+class UnverifiedConversationError(LookupError):
+    """Message did not come from a peer proven by the sales feed."""
+
+
+@dataclass(frozen=True, slots=True)
+class SaleOrderSummary:
+    order_id: int | None
+    funpay_order_id: str
+    status: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ChatConversationSummary:
+    id: int
+    funpay_chat_id: str
+    buyer_funpay_id: str
+    buyer_username: str | None
+    buyer_avatar_url: str | None
+    buyer_is_online: bool | None
+    buyer_status_text: str | None
+    profile_checked_at: datetime | None
+    funpay_order_id: str | None
+    order_id: int | None
+    unread_count: int
+    last_message_text: str | None
+    last_message_direction: str | None
+    last_message_at: datetime | None
+    sale_orders: tuple[SaleOrderSummary, ...]
+
 
 
 _LOGIN_CODE_RE = re.compile(
@@ -33,6 +67,9 @@ class ChatService:
     lets the incoming callback commit the message before command processing and
     lets the send endpoint persist a pending outbox row before network I/O.
     """
+
+    def __init__(self, sale_registry: SaleRegistryService | None = None) -> None:
+        self._sales = sale_registry or SaleRegistryService()
 
     async def record_event(
         self,
@@ -104,21 +141,110 @@ class ChatService:
         await session.flush()
         return stored, True
 
-    async def list_conversations(self, session: AsyncSession) -> list[ChatConversation]:
+    async def list_conversations(
+        self, session: AsyncSession
+    ) -> list[ChatConversationSummary]:
         result = await session.execute(
-            select(ChatConversation).order_by(
-                ChatConversation.last_message_at.desc(),
-                ChatConversation.id.desc(),
-            )
+            select(ChatConversation)
+            .where(ChatConversation.verified_sale.is_(True))
         )
-        return list(result.scalars().all())
+        conversations = list(result.scalars().all())
+        if not conversations:
+            return []
+        buyer_ids = {
+            item.buyer_funpay_id
+            for item in conversations
+            if item.buyer_funpay_id is not None
+        }
+        chat_ids = {item.funpay_chat_id for item in conversations}
+        sales = list(
+            (
+                await session.execute(
+                    select(FunPaySale)
+                    .where(
+                        (FunPaySale.buyer_funpay_id.in_(buyer_ids))
+                        | (FunPaySale.funpay_chat_id.in_(chat_ids))
+                    )
+                    .order_by(FunPaySale.created_at.desc(), FunPaySale.id.desc())
+                )
+            ).scalars()
+        )
+        sales_by_buyer: dict[str, list[FunPaySale]] = {}
+        exact_sale_keys: set[tuple[str, str]] = set()
+        for sale in sales:
+            sales_by_buyer.setdefault(sale.buyer_funpay_id, []).append(sale)
+            if sale.funpay_chat_id is not None:
+                exact_sale_keys.add((sale.buyer_funpay_id, sale.funpay_chat_id))
+
+        sortable: list[tuple[datetime, ChatConversationSummary]] = []
+        for conversation in conversations:
+            if conversation.buyer_funpay_id is None or (
+                conversation.buyer_funpay_id,
+                conversation.funpay_chat_id,
+            ) not in exact_sale_keys:
+                # A stale/corrupt boolean alone cannot expose chat history.
+                continue
+            buyer_sales = sales_by_buyer.get(conversation.buyer_funpay_id, [])
+            summary = ChatConversationSummary(
+                id=conversation.id,
+                funpay_chat_id=conversation.funpay_chat_id,
+                buyer_funpay_id=conversation.buyer_funpay_id,
+                buyer_username=conversation.buyer_username,
+                buyer_avatar_url=conversation.buyer_avatar_url,
+                buyer_is_online=conversation.buyer_is_online,
+                buyer_status_text=conversation.buyer_status_text,
+                profile_checked_at=conversation.profile_checked_at,
+                funpay_order_id=conversation.funpay_order_id,
+                order_id=conversation.order_id,
+                unread_count=conversation.unread_count,
+                last_message_text=conversation.last_message_text,
+                last_message_direction=conversation.last_message_direction,
+                last_message_at=conversation.last_message_at,
+                sale_orders=tuple(
+                    SaleOrderSummary(
+                        order_id=sale.order_id,
+                        funpay_order_id=sale.funpay_order_id,
+                        status=sale.status,
+                        created_at=sale.created_at,
+                    )
+                    for sale in buyer_sales
+                ),
+            )
+            newest_sale_at = buyer_sales[0].created_at
+            if newest_sale_at.tzinfo is None:
+                newest_sale_at = newest_sale_at.replace(tzinfo=timezone.utc)
+            last_message_at = conversation.last_message_at
+            if last_message_at is not None and last_message_at.tzinfo is None:
+                last_message_at = last_message_at.replace(tzinfo=timezone.utc)
+            activity_at = (
+                max(last_message_at, newest_sale_at)
+                if last_message_at is not None
+                else newest_sale_at
+            )
+            sortable.append((activity_at, summary))
+        sortable.sort(key=lambda item: (item[0], item[1].id), reverse=True)
+        return [item[1] for item in sortable]
 
     async def get_conversation(
         self,
         session: AsyncSession,
         conversation_id: int,
     ) -> ChatConversation:
-        conversation = await session.get(ChatConversation, conversation_id)
+        matching_sale = (
+            select(FunPaySale.id)
+            .where(
+                FunPaySale.funpay_chat_id == ChatConversation.funpay_chat_id,
+                FunPaySale.buyer_funpay_id == ChatConversation.buyer_funpay_id,
+            )
+            .exists()
+        )
+        conversation = await session.scalar(
+            select(ChatConversation).where(
+                ChatConversation.id == conversation_id,
+                ChatConversation.verified_sale.is_(True),
+                matching_sale,
+            )
+        )
         if conversation is None:
             raise ConversationNotFoundError(conversation_id)
         return conversation
@@ -201,55 +327,25 @@ class ChatService:
         session: AsyncSession,
         message: MessageInfo,
     ) -> ChatConversation:
-        chat_id = str(message.chat_id)
-        conversation = await session.scalar(
-            select(ChatConversation).where(ChatConversation.funpay_chat_id == chat_id)
+        if message.chat_id <= 0:
+            raise UnverifiedConversationError(message.chat_id)
+        sale = await self._sales.resolve_message_sale(session, message)
+        if sale is None:
+            raise UnverifiedConversationError(message.chat_id)
+        conversation = await self._sales.ensure_conversation(
+            session, sale, message.chat_id
         )
-        order = await self._find_order(session, message)
-
-        if conversation is None:
-            buyer_funpay_id = order.buyer_funpay_id if order is not None else None
-            if buyer_funpay_id is None and message.sender_id is not None and not message.from_me:
-                buyer_funpay_id = str(message.sender_id)
-            conversation = ChatConversation(
-                funpay_chat_id=chat_id,
-                buyer_funpay_id=buyer_funpay_id,
-                funpay_order_id=(
-                    order.funpay_order_id if order is not None else message.order_id
-                ),
-                order_id=order.id if order is not None else None,
-            )
-            session.add(conversation)
-            await session.flush()
-            return conversation
-
-        if order is not None:
-            conversation.order_id = order.id
-            conversation.funpay_order_id = order.funpay_order_id
-            conversation.buyer_funpay_id = order.buyer_funpay_id
-        elif (
-            conversation.buyer_funpay_id is None
+        if conversation is None or not conversation.verified_sale:
+            raise UnverifiedConversationError(message.chat_id)
+        if (
+            not message.from_me
+            and message.sender_username
             and message.sender_id is not None
-            and not message.from_me
+            and str(message.sender_id) == sale.buyer_funpay_id
         ):
-            conversation.buyer_funpay_id = str(message.sender_id)
-        if conversation.funpay_order_id is None and message.order_id:
-            conversation.funpay_order_id = message.order_id
+            sale.buyer_username = message.sender_username
+            conversation.buyer_username = message.sender_username
         return conversation
-
-    @staticmethod
-    async def _find_order(session: AsyncSession, message: MessageInfo) -> Order | None:
-        if message.order_id:
-            order = await session.scalar(
-                select(Order).where(Order.funpay_order_id == message.order_id)
-            )
-            if order is not None:
-                return order
-        return await session.scalar(
-            select(Order)
-            .where(Order.funpay_chat_id == str(message.chat_id))
-            .order_by(Order.id.desc())
-        )
 
     @staticmethod
     def _set_last_message(

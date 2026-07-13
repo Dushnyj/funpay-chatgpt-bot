@@ -15,6 +15,7 @@ from app.integrations.funpay.gateway import FakeChatGateway
 from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
+from app.models.funpay_sale import FunPaySale
 from app.models.rental import Order, Rental
 from app.services.command_handlers import (
     CodeHandler,
@@ -243,6 +244,73 @@ async def test_code_handler_uses_exact_order_when_chat_has_two_active_rentals(
 
     generate.assert_called_once_with(second_account.totp_secret_encrypted)
     assert "654321" in gateway.sent_messages[0][1]
+
+
+async def test_orderless_direct_chat_uses_verified_buyer_identity(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session, chat_id=100)
+    order = await session.get(Order, rental.order_id)
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id="999",
+        buyer_funpay_id="200",
+        status="paid",
+    ))
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    with patch(
+        "app.services.command_handlers.generate_totp",
+        return_value="123456",
+    ):
+        await CodeHandler(totp_min_validity_s=0)(
+            _ctx(gateway, session, chat_id=999)
+        )
+
+    assert "123456" in gateway.sent_messages[0][1]
+
+
+async def test_orderless_direct_chat_keeps_multiple_rentals_ambiguous(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    first = await _seed_rental(session, chat_id=100)
+    second, _ = await _add_second_rental_in_same_chat(session, first)
+    first_order = await session.get(Order, first.order_id)
+    second_order = await session.get(Order, second.order_id)
+    session.add_all([
+        FunPaySale(
+            funpay_order_id=first_order.funpay_order_id,
+            order_id=first_order.id,
+            funpay_chat_id="999",
+            buyer_funpay_id="200",
+            status="paid",
+        ),
+        FunPaySale(
+            funpay_order_id=second_order.funpay_order_id,
+            order_id=second_order.id,
+            funpay_chat_id="999",
+            buyer_funpay_id="200",
+            status="paid",
+        ),
+    ])
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    with patch("app.services.command_handlers.generate_totp") as generate:
+        await CodeHandler(totp_min_validity_s=0)(
+            _ctx(gateway, session, chat_id=999)
+        )
+
+    generate.assert_not_called()
+    assert "несколько активных заказов" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_rechecks_account_status_after_mailbox_work(

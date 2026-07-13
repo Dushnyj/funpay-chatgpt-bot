@@ -98,7 +98,11 @@ async def test_runner_maps_message_from_me_flag():
 
 
 async def test_runner_tracks_listener_and_gateway_uses_same_bot():
-    async def _listen(_dp):
+    seen_config = None
+
+    async def _listen(_dp, *, config):
+        nonlocal seen_config
+        seen_config = config
         await asyncio.Event().wait()
 
     bot = SimpleNamespace(
@@ -116,6 +120,10 @@ async def test_runner_tracks_listener_and_gateway_uses_same_bot():
     assert runner.started is True
     assert runner.listener_task is not None
     assert runner.gateway._bot is bot
+    await asyncio.sleep(0)
+    assert seen_config is not None
+    assert seen_config.discover_sales is True
+    assert seen_config.discover_purchases is False
     await runner.stop()
     assert runner.listener_task is None
     bot.stop_listening.assert_awaited_once()

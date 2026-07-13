@@ -23,6 +23,7 @@ from app.services.lot_auto_manager import LotAutoManager
 from app.services.lot_sync import LotSyncService
 from app.services.offer_configuration import validate_offer_configurations
 from app.services.order_processor import OrderProcessor
+from app.services.sale_registry import SaleRegistryService, SalesSyncResult
 from app.services.rental_service import (
     CREDENTIAL_DELIVERY_LEASE,
     CREDENTIAL_DELIVERY_MAX_ATTEMPTS,
@@ -85,6 +86,7 @@ class AppLifecycle:
         self._bump_interval_seconds = 4 * 60 * 60
         self._refresh_interval_seconds = 60
         self._pending_order_interval_seconds = CREDENTIAL_DELIVERY_POLL_SECONDS
+        self._sale_sync_interval_seconds = 120
         self._refresh_concurrency = 3
         self._revoke_concurrency = 4
         self._revoke_semaphore = asyncio.Semaphore(self._revoke_concurrency)
@@ -96,6 +98,8 @@ class AppLifecycle:
         self._bump = BumpService()
         self._jobs = CheckJobQueue()
         self._lot_sync = LotSyncService()
+        self._sale_registry = SaleRegistryService()
+        self._legacy_sales_bootstrapped = False
 
     async def start(self) -> None:
         """Start the live FunPay listener when a session key is configured."""
@@ -287,6 +291,66 @@ class AppLifecycle:
             callback=self._task_pending_orders,
             interval=self._pending_order_interval_seconds,
         ))
+        self.scheduler.register("funpay_sale_sync", ScheduledTask(
+            callback=self._task_funpay_sale_sync,
+            interval=self._sale_sync_interval_seconds,
+        ))
+
+    async def sync_funpay_sales(
+        self,
+        *,
+        order_id: str | None = None,
+    ) -> SalesSyncResult:
+        """Run a sale-only sync, optionally for one exact FunPay order."""
+
+        gateway = self._gateway
+        if gateway is None:
+            raise FunPayUnavailableError("FunPay bot is not connected")
+        async with async_session_factory() as session:
+            bootstrapped = 0
+            if not self._legacy_sales_bootstrapped:
+                bootstrapped = await self._sale_registry.bootstrap_from_orders(
+                    session
+                )
+            result = (
+                await self._sale_registry.sync_order(session, gateway, order_id)
+                if order_id is not None
+                else await self._sale_registry.sync_recent_sales(session, gateway)
+            )
+            profile_result = None
+            if order_id is None:
+                profile_result = await self._sale_registry.refresh_buyer_profiles(
+                    session,
+                    gateway,
+                )
+            await session.commit()
+            self._legacy_sales_bootstrapped = True
+        total_imported = bootstrapped + result.imported
+        profiles_refreshed = (
+            profile_result.refreshed if profile_result is not None else 0
+        )
+        profile_errors = profile_result.errors if profile_result is not None else 0
+        logger.info(
+            "FunPay sale sync%s: imported=%s enriched=%s profiles=%s errors=%s",
+            f" order={order_id}" if order_id else "",
+            total_imported,
+            result.enriched,
+            profiles_refreshed,
+            result.enrichment_errors + result.history_errors + profile_errors,
+        )
+        return SalesSyncResult(
+            imported=total_imported,
+            enriched=result.enriched,
+            enrichment_errors=result.enrichment_errors,
+            history_errors=result.history_errors,
+            profiles_refreshed=profiles_refreshed,
+            profile_errors=profile_errors,
+        )
+
+    async def _task_funpay_sale_sync(self) -> None:
+        if self._gateway is None:
+            return
+        await self.sync_funpay_sales()
 
     async def _task_expire_overdue(self) -> None:
         """Помечать истёкшие аренды как expired."""

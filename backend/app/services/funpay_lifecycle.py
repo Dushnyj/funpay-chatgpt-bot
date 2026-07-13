@@ -21,8 +21,9 @@ from app.services.command_handlers import (
 )
 from app.services.command_parser import CommandType
 from app.services.command_router import CommandRouter, UnhandledMessage
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, UnverifiedConversationError
 from app.services.order_processor import OrderProcessor, LotNotFoundError
+from app.services.sale_registry import SaleRegistryService
 from app.services.rental_service import RentalService
 from app.telegram_notifier import TelegramNotifier
 
@@ -36,6 +37,7 @@ def build_callbacks(
     session_factory: SessionFactory,
     gateway: ChatGateway,
     command_router: CommandRouter | None = None,
+    sale_registry: SaleRegistryService | None = None,
 ) -> RunnerCallbacks:
     """Сборка RunnerCallbacks из сервисов Фазы 3.
 
@@ -48,6 +50,7 @@ def build_callbacks(
     order_processor = OrderProcessor()
     rental_service = RentalService()
     chat_service = ChatService()
+    sale_registry = sale_registry or SaleRegistryService()
     router = command_router or CommandRouter()
 
     # Регистрируем хэндлеры команд для on_message.
@@ -59,10 +62,24 @@ def build_callbacks(
 
     async def on_new_sale(order_id: str) -> None:
         async with session_factory() as session:
+            logger.info("Processing verified FunPay NewSale %s", order_id)
+            try:
+                sale, info = await sale_registry.register_new_sale(
+                    session, gateway, order_id
+                )
+                # Provenance survives an unconfigured/ambiguous lot. Never
+                # make the buyer registry depend on successful fulfillment.
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.exception("Failed to persist NewSale provenance %s", order_id)
+                return
+
             try:
                 order = await order_processor.process_new_sale(
-                    session, gateway, order_id,
+                    session, gateway, order_id, info=info,
                 )
+                await sale_registry.attach_local_order(session, sale, order)
                 # Order создаётся и коммитится отдельно от fulfill_order,
                 # чтобы сбой выдачи аккаунта не откатил сам заказ
                 # (Order нужен для последующих on_sale_closed/refunded).
@@ -102,16 +119,42 @@ def build_callbacks(
     async def on_sale_closed(order_id: str) -> None:
         async with session_factory() as session:
             try:
+                sale = await sale_registry.update_status(
+                    session, order_id, "completed"
+                )
+                if sale is None:
+                    await sale_registry.sync_order(session, gateway, order_id)
+                    await sale_registry.update_status(session, order_id, "completed")
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.exception("Failed to update sale registry for close %s", order_id)
+            try:
                 await order_processor.process_sale_closed(session, order_id)
                 await session.commit()
                 notifier = await TelegramNotifier.from_settings(session)
                 if notifier is not None:
                     await notifier.notify_order_confirmed(order_id)
+            except KeyError:
+                logger.info(
+                    "Closed sale %s has no local fulfillment order", order_id
+                )
             except Exception:
                 logger.exception("Failed to process sale closed %s", order_id)
 
     async def on_sale_refunded(order_id: str) -> None:
         async with session_factory() as session:
+            try:
+                sale = await sale_registry.update_status(
+                    session, order_id, "refunded"
+                )
+                if sale is None:
+                    await sale_registry.sync_order(session, gateway, order_id)
+                    await sale_registry.update_status(session, order_id, "refunded")
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.exception("Failed to update sale registry for refund %s", order_id)
             try:
                 order = await order_processor.process_sale_refunded(session, order_id)
                 await session.commit()
@@ -121,6 +164,10 @@ def build_callbacks(
                         order_id,
                         pending=order.status == "refund_pending",
                     )
+            except KeyError:
+                logger.info(
+                    "Refunded sale %s has no local fulfillment order", order_id
+                )
             except Exception:
                 logger.exception("Failed to process sale refunded %s", order_id)
 
@@ -129,6 +176,14 @@ def build_callbacks(
             try:
                 _, created = await chat_service.record_event(session, msg)
                 await session.commit()
+            except UnverifiedConversationError:
+                await session.rollback()
+                logger.info(
+                    "Ignored unverified FunPay chat event chat=%s sender=%s",
+                    msg.chat_id,
+                    msg.sender_id,
+                )
+                return
             except IntegrityError:
                 # A concurrent copy of the same FunPay event won the unique
                 # source-id insert. Never execute a command without owning the

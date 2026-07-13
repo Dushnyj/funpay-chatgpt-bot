@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +9,9 @@ from app.api.routers.chats import get_online_chat_gateway
 from app.integrations.funpay.gateway import FakeChatGateway
 from app.integrations.funpay.types import MessageInfo
 from app.main import app
-from app.services.chat_service import ChatService
+from app.models.chat import ChatConversation
+from app.models.funpay_sale import FunPaySale
+from app.services.chat_service import ChatService, UnverifiedConversationError
 
 
 @pytest.fixture
@@ -21,6 +24,7 @@ async def auth_client():
 
 
 async def _seed_conversation(session: AsyncSession, *, message_id: int = 101) -> int:
+    await _seed_sale(session)
     message, _ = await ChatService().record_event(
         session,
         MessageInfo(
@@ -35,6 +39,30 @@ async def _seed_conversation(session: AsyncSession, *, message_id: int = 101) ->
     return message.conversation_id
 
 
+async def _seed_sale(
+    session: AsyncSession,
+    *,
+    chat_id: int = 500,
+    buyer_id: int = 700,
+    order_id: str = "order-500",
+) -> FunPaySale:
+    sale = FunPaySale(
+        funpay_order_id=order_id,
+        funpay_chat_id=str(chat_id),
+        buyer_funpay_id=str(buyer_id),
+        buyer_username="verified-buyer",
+        buyer_avatar_url="https://example.test/avatar.png",
+        buyer_is_online=True,
+        buyer_status_text="online",
+        status="paid",
+        created_at=datetime.now(timezone.utc),
+        profile_checked_at=datetime.now(timezone.utc),
+    )
+    session.add(sale)
+    await session.flush()
+    return sale
+
+
 async def test_list_chats_and_history(auth_client: AsyncClient, session: AsyncSession):
     conversation_id = await _seed_conversation(session)
 
@@ -42,6 +70,9 @@ async def test_list_chats_and_history(auth_client: AsyncClient, session: AsyncSe
     assert response.status_code == 200
     assert response.json()[0]["id"] == conversation_id
     assert response.json()[0]["unread_count"] == 1
+    assert response.json()[0]["buyer_username"] == "verified-buyer"
+    assert response.json()[0]["buyer_is_online"] is True
+    assert response.json()[0]["sale_orders"][0]["funpay_order_id"] == "order-500"
 
     response = await auth_client.get(f"/api/chats/{conversation_id}/messages")
     assert response.status_code == 200
@@ -203,6 +234,12 @@ async def test_chat_text_is_encrypted_at_rest_but_available_to_admin(
     session: AsyncSession,
 ):
     secret_message = "Логин buyer@example.com; пароль SuperSecret-123"
+    await _seed_sale(
+        session,
+        chat_id=501,
+        buyer_id=700,
+        order_id="order-501",
+    )
     stored, _ = await ChatService().record_event(
         session,
         MessageInfo(
@@ -235,3 +272,37 @@ async def test_chat_text_is_encrypted_at_rest_but_available_to_admin(
     assert secret_message not in raw_message
     assert secret_message not in raw_preview
     assert stored.text == secret_message
+
+
+async def test_unverified_purchase_chat_is_not_persisted(session: AsyncSession):
+    with pytest.raises(UnverifiedConversationError):
+        await ChatService().record_event(
+            session,
+            MessageInfo(
+                message_id=999,
+                chat_id=999,
+                sender_id=123,
+                text="I sold something to you",
+                order_id="purchase-only",
+            ),
+        )
+    assert (await session.execute(text("SELECT COUNT(*) FROM chat_messages"))).scalar_one() == 0
+
+
+async def test_stale_verified_flag_without_sale_is_not_exposed(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    stale = ChatConversation(
+        funpay_chat_id="777",
+        buyer_funpay_id="888",
+        verified_sale=True,
+    )
+    session.add(stale)
+    await session.commit()
+
+    response = await auth_client.get("/api/chats")
+    assert response.status_code == 200
+    assert response.json() == []
+    response = await auth_client.get(f"/api/chats/{stale.id}/messages")
+    assert response.status_code == 404

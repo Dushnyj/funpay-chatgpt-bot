@@ -130,9 +130,14 @@ class FunPayRunner:
             self._dp = Dispatcher()
 
     async def _listen_forever(self) -> None:
+        from funpaybotengine.runner import RunnerConfig
+
         while not self._stopping:
             try:
-                await self._bot.listen_events(self._dp)
+                await self._bot.listen_events(
+                    self._dp,
+                    config=RunnerConfig(discover_purchases=False),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -183,13 +188,23 @@ class FunPayRunner:
             @self._dp.on_new_message()
             async def handle_message(event):
                 msg = event.message
+                meta = msg.meta
                 info = MessageInfo(
                     message_id=msg.id,
                     chat_id=int(msg.chat_id) if msg.chat_id else 0,
                     sender_id=msg.sender_id,
                     text=msg.text,
-                    order_id=msg.meta.order_id if msg.meta else None,
+                    order_id=meta.order_id if meta else None,
                     from_me=bool(msg.from_me),
+                    sender_username=getattr(msg, "sender_username", None),
+                    buyer_id=getattr(meta, "buyer_id", None) if meta else None,
+                    buyer_username=(
+                        getattr(meta, "buyer_username", None) if meta else None
+                    ),
+                    seller_id=getattr(meta, "seller_id", None) if meta else None,
+                    seller_username=(
+                        getattr(meta, "seller_username", None) if meta else None
+                    ),
                 )
                 await message_cb(info)
 

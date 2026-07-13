@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 
@@ -29,6 +30,43 @@ class OrderInfo:
     # (or when another parser can recover it).  Domain matching always prefers
     # this stable remote identifier over title/price fallbacks.
     offer_id: int | None = None
+    buyer_username: str | None = None
+    buyer_avatar_url: str | None = None
+    buyer_is_online: bool | None = None
+    buyer_status_text: str | None = None
+
+
+@dataclass(frozen=True)
+class SalePreviewInfo:
+    """Sale-only preview returned by ``Bot.get_sales()``."""
+
+    order_id: str
+    status: SaleStatus
+    buyer_id: int
+    buyer_username: str | None
+    buyer_avatar_url: str | None
+    buyer_is_online: bool | None
+    buyer_status_text: str | None
+    created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SalePreviewPage:
+    """One bounded page from the sale-only order history."""
+
+    sales: tuple[SalePreviewInfo, ...]
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class BuyerProfileInfo:
+    """Authoritative buyer profile returned by ``Bot.get_profile_page()``."""
+
+    buyer_id: int
+    username: str | None
+    avatar_url: str | None
+    is_online: bool | None
+    status_text: str | None
 
 
 @dataclass(frozen=True)
@@ -53,6 +91,11 @@ class MessageInfo:
     text: str | None
     order_id: str | None
     from_me: bool = False
+    sender_username: str | None = None
+    buyer_id: int | None = None
+    buyer_username: str | None = None
+    seller_id: int | None = None
+    seller_username: str | None = None
 
 
 @dataclass(frozen=True)

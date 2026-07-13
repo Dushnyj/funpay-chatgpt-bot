@@ -12,13 +12,26 @@ class _FromAttributes(BaseModel):
 class ChatSummaryOut(_FromAttributes):
     id: int
     funpay_chat_id: str
-    buyer_funpay_id: str | None = None
+    buyer_funpay_id: str
+    buyer_username: str | None = None
+    buyer_avatar_url: str | None = None
+    buyer_is_online: bool | None = None
+    buyer_status_text: str | None = None
+    profile_checked_at: datetime | None = None
     funpay_order_id: str | None = None
     order_id: int | None = None
     unread_count: int
     last_message_text: str | None = None
     last_message_direction: str | None = None
     last_message_at: datetime | None = None
+    sale_orders: list["ChatSaleOrderOut"]
+
+
+class ChatSaleOrderOut(_FromAttributes):
+    order_id: int | None = None
+    funpay_order_id: str
+    status: str
+    created_at: datetime
 
 
 class ChatMessageOut(_FromAttributes):

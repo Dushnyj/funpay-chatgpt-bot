@@ -353,12 +353,23 @@ export interface TelegramConfigStatus {
   seller_chat_id: string | null
 }
 
+export interface ChatSaleOrder {
+  order_id: number | null
+  funpay_order_id: string
+  status: string
+  created_at: string
+}
+
 export interface ChatSummary {
   id: number
   funpay_chat_id: string
-  buyer_funpay_id: string | null
-  funpay_order_id: string | null
-  order_id: number | null
+  buyer_funpay_id: string
+  buyer_username: string | null
+  buyer_avatar_url: string | null
+  buyer_is_online: boolean | null
+  buyer_status_text: string | null
+  profile_checked_at: string | null
+  sale_orders: ChatSaleOrder[]
   unread_count: number
   last_message_text: string | null
   last_message_direction: 'incoming' | 'outgoing' | null

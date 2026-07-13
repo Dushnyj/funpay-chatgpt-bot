@@ -15,6 +15,54 @@ from app.db.migrations import (
 from app.services.crypto import decrypt, encrypt
 
 
+async def test_0016_backfills_only_exact_sale_conversations(tmp_path, monkeypatch):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'verified-sales-0016.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0015")
+
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        await connection.execute(text(
+            "INSERT INTO orders "
+            "(id, funpay_order_id, funpay_chat_id, buyer_funpay_id, "
+            "buyer_locale, price, status, fulfillment_attempts, created_at) "
+            "VALUES (1, 'SALE-1', '100', '200', 'ru', 100, 'pending', 0, "
+            "CURRENT_TIMESTAMP)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO chat_conversations "
+            "(id, funpay_chat_id, buyer_funpay_id, funpay_order_id, order_id, "
+            "unread_count, created_at, updated_at) VALUES "
+            "(1, '100', '200', 'SALE-1', 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+            "(2, '101', '200', 'SALE-1', NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+            "(3, '102', '999', NULL, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ))
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260713_0016")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        sale = (
+            await connection.execute(text(
+                "SELECT funpay_order_id, order_id, funpay_chat_id, "
+                "buyer_funpay_id, status FROM funpay_sales"
+            ))
+        ).one()
+        flags = dict((await connection.execute(text(
+            "SELECT id, verified_sale FROM chat_conversations ORDER BY id"
+        ))).all())
+    await engine.dispose()
+
+    assert tuple(sale) == ("SALE-1", 1, "100", "200", "paid")
+    assert {key: bool(value) for key, value in flags.items()} == {
+        1: True,
+        2: False,
+        3: False,
+    }
+
+
 async def _schema(engine):
     async with engine.connect() as connection:
         return await connection.run_sync(
@@ -64,7 +112,41 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
-    assert version == "20260713_0015"
+        sale_sync_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns(
+                    "funpay_sale_sync_state"
+                )
+            }
+        )
+        funpay_sale_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns("funpay_sales")
+            }
+        )
+        chat_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns(
+                    "chat_conversations"
+                )
+            }
+        )
+    assert version == "20260714_0017"
+    assert "funpay_sales" in tables
+    assert "funpay_sale_sync_state" in tables
+    assert {
+        "backfill_cursor",
+        "backfill_complete",
+        "head_synced_at",
+        "page_backoff_attempts",
+        "page_backoff_until",
+        "updated_at",
+    } <= sale_sync_columns
+    assert {"detail_attempts", "detail_next_attempt_at"} <= funpay_sale_columns
+    assert {"profile_attempts", "profile_next_attempt_at"} <= chat_columns
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
@@ -731,7 +813,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260713_0015"
+    assert version == "20260714_0017"
     await engine.dispose()
 
 
@@ -820,7 +902,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260713_0015"
+    assert version == "20260714_0017"
     await engine.dispose()
 
 

@@ -21,6 +21,7 @@ dependencies = [
     "playwright==1.61.0",
     "python-telegram-bot>=21.0",
     "funpaybotengine==0.7.0",
+    "funpayparsers==0.10.0",
     "aioimaplib==2.0.1",
     "pyzbar>=0.1.9",
     "Pillow>=10.0",

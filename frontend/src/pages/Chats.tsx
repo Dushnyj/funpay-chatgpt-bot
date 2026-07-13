@@ -4,12 +4,20 @@ import { ApiError } from '../api/client'
 import { useChatMessages, useChats, useMarkChatRead, useSendChatMessage } from '../api/chats'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader } from '../components/ui'
+import {
+  buyerInitial,
+  buyerPresence,
+  chatMatchesSearch,
+  chatTitle,
+  funPayOrderUrl,
+  orderLabel,
+  orderListPresentation,
+  parseConversationId,
+  safeAvatarUrl,
+  sortedSaleOrders,
+} from '../utils/chatPresentation'
 import { formatDateTime } from '../utils/format'
 import type { ChatMessage, ChatSummary } from '../types/api'
-
-function chatTitle(chat: ChatSummary) {
-  return chat.buyer_funpay_id ? `Покупатель #${chat.buyer_funpay_id}` : `Чат #${chat.funpay_chat_id}`
-}
 
 function shortTime(value: string | null) {
   if (!value) return ''
@@ -26,31 +34,49 @@ export default function Chats() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [search, setSearch] = useState('')
   const chatsQuery = useChats()
-  const selectedId = parseConversationId(searchParams.get('chat'))
-  const selectedChat = chatsQuery.data?.find((chat) => chat.id === selectedId) ?? null
-  const messagesQuery = useChatMessages(selectedId)
+  const requestedChat = searchParams.get('chat')
+  const selectedId = parseConversationId(requestedChat)
+  const buyerChats = useMemo(
+    () => (chatsQuery.data ?? []).filter((chat) => chat.sale_orders.length > 0),
+    [chatsQuery.data],
+  )
+  const selectedChat = buyerChats.find((chat) => chat.id === selectedId) ?? null
+  const selectedChatId = selectedChat?.id ?? null
+  const messagesQuery = useChatMessages(selectedChatId)
   const markRead = useMarkChatRead()
   const markReadRef = useRef(markRead.mutate)
+  const markedUnreadRef = useRef<string | null>(null)
   markReadRef.current = markRead.mutate
 
   useEffect(() => {
-    if (selectedChat && selectedChat.unread_count > 0) {
-      markReadRef.current(selectedChat.id)
+    if (!requestedChat || chatsQuery.data === undefined || selectedChat) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('chat')
+    setSearchParams(next, { replace: true })
+  }, [chatsQuery.data, requestedChat, searchParams, selectedChat, setSearchParams])
+
+  const unreadKey = selectedChat && selectedChat.unread_count > 0
+    ? `${selectedChat.id}:${selectedChat.unread_count}`
+    : null
+
+  useEffect(() => {
+    if (!unreadKey || selectedChatId === null) {
+      markedUnreadRef.current = null
+      return
     }
-  }, [selectedChat, messagesQuery.data?.length])
+    if (markedUnreadRef.current === unreadKey) return
+    markedUnreadRef.current = unreadKey
+    markReadRef.current(selectedChatId)
+  }, [selectedChatId, unreadKey])
 
   const chats = useMemo(() => {
-    const needle = search.trim().toLocaleLowerCase('ru-RU')
-    if (!needle) return chatsQuery.data ?? []
-    return (chatsQuery.data ?? []).filter((chat) =>
-      [chat.buyer_funpay_id, chat.funpay_order_id, chat.funpay_chat_id, chat.last_message_text]
-        .some((value) => value?.toLocaleLowerCase('ru-RU').includes(needle)),
-    )
-  }, [chatsQuery.data, search])
+    return buyerChats.filter((chat) => chatMatchesSearch(chat, search))
+  }, [buyerChats, search])
 
   const selectChat = (conversation: ChatSummary) => {
-    setSearchParams({ chat: String(conversation.id) })
-    if (conversation.unread_count > 0) markRead.mutate(conversation.id)
+    const next = new URLSearchParams(searchParams)
+    next.set('chat', String(conversation.id))
+    setSearchParams(next)
   }
 
   return (
@@ -58,7 +84,7 @@ export default function Chats() {
       <PageHeader
         eyebrow="Коммуникации"
         title="Чаты"
-        description="Входящие сообщения покупателей и ответы через подключённого FunPay-бота."
+        description="Только чаты покупателей, подтверждённые вашими продажами FunPay, и ответы через подключённого бота."
         actions={(
           <button className="button button--secondary" onClick={() => chatsQuery.refetch()} disabled={chatsQuery.isFetching}>
             <Icon name="refresh" />
@@ -69,15 +95,15 @@ export default function Chats() {
 
       {chatsQuery.isLoading && <LoadingState label="Загружаем чаты" />}
       {chatsQuery.isError && <ErrorState message="Не удалось загрузить чаты" onRetry={() => chatsQuery.refetch()} />}
-      {chatsQuery.data && chatsQuery.data.length === 0 && (
+      {chatsQuery.data && buyerChats.length === 0 && (
         <EmptyState
           icon="chat"
-          title="Сообщений пока нет"
-          description="Новая беседа появится здесь после первого входящего сообщения от покупателя в FunPay."
+          title="Чатов с покупателями пока нет"
+          description="Здесь появятся только беседы пользователей, у которых есть подтверждённая покупка в ваших продажах FunPay."
         />
       )}
 
-      {chatsQuery.data && chatsQuery.data.length > 0 && (
+      {chatsQuery.data && buyerChats.length > 0 && (
         <div className={`chat-console ${selectedChat ? 'chat-console--thread-open' : ''}`}>
           <aside className="chat-inbox" aria-label="Список чатов">
             <div className="chat-inbox__toolbar">
@@ -87,41 +113,52 @@ export default function Chats() {
                 <input
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Покупатель, заказ или сообщение"
+                  placeholder="Логин, ID, чат, заказ или сообщение"
                 />
               </label>
               <span className="chat-inbox__count">{chats.length}</span>
             </div>
 
             <div className="chat-list">
-              {chats.map((chat) => (
-                <button
-                  key={chat.id}
-                  type="button"
-                  className={`chat-list-item ${selectedId === chat.id ? 'chat-list-item--active' : ''}`}
-                  onClick={() => selectChat(chat)}
-                >
-                  <span className="chat-list-item__avatar" aria-hidden="true">{chat.buyer_funpay_id?.slice(0, 1) ?? 'F'}</span>
-                  <span className="chat-list-item__body">
-                    <span className="chat-list-item__head">
-                      <strong>{chatTitle(chat)}</strong>
-                      <time dateTime={chat.last_message_at ?? undefined}>{shortTime(chat.last_message_at)}</time>
+              {chats.map((chat) => {
+                const order = orderListPresentation(chat)
+                return (
+                  <button
+                    key={chat.id}
+                    type="button"
+                    className={`chat-list-item ${selectedId === chat.id ? 'chat-list-item--active' : ''}`}
+                    onClick={() => selectChat(chat)}
+                  >
+                    <BuyerAvatar chat={chat} />
+                    <span className="chat-list-item__body">
+                      <span className="chat-list-item__head">
+                        <strong>{chatTitle(chat)}</strong>
+                        <time dateTime={chat.last_message_at ?? undefined}>{shortTime(chat.last_message_at)}</time>
+                      </span>
+                      <span className="chat-list-item__meta">
+                        <span className="chat-list-item__order">
+                          {order.label}
+                          {order.additionalCount > 0 && (
+                            <span className="chat-list-item__order-more" aria-label={`Ещё заказов: ${order.additionalCount}`}>
+                              +{order.additionalCount}
+                            </span>
+                          )}
+                        </span>
+                        <BuyerPresence chat={chat} />
+                      </span>
+                      <span className="chat-list-item__preview">
+                        {chat.last_message_direction === 'outgoing' && <span aria-label="Ваш ответ">Вы: </span>}
+                        {chat.last_message_text || 'Сообщение без текста'}
+                      </span>
                     </span>
-                    <span className="chat-list-item__meta">
-                      {chat.funpay_order_id ? `Заказ #${chat.funpay_order_id}` : `FunPay chat ${chat.funpay_chat_id}`}
-                    </span>
-                    <span className="chat-list-item__preview">
-                      {chat.last_message_direction === 'outgoing' && <span aria-label="Ваш ответ">Вы: </span>}
-                      {chat.last_message_text || 'Сообщение без текста'}
-                    </span>
-                  </span>
-                  {chat.unread_count > 0 && (
-                    <span className="unread-badge" aria-label={`Непрочитанных: ${chat.unread_count}`}>
-                      {chat.unread_count > 99 ? '99+' : chat.unread_count}
-                    </span>
-                  )}
-                </button>
-              ))}
+                    {chat.unread_count > 0 && (
+                      <span className="unread-badge" aria-label={`Непрочитанных: ${chat.unread_count}`}>
+                        {chat.unread_count > 99 ? '99+' : chat.unread_count}
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
               {chats.length === 0 && (
                 <div className="chat-list-empty">Ничего не найдено</div>
               )}
@@ -143,7 +180,11 @@ export default function Chats() {
                 isLoading={messagesQuery.isLoading}
                 isError={messagesQuery.isError}
                 onRetry={() => messagesQuery.refetch()}
-                onBack={() => setSearchParams({})}
+                onBack={() => {
+                  const next = new URLSearchParams(searchParams)
+                  next.delete('chat')
+                  setSearchParams(next)
+                }}
               />
             )}
           </section>
@@ -206,10 +247,26 @@ function Conversation({
         <button type="button" className="icon-button chat-thread__back" onClick={onBack} aria-label="Вернуться к списку чатов">
           <Icon name="arrow-right" className="chat-thread__back-icon" />
         </button>
-        <div className="chat-list-item__avatar" aria-hidden="true">{chat.buyer_funpay_id?.slice(0, 1) ?? 'F'}</div>
-        <div>
-          <strong>{chatTitle(chat)}</strong>
-          <span>{chat.funpay_order_id ? `Заказ #${chat.funpay_order_id}` : `FunPay chat ${chat.funpay_chat_id}`}</span>
+        <BuyerAvatar chat={chat} />
+        <div className="chat-thread__summary">
+          <div className="chat-thread__buyer">
+            <strong>{chatTitle(chat)}</strong>
+            <BuyerPresence chat={chat} />
+          </div>
+          <nav className="chat-thread__orders" aria-label="Продажи покупателя">
+            {sortedSaleOrders(chat.sale_orders).map((order) => (
+              <a
+                key={`${order.funpay_order_id}:${order.created_at}`}
+                className="chat-order-chip"
+                href={funPayOrderUrl(order.funpay_order_id)}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`Открыть ${orderLabel(order.funpay_order_id)} в FunPay`}
+              >
+                {orderLabel(order.funpay_order_id)}
+              </a>
+            ))}
+          </nav>
         </div>
       </header>
 
@@ -252,7 +309,7 @@ function Conversation({
               void submit()
             }
           }}
-          rows={3}
+          rows={2}
           maxLength={4000}
           placeholder="Напишите ответ… Enter — отправить, Shift+Enter — новая строка"
         />
@@ -278,8 +335,34 @@ function DeliveryStatus({ status }: { status: ChatMessage['delivery_status'] }) 
   return <span className={`delivery-status delivery-status--${status}`}>{labels[status]}</span>
 }
 
-function parseConversationId(value: string | null) {
-  if (!value) return null
-  const id = Number(value)
-  return Number.isInteger(id) && id > 0 ? id : null
+function BuyerAvatar({ chat }: { chat: ChatSummary }) {
+  const avatarUrl = safeAvatarUrl(chat.buyer_avatar_url)
+  const presence = buyerPresence(chat)
+  return (
+    <span className="chat-list-item__avatar buyer-avatar" aria-hidden="true">
+      <span className="buyer-avatar__initial">{buyerInitial(chat)}</span>
+      {avatarUrl && (
+        <img
+          key={avatarUrl}
+          src={avatarUrl}
+          alt=""
+          loading="lazy"
+          decoding="async"
+          referrerPolicy="no-referrer"
+          onError={(event) => { event.currentTarget.hidden = true }}
+        />
+      )}
+      <span className={`buyer-avatar__presence buyer-avatar__presence--${presence.tone}`} />
+    </span>
+  )
+}
+
+function BuyerPresence({ chat }: { chat: ChatSummary }) {
+  const presence = buyerPresence(chat)
+  const checkedAt = chat.profile_checked_at ? `Профиль проверен: ${formatDateTime(chat.profile_checked_at)}` : undefined
+  return (
+    <span className={`buyer-presence buyer-presence--${presence.tone}`} title={checkedAt}>
+      {presence.label}
+    </span>
+  )
 }

@@ -55,12 +55,13 @@ class OrderProcessor:
         session: AsyncSession,
         gateway: ChatGateway,
         order_id: str,
+        info: OrderInfo | None = None,
     ) -> Order:
         existing = await self._find_order(session, order_id)
         if existing is not None:
             return existing
 
-        info = await gateway.get_order(order_id)
+        info = info or await gateway.get_order(order_id)
         lot = await self._find_lot(session, info)
         if lot is None:
             raise LotNotFoundError(

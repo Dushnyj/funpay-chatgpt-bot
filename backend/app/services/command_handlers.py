@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from collections.abc import Awaitable, Callable
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.email.provider import (
@@ -20,6 +20,7 @@ from app.integrations.funpay.gateway import ChatGateway
 from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier
+from app.models.funpay_sale import FunPaySale
 from app.models.rental import Order, Rental
 from app.services.command_router import CommandContext
 from app.services.account_limits import MeasureResult, measure_account_limits
@@ -94,12 +95,27 @@ async def _find_rental_for_context(
 ) -> Rental | None:
     """Resolve the rental by order first; never guess between active rentals."""
 
+    verified_buyer_fallback = and_(
+        Rental.buyer_funpay_id == str(ctx.sender_id),
+        select(FunPaySale.id)
+        .where(
+            FunPaySale.funpay_order_id == Order.funpay_order_id,
+            FunPaySale.buyer_funpay_id == str(ctx.sender_id),
+            FunPaySale.funpay_chat_id == str(ctx.chat_id),
+        )
+        .exists(),
+    )
+    context_identity = or_(
+        Rental.buyer_funpay_chat_id == str(ctx.chat_id),
+        verified_buyer_fallback,
+    )
+
     if ctx.order_id:
         stmt = (
             select(Rental)
             .join(Order, Order.id == Rental.order_id)
             .where(
-                Rental.buyer_funpay_chat_id == str(ctx.chat_id),
+                context_identity,
                 Order.funpay_order_id == ctx.order_id,
             )
             .limit(1)
@@ -111,8 +127,9 @@ async def _find_rental_for_context(
 
     active_stmt = (
         select(Rental)
+        .join(Order, Order.id == Rental.order_id)
         .where(
-            Rental.buyer_funpay_chat_id == str(ctx.chat_id),
+            context_identity,
             Rental.status.in_(["active", "expiry_pending"]),
         )
         .order_by(Rental.started_at.desc(), Rental.id.desc())
@@ -130,7 +147,8 @@ async def _find_rental_for_context(
 
     latest_stmt = (
         select(Rental)
-        .where(Rental.buyer_funpay_chat_id == str(ctx.chat_id))
+        .join(Order, Order.id == Rental.order_id)
+        .where(context_identity)
         .order_by(Rental.started_at.desc(), Rental.id.desc())
         .limit(1)
     )
@@ -165,18 +183,46 @@ async def _lock_resolved_rental(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
+    if rental is None:
+        return None
+    verified_buyer_fallback = await session.scalar(
+        select(FunPaySale.id).where(
+            FunPaySale.funpay_order_id == order.funpay_order_id,
+            FunPaySale.buyer_funpay_id == str(ctx.sender_id),
+            FunPaySale.funpay_chat_id == str(ctx.chat_id),
+        )
+    )
+    identity_matches = (
+        rental.buyer_funpay_chat_id == str(ctx.chat_id)
+        or (
+            rental.buyer_funpay_id == str(ctx.sender_id)
+            and verified_buyer_fallback is not None
+        )
+    )
     if (
-        rental is None
-        or rental.order_id != order.id
-        or rental.buyer_funpay_chat_id != str(ctx.chat_id)
+        rental.order_id != order.id
+        or not identity_matches
         or (ctx.order_id is not None and order.funpay_order_id != ctx.order_id)
     ):
         return None
     if ctx.order_id is None:
         active_ids = list((await session.execute(
             select(Rental.id)
+            .join(Order, Order.id == Rental.order_id)
             .where(
-                Rental.buyer_funpay_chat_id == str(ctx.chat_id),
+                or_(
+                    Rental.buyer_funpay_chat_id == str(ctx.chat_id),
+                    and_(
+                        Rental.buyer_funpay_id == str(ctx.sender_id),
+                        select(FunPaySale.id)
+                        .where(
+                            FunPaySale.funpay_order_id == Order.funpay_order_id,
+                            FunPaySale.buyer_funpay_id == str(ctx.sender_id),
+                            FunPaySale.funpay_chat_id == str(ctx.chat_id),
+                        )
+                        .exists(),
+                    ),
+                ),
                 Rental.status.in_(["active", "expiry_pending"]),
             )
             .order_by(Rental.started_at.desc(), Rental.id.desc())

@@ -203,7 +203,49 @@ async def test_register_periodic_tasks():
     assert "refresh_recover" in lc.scheduler._tasks
     assert "refund_revoke" in lc.scheduler._tasks
     assert "pending_order_retry" in lc.scheduler._tasks
+    assert "funpay_sale_sync" in lc.scheduler._tasks
+    assert lc.scheduler._tasks["funpay_sale_sync"].interval == 120
     await lc.stop()
+
+
+async def test_sale_sync_bootstraps_legacy_orders_only_once(monkeypatch):
+    import app.app_lifecycle as lifecycle_module
+    from app.services.sale_registry import ProfileRefreshResult, SalesSyncResult
+
+    session = MagicMock()
+    session.commit = AsyncMock()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = object()
+    lifecycle._sale_registry.bootstrap_from_orders = AsyncMock(return_value=3)
+    lifecycle._sale_registry.sync_recent_sales = AsyncMock(
+        return_value=SalesSyncResult(
+            imported=2,
+            enriched=0,
+            enrichment_errors=0,
+        )
+    )
+    lifecycle._sale_registry.refresh_buyer_profiles = AsyncMock(
+        return_value=ProfileRefreshResult(refreshed=1, errors=0)
+    )
+
+    first = await lifecycle.sync_funpay_sales()
+    second = await lifecycle.sync_funpay_sales()
+
+    assert first.imported == 5
+    assert second.imported == 2
+    assert first.profiles_refreshed == second.profiles_refreshed == 1
+    lifecycle._sale_registry.bootstrap_from_orders.assert_awaited_once_with(session)
+    assert lifecycle._sale_registry.sync_recent_sales.await_count == 2
+    assert lifecycle._sale_registry.refresh_buyer_profiles.await_count == 2
 
 
 async def test_stop_is_idempotent():

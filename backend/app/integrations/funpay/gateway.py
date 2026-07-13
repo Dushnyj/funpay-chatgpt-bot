@@ -3,13 +3,17 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from app.integrations.funpay.exceptions import FunPayApiError, FunPayOfferResolutionError
 from app.integrations.funpay.types import (
+    BuyerProfileInfo,
     OrderInfo,
     OfferInfo,
     OfferFieldsDTO,
+    SalePreviewInfo,
+    SalePreviewPage,
 )
 
 
@@ -37,6 +41,20 @@ class ChatGateway(Protocol):
         """Получить список своих лотов в подкатегории."""
         ...
 
+    async def list_sales(
+        self,
+        *,
+        limit: int = 100,
+        order_id: str | None = None,
+        cursor: str | None = None,
+    ) -> SalePreviewPage:
+        """Return recent sales only (never purchases)."""
+        ...
+
+    async def get_buyer_profile(self, buyer_id: int) -> BuyerProfileInfo:
+        """Return one exact FunPay user profile by stable user ID."""
+        ...
+
     async def get_category_id(self, subcategory_id: int) -> int | None:
         """Resolve parent category id needed by FunPay raise_offers()."""
         ...
@@ -57,6 +75,11 @@ class FakeChatGateway:
         self._next_message_id = 1
         self._next_offer_id = 1
         self._orders: dict[str, OrderInfo] = {}
+        self._sales: list[SalePreviewInfo] = []
+        self._sales_page_size = 100
+        self.sales_list_calls: list[tuple[str | None, str | None, int]] = []
+        self._buyer_profiles: dict[int, BuyerProfileInfo] = {}
+        self.profile_calls: list[int] = []
         self.saved_offers: dict[int, OfferFieldsDTO] = {}
         self.activity_changes: list[tuple[int, bool]] = []
         self.bumped: list[tuple[int, int]] = []
@@ -65,6 +88,18 @@ class FakeChatGateway:
 
     def set_order(self, order: OrderInfo) -> None:
         self._orders[order.order_id] = order
+
+    def set_sales(
+        self,
+        sales: list[SalePreviewInfo],
+        *,
+        page_size: int = 100,
+    ) -> None:
+        self._sales = list(sales)
+        self._sales_page_size = max(1, page_size)
+
+    def set_buyer_profile(self, profile: BuyerProfileInfo) -> None:
+        self._buyer_profiles[profile.buyer_id] = profile
 
     def set_my_offers(self, subcategory_id: int, offers: list[OfferInfo]) -> None:
         self._my_offers[subcategory_id] = offers
@@ -82,6 +117,41 @@ class FakeChatGateway:
         if order_id not in self._orders:
             raise KeyError(order_id)
         return self._orders[order_id]
+
+    async def list_sales(
+        self,
+        *,
+        limit: int = 100,
+        order_id: str | None = None,
+        cursor: str | None = None,
+    ) -> SalePreviewPage:
+        self.sales_list_calls.append((cursor, order_id, limit))
+        if order_id is not None:
+            sales = tuple(item for item in self._sales if item.order_id == order_id)
+            return SalePreviewPage(sales=sales[: max(0, limit)])
+        start = 0
+        if cursor is not None:
+            start = next(
+                (
+                    index
+                    for index, item in enumerate(self._sales)
+                    if item.order_id == cursor
+                ),
+                len(self._sales),
+            )
+        page_size = min(max(0, limit), self._sales_page_size)
+        end = min(len(self._sales), start + page_size)
+        next_cursor = self._sales[end].order_id if end < len(self._sales) else None
+        return SalePreviewPage(
+            sales=tuple(self._sales[start:end]),
+            next_cursor=next_cursor,
+        )
+
+    async def get_buyer_profile(self, buyer_id: int) -> BuyerProfileInfo:
+        self.profile_calls.append(buyer_id)
+        if buyer_id not in self._buyer_profiles:
+            raise KeyError(buyer_id)
+        return self._buyer_profiles[buyer_id]
 
     async def save_offer_fields(self, fields: OfferFieldsDTO) -> int:
         if fields.offer_id == 0:
@@ -140,8 +210,9 @@ def _build_order_info(page) -> OrderInfo:
     MoneyValue.value — числовая сумма (НЕ amount).
     """
     buyer_id = 0
-    if page.chat and page.chat.interlocutor:
-        buyer_id = page.chat.interlocutor.id or 0
+    buyer = page.chat.interlocutor if page.chat and page.chat.interlocutor else None
+    if buyer:
+        buyer_id = buyer.id or 0
     price = None
     if page.order_total:
         price = float(page.order_total.value)
@@ -154,6 +225,28 @@ def _build_order_info(page) -> OrderInfo:
         title=page.short_description,
         price=price,
         offer_id=_extract_order_offer_id(page),
+        buyer_username=getattr(buyer, "username", None),
+        buyer_avatar_url=getattr(buyer, "avatar_url", None),
+        buyer_is_online=getattr(buyer, "online", None),
+        buyer_status_text=getattr(buyer, "status_text", None),
+    )
+
+
+def _build_sale_preview_info(preview) -> SalePreviewInfo:
+    buyer = preview.counterparty
+    timestamp = preview.timestamp
+    created_at = (
+        datetime.fromtimestamp(timestamp, timezone.utc) if timestamp > 0 else None
+    )
+    return SalePreviewInfo(
+        order_id=str(preview.id),
+        status=_map_order_status(preview.status),
+        buyer_id=int(buyer.id),
+        buyer_username=buyer.username or None,
+        buyer_avatar_url=buyer.avatar_url or None,
+        buyer_is_online=buyer.online,
+        buyer_status_text=buyer.status_text or None,
+        created_at=created_at,
     )
 
 
@@ -194,6 +287,13 @@ def _positive_int(value) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _clean_optional_text(value) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
 def _build_offer_info(preview) -> OfferInfo:
     """Сборка OfferInfo из OfferPreview funpaybotengine."""
     price = None
@@ -227,6 +327,44 @@ class FunPayChatGateway:
     async def get_order(self, order_id: str) -> OrderInfo:
         page = await self._bot.get_order_page(order_id=order_id)
         return _build_order_info(page)
+
+    async def list_sales(
+        self,
+        *,
+        limit: int = 100,
+        order_id: str | None = None,
+        cursor: str | None = None,
+    ) -> SalePreviewPage:
+        if limit <= 0:
+            return SalePreviewPage(sales=())
+        batch = await self._bot.get_sales(
+            from_order_id=cursor,
+            order_id_filter=order_id,
+        )
+        orders = (
+            [item for item in batch.orders if str(item.id) == order_id]
+            if order_id is not None
+            else list(batch.orders)
+        )
+        next_cursor = None
+        if order_id is None:
+            next_cursor = (
+                str(orders[limit].id) if len(orders) > limit else batch.next_order_id
+            )
+        return SalePreviewPage(
+            sales=tuple(_build_sale_preview_info(item) for item in orders[:limit]),
+            next_cursor=next_cursor,
+        )
+
+    async def get_buyer_profile(self, buyer_id: int) -> BuyerProfileInfo:
+        page = await self._bot.get_profile_page(id=buyer_id)
+        return BuyerProfileInfo(
+            buyer_id=int(page.user_id),
+            username=_clean_optional_text(page.username),
+            avatar_url=_clean_optional_text(page.avatar_url),
+            is_online=bool(page.online),
+            status_text=_clean_optional_text(page.status_text),
+        )
 
     async def save_offer_fields(self, fields: OfferFieldsDTO) -> int:
         if self._bot is None:

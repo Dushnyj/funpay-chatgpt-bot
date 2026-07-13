@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 from app.integrations.funpay.exceptions import FunPayApiError, FunPayOfferResolutionError
 from app.integrations.funpay.gateway import FakeChatGateway, FunPayChatGateway
 from app.integrations.funpay.types import (
+    BuyerProfileInfo,
     OrderInfo,
     OfferInfo,
     SaleStatus,
@@ -41,6 +42,28 @@ async def test_get_order_returns_set_order(gw: FakeChatGateway):
 async def test_get_order_not_found_raises(gw: FakeChatGateway):
     with pytest.raises(KeyError):
         await gw.get_order("nonexistent")
+
+
+async def test_profile_gateway_maps_exact_user_and_normalizes_text():
+    page = SimpleNamespace(
+        user_id="42",
+        username="  buyer-42  ",
+        avatar_url="   ",
+        online=0,
+        status_text="  был недавно  ",
+    )
+    bot = SimpleNamespace(get_profile_page=AsyncMock(return_value=page))
+
+    profile = await FunPayChatGateway(bot).get_buyer_profile(42)
+
+    assert profile == BuyerProfileInfo(
+        buyer_id=42,
+        username="buyer-42",
+        avatar_url=None,
+        is_online=False,
+        status_text="был недавно",
+    )
+    bot.get_profile_page.assert_awaited_once_with(id=42)
 
 
 async def test_save_offer_returns_new_id_and_records(gw: FakeChatGateway):
