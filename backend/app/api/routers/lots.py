@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.app_lifecycle import FunPayUnavailableError
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import LotCreate, LotOut
+from app.models.catalog import LimitScope
 from app.models.lot import Lot
 from app.models.settings import SellerSettings
 from app.services.offer_configuration import (
@@ -38,7 +39,12 @@ class LotSyncResponse(BaseModel):
 
 @router.get("", response_model=list[LotOut])
 async def list_lots(session: AsyncSession = Depends(get_db_session)):
-    result = await session.execute(select(Lot).order_by(Lot.id))
+    result = await session.execute(
+        select(Lot)
+        .join(LimitScope, LimitScope.id == Lot.limit_scope_id)
+        .where(LimitScope.code.in_(("any", "codex")))
+        .order_by(Lot.id)
+    )
     return result.scalars().all()
 
 

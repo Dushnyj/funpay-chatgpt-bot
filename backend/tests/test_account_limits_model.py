@@ -27,8 +27,6 @@ async def test_account_limits_one_per_account(session):
         access_token_encrypted="at-secret",
         access_token_expires_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
         account_id_openai="acc-openai-123",
-        chat_5h_remaining_pct=82,
-        chat_weekly_remaining_pct=67,
         codex_5h_remaining_pct=90,
         codex_weekly_remaining_pct=75,
         codex_primary_remaining_pct=90,
@@ -48,7 +46,6 @@ async def test_account_limits_one_per_account(session):
     fetched = await session.execute(select(AccountLimits).where(AccountLimits.account_id == acc.id))
     reloaded = fetched.scalar_one()
     assert reloaded.refresh_token_encrypted == "rt-secret"
-    assert reloaded.chat_5h_remaining_pct == 82
     assert reloaded.codex_primary_window_seconds == 18000
     assert reloaded.codex_secondary_window_seconds == 604800
     assert reloaded.refresh_status == "ok"

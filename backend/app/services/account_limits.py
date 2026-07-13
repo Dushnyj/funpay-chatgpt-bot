@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.openai.client import OpenAIClient
 from app.integrations.openai.exceptions import BackendApiError, RefreshFailedError, TokenExpiredError
 from app.integrations.openai.oauth import parse_id_token, refresh_access_token
-from app.integrations.openai.types import AccountMetadata
+from app.integrations.openai.types import AccountMetadata, UsageInfo
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.services.subscription_plans import (
@@ -45,19 +45,14 @@ async def measure_account_limits(
     Цикл: refresh access_token (если протух) → get_usage + get_account_metadata → запись в БД.
     При RefreshFailedError → refresh_status=expired, возврат REFRESH_FAILED.
     """
-    limits = await session.get(AccountLimits, account_id)
-    if limits is None:
-        raise ValueError(f"AccountLimits not found for account_id={account_id}")
+    limits, access_token = await _acquire_access_token(
+        session, account_id,
+    )
+    if access_token is None:
+        return MeasureResult.REFRESH_FAILED
     account = await session.get(Account, account_id)
     if account is None:
         raise ValueError(f"Account not found for account_id={account_id}")
-
-    access_token = limits.access_token_encrypted
-    if access_token is None or _is_token_expired(limits.access_token_expires_at):
-        refreshed = await _do_refresh(session, limits)
-        if refreshed is None:
-            return MeasureResult.REFRESH_FAILED
-        access_token = refreshed
 
     # Current OpenAI access tokens carry the ChatGPT account ID and plan in the
     # auth namespace. Older id_token-derived values remain a supported fallback.
@@ -84,7 +79,12 @@ async def measure_account_limits(
         except TokenExpiredError:
             if attempt >= _MAX_RETRIES:
                 raise
-            refreshed = await _do_refresh(session, limits)
+            limits, refreshed = await _acquire_access_token(
+                session,
+                account_id,
+                force=True,
+                stale_access_token=access_token,
+            )
             if refreshed is None:
                 return MeasureResult.REFRESH_FAILED
             access_token = refreshed
@@ -94,11 +94,10 @@ async def measure_account_limits(
         except BackendApiError:
             return MeasureResult.BACKEND_ERROR
 
-    # ``wham/usage`` is the observed Codex allowance used by the Codex client.
-    # OpenAI does not publish a stable ChatGPT-message allowance API, so never
-    # mirror these values into the chat fields and present guessed data as fact.
-    limits.chat_5h_remaining_pct = None
-    limits.chat_weekly_remaining_pct = None
+    # ``wham/usage`` is the observed common agentic allowance used by Codex,
+    # Work, Workspace Agents and related clients. OpenAI may return multiple
+    # real windows; preserve each observation instead of inventing a separate
+    # Chat allowance that the API does not expose.
     limits.codex_primary_remaining_pct = usage.primary_remaining_pct
     limits.codex_primary_window_seconds = usage.primary_window_seconds
     limits.codex_primary_resets_at = usage.primary_resets_at
@@ -108,15 +107,11 @@ async def measure_account_limits(
 
     # Backward-compatible aliases must not mislabel a 30-day (or any other)
     # observed window as 5h/weekly.
-    limits.codex_5h_remaining_pct = (
-        usage.primary_remaining_pct
-        if usage.primary_window_seconds == _FIVE_HOURS_SECONDS
-        else None
+    limits.codex_5h_remaining_pct = _remaining_for_window(
+        usage, _FIVE_HOURS_SECONDS,
     )
-    limits.codex_weekly_remaining_pct = (
-        usage.secondary_remaining_pct
-        if usage.secondary_window_seconds == _ONE_WEEK_SECONDS
-        else None
+    limits.codex_weekly_remaining_pct = _remaining_for_window(
+        usage, _ONE_WEEK_SECONDS,
     )
     resolved_plan = resolve_subscription_plan(
         (
@@ -164,6 +159,19 @@ async def measure_account_limits(
     if not window_contract_ok:
         return MeasureResult.PLAN_WINDOW_MISMATCH
     return MeasureResult.OK
+
+
+def _remaining_for_window(
+    usage: UsageInfo,
+    window_seconds: int,
+) -> int | None:
+    """Find a compatibility alias by duration, never by array position."""
+
+    if usage.primary_window_seconds == window_seconds:
+        return usage.primary_remaining_pct
+    if usage.secondary_window_seconds == window_seconds:
+        return usage.secondary_remaining_pct
+    return None
 
 
 async def _store_resolved_plan(
@@ -244,6 +252,46 @@ def _is_token_expired(expires_at: datetime | None) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     return expires_at <= datetime.now(timezone.utc) + _TOKEN_FRESH_THRESHOLD
+
+
+async def _acquire_access_token(
+    session: AsyncSession,
+    account_id: int,
+    *,
+    force: bool = False,
+    stale_access_token: str | None = None,
+) -> tuple[AccountLimits, str | None]:
+    """Serialize rotating refresh-token use across workers for one account."""
+
+    limits = (
+        await session.execute(
+            select(AccountLimits)
+            .where(AccountLimits.account_id == account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if limits is None:
+        raise ValueError(f"AccountLimits not found for account_id={account_id}")
+
+    current = limits.access_token_encrypted
+    another_worker_refreshed = (
+        stale_access_token is not None
+        and current is not None
+        and current != stale_access_token
+        and not _is_token_expired(limits.access_token_expires_at)
+    )
+    if another_worker_refreshed or (
+        not force
+        and current is not None
+        and not _is_token_expired(limits.access_token_expires_at)
+    ):
+        # Even the no-refresh path must commit here: this transaction owns the
+        # AccountLimits row lock and usage HTTP must run without it.
+        await session.commit()
+        return limits, current
+
+    return limits, await _do_refresh(session, limits)
 
 
 async def _do_refresh(session: AsyncSession, limits: AccountLimits) -> str | None:

@@ -6,7 +6,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,8 +30,15 @@ from app.models.account import (
     EmailOAuthCredential,
 )
 from app.models.audit import AuditLog
-from app.models.rental import Rental
-from app.services.account_device_auth import account_device_auth_manager
+from app.services.account_device_auth import (
+    AccountBusyError,
+    account_device_auth_manager,
+)
+from app.services.account_occupancy import (
+    account_is_busy,
+    active_rental_counts,
+    replacement_reserved_account_ids,
+)
 from app.services.totp import generate_totp_at, is_valid_base32
 from app.integrations.openai.device_auth import DeviceAuthError
 
@@ -88,6 +95,7 @@ def _account_out(
     job: AccountCheckJob | None = None,
     email_oauth: EmailOAuthCredential | None = None,
     active_rentals_count: int = 0,
+    replacement_reserved: bool = False,
 ) -> AccountOut:
     base = AccountOut.model_validate(account)
     return base.model_copy(
@@ -103,6 +111,7 @@ def _account_out(
                 email_oauth.status if email_oauth is not None else None
             ),
             "active_rentals_count": active_rentals_count,
+            "replacement_reserved": replacement_reserved,
         }
     )
 
@@ -113,8 +122,15 @@ def _account_with_limits(
     job: AccountCheckJob | None = None,
     email_oauth: EmailOAuthCredential | None = None,
     active_rentals_count: int = 0,
+    replacement_reserved: bool = False,
 ) -> AccountWithLimits:
-    base = _account_out(account, job, email_oauth, active_rentals_count)
+    base = _account_out(
+        account,
+        job,
+        email_oauth,
+        active_rentals_count,
+        replacement_reserved,
+    )
     return AccountWithLimits(
         **base.model_dump(),
         limits=(
@@ -168,17 +184,7 @@ async def _email_oauth_by_account(
 async def _active_rental_counts(
     session: AsyncSession, account_ids: list[int],
 ) -> dict[int, int]:
-    if not account_ids:
-        return {}
-    result = await session.execute(
-        select(Rental.account_id, func.count(Rental.id))
-        .where(
-            Rental.account_id.in_(account_ids),
-            Rental.status == "active",
-        )
-        .group_by(Rental.account_id)
-    )
-    return {account_id: int(count) for account_id, count in result.all()}
+    return await active_rental_counts(session, account_ids)
 
 
 async def _active_rental_count(session: AsyncSession, account_id: int) -> int:
@@ -195,6 +201,9 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
     limits = await _limits_by_account(session, account_ids)
     email_oauth = await _email_oauth_by_account(session, account_ids)
     active_rental_counts = await _active_rental_counts(session, account_ids)
+    replacement_reserved_ids = await replacement_reserved_account_ids(
+        session, account_ids,
+    )
     return [
         _account_with_limits(
             account,
@@ -202,6 +211,7 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
             jobs.get(account.id),
             email_oauth.get(account.id),
             active_rental_counts.get(account.id, 0),
+            account.id in replacement_reserved_ids,
         )
         for account in accounts
     ]
@@ -272,12 +282,16 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
     active_rental_counts = await _active_rental_counts(session, [account.id])
+    replacement_reserved_ids = await replacement_reserved_account_ids(
+        session, [account.id],
+    )
     return _account_with_limits(
         account,
         limits,
         jobs.get(account.id),
         email_oauth,
         active_rental_counts.get(account.id, 0),
+        account.id in replacement_reserved_ids,
     )
 
 
@@ -294,6 +308,14 @@ async def recheck_account(
     ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    if await account_is_busy(session, account.id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Account validation cannot be restarted while an active or "
+                "expiring rental occupies it"
+            ),
+        )
     try:
         job = await _check_job_queue.enqueue_exclusive(
             session,
@@ -321,7 +343,16 @@ async def recheck_account(
     await session.refresh(job)
     email_oauth = await session.get(EmailOAuthCredential, account.id)
     active_rentals_count = await _active_rental_count(session, account.id)
-    return _account_out(account, job, email_oauth, active_rentals_count)
+    replacement_reserved = bool(
+        await replacement_reserved_account_ids(session, [account.id])
+    )
+    return _account_out(
+        account,
+        job,
+        email_oauth,
+        active_rentals_count,
+        replacement_reserved,
+    )
 
 
 @router.post(
@@ -333,16 +364,31 @@ async def start_device_auth(
     account_id: int,
     session: AsyncSession = Depends(get_db_session),
 ):
-    # Serialize the transition to pending validation with account allocation.
-    account = (
-        await session.execute(
-            select(Account).where(Account.id == account_id).with_for_update()
-        )
-    ).scalar_one_or_none()
+    # This is only a fast preflight. The manager releases the transaction for
+    # remote device-code creation, then locks and rechecks before mutation.
+    account = await session.get(Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    if await account_is_busy(session, account.id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Browser authorization cannot start while an active or "
+                "expiring rental occupies the account"
+            ),
+        )
     try:
         auth_session = await account_device_auth_manager.start(session, account)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Account not found")
+    except AccountBusyError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Browser authorization cannot start while the account is "
+                "occupied by a rental or reserved for replacement"
+            ),
+        )
     except ActiveJobConflict as exc:
         raise HTTPException(
             status_code=409,
@@ -390,6 +436,11 @@ async def get_device_auth_status(
         if auth_session.status == "completed"
         else 0
     )
+    replacement_reserved = (
+        bool(await replacement_reserved_account_ids(session, [account.id]))
+        if auth_session.status == "completed"
+        else False
+    )
     return DeviceAuthStatusOut(
         status=auth_session.status,
         error_code=auth_session.error_code,
@@ -400,6 +451,7 @@ async def get_device_auth_status(
                 jobs.get(account.id),
                 email_oauth,
                 active_rentals_count,
+                replacement_reserved,
             )
             if auth_session.status == "completed"
             else None
@@ -409,10 +461,23 @@ async def get_device_auth_status(
 
 @router.patch("/{account_id}", response_model=AccountOut)
 async def update_account(account_id: int, req: AccountUpdate, session: AsyncSession = Depends(get_db_session)):
-    account = await session.get(Account, account_id)
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == account_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     changes = req.model_dump(exclude_unset=True)
+    protected_changes = set(changes) - {"notes"}
+    if protected_changes and await account_is_busy(session, account.id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only operator notes can be changed while the account is "
+                "occupied by a rental or reserved for replacement"
+            ),
+        )
     for field, value in changes.items():
         setattr(account, field, value)
     if "status" in changes:
@@ -422,11 +487,15 @@ async def update_account(account_id: int, req: AccountUpdate, session: AsyncSess
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
     active_rentals_count = await _active_rental_count(session, account.id)
+    replacement_reserved = bool(
+        await replacement_reserved_account_ids(session, [account.id])
+    )
     return _account_out(
         account,
         jobs.get(account.id),
         email_oauth,
         active_rentals_count,
+        replacement_reserved,
     )
 
 
@@ -453,16 +522,13 @@ async def update_account_credentials(
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    active_rental = await session.scalar(
-        select(Rental.id).where(
-            Rental.account_id == account_id,
-            Rental.status.in_(["active", "expiry_pending"]),
-        ).limit(1)
-    )
-    if active_rental is not None:
+    if await account_is_busy(session, account_id):
         raise HTTPException(
             status_code=409,
-            detail="Account credentials cannot be changed during an active rental",
+            detail=(
+                "Account credentials cannot be changed while it is occupied "
+                "by a rental or reserved for replacement"
+            ),
         )
     email_oauth = await session.get(EmailOAuthCredential, account.id)
 
@@ -568,22 +634,34 @@ async def update_account_credentials(
     await session.refresh(account)
     await session.refresh(job)
     active_rentals_count = await _active_rental_count(session, account.id)
-    return _account_out(account, job, email_oauth, active_rentals_count)
+    replacement_reserved = bool(
+        await replacement_reserved_account_ids(session, [account.id])
+    )
+    return _account_out(
+        account,
+        job,
+        email_oauth,
+        active_rentals_count,
+        replacement_reserved,
+    )
 
 
 @router.delete("/{account_id}", status_code=204)
 async def delete_account(account_id: int, session: AsyncSession = Depends(get_db_session)):
-    account = await session.get(Account, account_id)
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == account_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
-    active_rental = await session.scalar(
-        select(Rental.id).where(
-            Rental.account_id == account_id,
-            Rental.status == "active",
-        ).limit(1)
-    )
-    if active_rental is not None:
-        raise HTTPException(status_code=409, detail="Account has an active rental")
+    if await account_is_busy(session, account_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Account is occupied by a rental or reserved for replacement"
+            ),
+        )
     await session.delete(account)
     try:
         await session.commit()

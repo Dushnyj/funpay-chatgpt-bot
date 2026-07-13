@@ -1,34 +1,72 @@
-type OrderedDuration = { id: number; days: number }
+type OrderedDuration = { id: number; minutes: number }
 
-export function compareDurationsByDays(left: OrderedDuration, right: OrderedDuration) {
-  return left.days - right.days || left.id - right.id
-}
+export type DurationInputMode = 'minutes' | 'hours' | 'days'
 
-export function durationUnit(days: number) {
-  const mod100 = Math.abs(days) % 100
-  const mod10 = mod100 % 10
-  if (mod100 >= 11 && mod100 <= 14) return 'дней'
-  if (mod10 === 1) return 'день'
-  if (mod10 >= 2 && mod10 <= 4) return 'дня'
-  return 'дней'
-}
-
-export type DurationDaysValidation = {
-  days: number | null
+export type DurationMinutesValidation = {
+  minutes: number | null
   error: string
 }
 
-export function validateDurationDays(value: string, existingDays: number[]): DurationDaysValidation {
-  const normalized = value.trim()
-  if (!/^\d+$/.test(normalized)) {
-    return { days: null, error: 'Введите целое число дней от 1 до 30.' }
+const MAX_DURATION_MINUTES = 30 * 24 * 60
+
+export function compareDurationsByMinutes(left: OrderedDuration, right: OrderedDuration) {
+  return left.minutes - right.minutes || left.id - right.id
+}
+
+export function formatDurationMinutes(minutes: number) {
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) return 'Неизвестный срок'
+
+  const days = Math.floor(minutes / (24 * 60))
+  const hours = Math.floor((minutes % (24 * 60)) / 60)
+  const remainingMinutes = minutes % 60
+  const parts: string[] = []
+
+  if (days > 0) parts.push(`${days} ${plural(days, 'день', 'дня', 'дней')}`)
+  if (hours > 0) parts.push(`${hours} ${plural(hours, 'час', 'часа', 'часов')}`)
+  if (remainingMinutes > 0) parts.push(`${remainingMinutes} ${plural(remainingMinutes, 'минута', 'минуты', 'минут')}`)
+
+  return parts.join(' ')
+}
+
+export function validateDurationInput(
+  mode: DurationInputMode,
+  value: string,
+  existingMinutes: number[],
+): DurationMinutesValidation {
+  const normalized = value.trim().replace(',', '.')
+  if (!/^\d+(?:\.\d+)?$/.test(normalized)) {
+    const unit = mode === 'minutes' ? 'минут' : mode === 'hours' ? 'часов' : 'дней'
+    return { minutes: null, error: `Введите количество ${unit}.` }
   }
-  const days = Number(normalized)
-  if (!Number.isSafeInteger(days) || days < 1 || days > 30) {
-    return { days: null, error: 'Срок должен быть целым числом от 1 до 30 дней.' }
+  const amount = Number(normalized)
+  if (!Number.isFinite(amount)) return { minutes: null, error: 'Введите корректный срок.' }
+  if ((mode === 'minutes' || mode === 'days') && !Number.isInteger(amount)) {
+    return {
+      minutes: null,
+      error: mode === 'minutes'
+        ? 'Минуты указываются целым числом с шагом 30.'
+        : 'Для дней укажите целое число. Для более точного срока выберите часы.',
+    }
   }
-  if (existingDays.includes(days)) {
-    return { days: null, error: `Срок ${days} ${durationUnit(days)} уже существует.` }
+  const minutes = amount * (mode === 'minutes' ? 1 : mode === 'hours' ? 60 : 24 * 60)
+
+  if (!Number.isSafeInteger(minutes) || minutes < 30 || minutes > MAX_DURATION_MINUTES) {
+    return { minutes: null, error: 'Срок должен быть от 30 минут до 30 дней.' }
   }
-  return { days, error: '' }
+  if (minutes % 30 !== 0) {
+    return { minutes: null, error: 'Срок задаётся с шагом 30 минут. Для часов используйте целое значение или половину часа.' }
+  }
+  if (existingMinutes.includes(minutes)) {
+    return { minutes, error: `Срок «${formatDurationMinutes(minutes)}» уже существует.` }
+  }
+  return { minutes, error: '' }
+}
+
+function plural(value: number, one: string, few: string, many: string) {
+  const mod100 = Math.abs(value) % 100
+  const mod10 = mod100 % 10
+  if (mod100 >= 11 && mod100 <= 14) return many
+  if (mod10 === 1) return one
+  if (mod10 >= 2 && mod10 <= 4) return few
+  return many
 }

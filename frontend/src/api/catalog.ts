@@ -10,7 +10,7 @@ import type {
   TierCreate,
   TierUpdate,
 } from '../types/api'
-import { compareDurationsByDays } from '../utils/catalogEditor'
+import { compareDurationsByMinutes } from '../utils/catalogEditor'
 
 export function useTiers() {
   return useQuery({ queryKey: ['tiers'], queryFn: () => api.get<Tier[]>('/tiers') })
@@ -49,7 +49,7 @@ export function useUpdateTier() {
 export function useDurations() {
   return useQuery({
     queryKey: ['durations'],
-    queryFn: async () => (await api.get<Duration[]>('/durations')).sort(compareDurationsByDays),
+    queryFn: async () => (await api.get<Duration[]>('/durations')).sort(compareDurationsByMinutes),
   })
 }
 
@@ -60,7 +60,7 @@ export function useCreateDuration() {
     onSuccess: (created) => {
       qc.setQueryData<Duration[]>(['durations'], (current) =>
         [...(current?.filter((duration) => duration.id !== created.id) ?? []), created]
-          .sort(compareDurationsByDays),
+          .sort(compareDurationsByMinutes),
       )
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ['durations'] }),

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -9,6 +9,12 @@ from app.types.encrypted import FernetEncrypted
 
 class SellerSettings(Base):
     __tablename__ = "seller_settings"
+    __table_args__ = (
+        CheckConstraint(
+            "default_max_active_rentals = 1",
+            name="single_active_rental",
+        ),
+    )
 
     # Singleton-строка: единственный ряд настроек продавца
     id: Mapped[int] = mapped_column(primary_key=True, default=1)

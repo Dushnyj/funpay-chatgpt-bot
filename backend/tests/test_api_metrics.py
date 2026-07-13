@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
-from app.models.account import Account, AccountLimits
-from app.models.catalog import SubscriptionTier
+from app.models.account import Account, AccountCheckJob, AccountLimits
+from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
 
 
@@ -43,14 +44,14 @@ async def test_metrics_report_free_rental_capacity(
         is_active=True,
         is_sellable=True,
     ))
-    session.add(SellerSettings(id=1, default_max_active_rentals=2))
+    session.add(SellerSettings(id=1, default_max_active_rentals=1))
     session.add_all([
         Account(
             login="pool-a@example.test",
             password_encrypted="secret-a",
             totp_secret_encrypted="totp-a",
             tier_id=1,
-            max_active_rentals=3,
+            max_active_rentals=1,
             status="active",
         ),
         Account(
@@ -66,10 +67,13 @@ async def test_metrics_report_free_rental_capacity(
             password_encrypted="secret-c",
             totp_secret_encrypted="totp-c",
             tier_id=1,
-            max_active_rentals=10,
+            max_active_rentals=1,
             status="maintenance",
         ),
     ])
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
+    scope = LimitScope(code="any", name="Any", is_enabled=True)
+    session.add_all([duration, scope])
     await session.flush()
     measured_at = datetime.now(timezone.utc)
     session.add_all([
@@ -101,12 +105,187 @@ async def test_metrics_report_free_rental_capacity(
             expected_long_window_seconds=30 * 24 * 60 * 60,
         ),
     ])
+    order = Order(
+        funpay_order_id="expiry-pending-capacity",
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        tier_id=1,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(Rental(
+        order_id=order.id,
+        account_id=1,
+        buyer_funpay_id="200",
+        buyer_funpay_chat_id="100",
+        tier_id=1,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        lang="ru",
+        started_at=measured_at,
+        expires_at=measured_at,
+        status="expiry_pending",
+        credentials_delivery_status="sent",
+        credentials_delivery_template="welcome",
+    ))
     await session.commit()
 
     response = await auth_client.get("/api/metrics")
 
     assert response.status_code == 200
-    assert response.json()["available_accounts"] == 5
+    assert response.json()["available_accounts"] == 1
+
+
+async def test_metrics_exclude_replacement_target_from_available_capacity(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier = SubscriptionTier(
+        code="plus",
+        name="Plus",
+        is_active=True,
+        is_sellable=True,
+    )
+    duration = Duration(minutes=60, is_enabled=True, sort_order=10)
+    scope = LimitScope(code="any", name="Any", is_enabled=True)
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    old_account = Account(
+        login="old-capacity@example.test",
+        password_encrypted="secret-old",
+        totp_secret_encrypted="totp-old",
+        tier_id=tier.id,
+        status="active",
+        subscription_expires_at=datetime.now(timezone.utc),
+    )
+    target_account = Account(
+        login="target-capacity@example.test",
+        password_encrypted="secret-target",
+        totp_secret_encrypted="totp-target",
+        tier_id=tier.id,
+        status="active",
+        subscription_expires_at=datetime.now(timezone.utc),
+    )
+    session.add_all([old_account, target_account])
+    await session.flush()
+    measured_at = datetime.now(timezone.utc)
+    old_account.subscription_expires_at = measured_at.replace(year=measured_at.year + 1)
+    target_account.subscription_expires_at = measured_at.replace(
+        year=measured_at.year + 1,
+    )
+    session.add_all(
+        [
+            AccountLimits(
+                account_id=old_account.id,
+                refresh_token_encrypted="refresh-old",
+                refresh_status="ok",
+                measured_at=measured_at,
+                plan_type="plus",
+                plan_window_status="ok",
+            ),
+            AccountLimits(
+                account_id=target_account.id,
+                refresh_token_encrypted="refresh-target",
+                refresh_status="ok",
+                measured_at=measured_at,
+                plan_type="plus",
+                plan_window_status="ok",
+            ),
+        ]
+    )
+    order = Order(
+        funpay_order_id="reserved-metrics-order",
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(
+        Rental(
+            order_id=order.id,
+            account_id=old_account.id,
+            replacement_target_account_id=target_account.id,
+            buyer_funpay_id="200",
+            buyer_funpay_chat_id="100",
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            lang="ru",
+            started_at=measured_at,
+            expires_at=measured_at,
+            status="active",
+            credentials_delivery_status="sent",
+        )
+    )
+    await session.commit()
+
+    response = await auth_client.get("/api/metrics")
+
+    assert response.status_code == 200
+    assert response.json()["active_rentals"] == 1
+    assert response.json()["available_accounts"] == 0
+
+
+@pytest.mark.parametrize("job_status", ["pending", "running"])
+async def test_metrics_exclude_accounts_with_active_check_jobs(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    job_status: str,
+):
+    tier = SubscriptionTier(
+        code="plus",
+        name="Plus",
+        is_active=True,
+        is_sellable=True,
+    )
+    session.add(tier)
+    await session.flush()
+    measured_at = datetime.now(timezone.utc)
+    account = Account(
+        login="checking-capacity@example.test",
+        password_encrypted="secret",
+        totp_secret_encrypted="totp",
+        tier_id=tier.id,
+        status="active",
+        subscription_expires_at=measured_at.replace(year=measured_at.year + 1),
+    )
+    session.add(account)
+    await session.flush()
+    session.add_all(
+        [
+            AccountLimits(
+                account_id=account.id,
+                refresh_token_encrypted="refresh",
+                refresh_status="ok",
+                measured_at=measured_at,
+                plan_type="plus",
+                plan_window_status="ok",
+            ),
+            AccountCheckJob(
+                account_id=account.id,
+                priority="limit_check",
+                job_type="limit_check",
+                status=job_status,
+                started_at=(measured_at if job_status == "running" else None),
+            ),
+        ]
+    )
+    await session.commit()
+
+    response = await auth_client.get("/api/metrics")
+
+    assert response.status_code == 200
+    assert response.json()["active_rentals"] == 0
+    assert response.json()["available_accounts"] == 0
 
 
 async def test_metrics_use_live_runner_state(

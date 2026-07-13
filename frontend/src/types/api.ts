@@ -27,12 +27,12 @@ export interface TierUpdate {
 
 export interface Duration {
   id: number
-  days: number
+  minutes: number
   is_enabled: boolean
 }
 
 export interface DurationCreate {
-  days: number
+  minutes: number
   is_enabled?: boolean
 }
 
@@ -56,8 +56,6 @@ export interface AccountLimits {
   plan_type?: string | null
   plan_window_status: 'unknown' | 'ok' | 'mismatch'
   expected_long_window_seconds: number | null
-  chat_5h_remaining_pct: number | null
-  chat_weekly_remaining_pct: number | null
   codex_5h_remaining_pct: number | null
   codex_weekly_remaining_pct: number | null
   codex_primary_remaining_pct: number | null
@@ -78,6 +76,7 @@ export interface Account {
   subscription_expires_at: string | null
   max_active_rentals: number | null
   active_rentals_count: number
+  replacement_reserved: boolean
   status: string
   operator_status_override?: 'maintenance' | 'disabled' | null
   notes: string | null

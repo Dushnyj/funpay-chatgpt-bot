@@ -1,5 +1,29 @@
 export const PLACEHOLDER_PATTERN = /\{([a-zA-Z0-9_]+)\}/g
 
+export const DEPRECATED_DURATION_TEMPLATE_FIELDS: ReadonlySet<string> = new Set(['days'])
+export const DEPRECATED_LIMIT_TEMPLATE_FIELDS: ReadonlySet<string> = new Set([
+  'chat_5h',
+  'chat_weekly',
+  'codex_5h',
+  'codex_weekly',
+])
+export const DEPRECATED_MESSAGE_TEMPLATE_FIELDS: ReadonlySet<string> = new Set([
+  ...DEPRECATED_DURATION_TEMPLATE_FIELDS,
+  ...DEPRECATED_LIMIT_TEMPLATE_FIELDS,
+])
+
+export function classifyTemplateFields(
+  usedFields: string[],
+  allowedFields: string[],
+  deprecatedFields: ReadonlySet<string>,
+) {
+  const allowed = new Set(allowedFields)
+  return {
+    deprecated: usedFields.filter((field) => deprecatedFields.has(field)),
+    unknown: usedFields.filter((field) => !allowed.has(field) && !deprecatedFields.has(field)),
+  }
+}
+
 export function extractTemplateFields(value: string) {
   return [...new Set([...value.matchAll(PLACEHOLDER_PATTERN)].map((match) => match[1]))]
 }

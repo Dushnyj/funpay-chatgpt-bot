@@ -1,11 +1,14 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { useDurations } from '../api/catalog'
 import { useOrders } from '../api/orders'
 import { useRentals, useRetryRentalDelivery } from '../api/rentals'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
+import type { Duration, Rental } from '../types/api'
+import { formatDurationMinutes } from '../utils/catalogEditor'
 import { formatCurrency, formatDateTime } from '../utils/format'
-import type { Rental } from '../types/api'
+import { isInitialRentalDeliveryPending, isOccupyingRentalStatus } from '../utils/rentalDisplay'
 
 type DealTab = 'orders' | 'rentals'
 
@@ -13,7 +16,9 @@ export default function Orders() {
   const [tab, setTab] = useState<DealTab>('orders')
   const ordersQuery = useOrders()
   const rentalsQuery = useRentals()
-  const activeRentals = rentalsQuery.data?.filter((rental) => rental.status === 'active').length ?? 0
+  const durationsQuery = useDurations()
+  const durations = durationsQuery.data ?? []
+  const occupiedRentals = rentalsQuery.data?.filter((rental) => isOccupyingRentalStatus(rental.status)).length ?? 0
   const completedOrders = ordersQuery.data?.filter((order) => order.status === 'completed').length ?? 0
 
   return (
@@ -23,18 +28,18 @@ export default function Orders() {
         <div><span>Заказов всего</span><strong>{ordersQuery.data?.length ?? '—'}</strong></div>
         <div><span className="summary-dot summary-dot--success" /><span>Завершены</span><strong>{completedOrders}</strong></div>
         <div><span>Аренд всего</span><strong>{rentalsQuery.data?.length ?? '—'}</strong></div>
-        <div><span className="summary-dot summary-dot--success" /><span>Активны сейчас</span><strong>{activeRentals}</strong></div>
+        <div><span className="summary-dot summary-dot--success" /><span>Занимают аккаунты</span><strong>{occupiedRentals}</strong></div>
       </section>
       <div className="content-tabs" role="tablist" aria-label="Тип сделки">
         <button role="tab" aria-selected={tab === 'orders'} className={tab === 'orders' ? 'active' : ''} onClick={() => setTab('orders')}><Icon name="deals" />Заказы<span>{ordersQuery.data?.length ?? 0}</span></button>
         <button role="tab" aria-selected={tab === 'rentals'} className={tab === 'rentals' ? 'active' : ''} onClick={() => setTab('rentals')}><Icon name="clock" />Аренды<span>{rentalsQuery.data?.length ?? 0}</span></button>
       </div>
-      {tab === 'orders' ? <OrdersTab query={ordersQuery} /> : <RentalsTab query={rentalsQuery} />}
+      {tab === 'orders' ? <OrdersTab query={ordersQuery} durations={durations} /> : <RentalsTab query={rentalsQuery} durations={durations} />}
     </div>
   )
 }
 
-function OrdersTab({ query }: { query: ReturnType<typeof useOrders> }) {
+function OrdersTab({ query, durations }: { query: ReturnType<typeof useOrders>; durations: Duration[] }) {
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('all')
   const orders = useMemo(() => query.data ?? [], [query.data])
@@ -46,13 +51,13 @@ function OrdersTab({ query }: { query: ReturnType<typeof useOrders> }) {
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
   return (
     <section className="panel panel--flush">
-      <div className="toolbar"><label className="search-field"><Icon name="search" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Заказ или покупатель" aria-label="Поиск заказов" /></label><label className="select-field"><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">Все</option><option value="pending">Ожидают</option><option value="completed">Завершены</option><option value="refunded">Возвраты</option></select><Icon name="chevron-down" size={15} /></label><span className="toolbar__count">Показано: {filtered.length}</span></div>
-      {orders.length === 0 ? <EmptyState icon="deals" title="Заказов пока нет" description="Здесь появятся оплаченные заказы, полученные от FunPay. Убедитесь, что интеграция подключена и на витрине есть активный лот." action={<Link className="button button--secondary" to="/lots">Проверить лоты<Icon name="arrow-right" /></Link>} /> : filtered.length === 0 ? <EmptyState icon="search" title="Заказы не найдены" description="Измените поиск или фильтр статуса." /> : <TableShell><table className="data-table"><thead><tr><th>Заказ</th><th>Покупатель</th><th>Создан</th><th>Лот и условие</th><th>Сумма</th><th>Статус</th></tr></thead><tbody>{filtered.map((order) => <tr key={order.id}><td><div className="identity-cell"><span className="identity-avatar identity-avatar--blue"><Icon name="deals" size={16} /></span><span><strong>#{order.funpay_order_id}</strong><small>Внутренний ID {order.id}</small></span></div></td><td><strong>{order.buyer_funpay_id}</strong><small className="table-subline">Чат {order.funpay_chat_id}</small></td><td>{formatDateTime(order.created_at)}</td><td>{order.lot_id ? `#${order.lot_id}` : '—'}<small className="table-subline">{purchasedLimitCondition(order)}</small></td><td className="table-number">{formatCurrency(order.price)}</td><td><div className="credential-delivery-cell"><StatusBadge value={order.status} />{order.fulfillment_attempts > 0 && <small>Попыток: {order.fulfillment_attempts}</small>}{order.fulfillment_next_attempt_at && <small>Следующая: {formatDateTime(order.fulfillment_next_attempt_at)}</small>}{safeOrderRetryError(order.fulfillment_last_error) && <small className="credential-delivery-error">{safeOrderRetryError(order.fulfillment_last_error)}</small>}</div></td></tr>)}</tbody></table></TableShell>}
+      <div className="toolbar"><label className="search-field"><Icon name="search" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Заказ или покупатель" aria-label="Поиск заказов" /></label><label className="select-field"><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">Все</option><option value="pending">Ожидают</option><option value="completed">Завершены</option><option value="refund_pending">Возврат обрабатывается</option><option value="refunded">Возвраты</option></select><Icon name="chevron-down" size={15} /></label><span className="toolbar__count">Показано: {filtered.length}</span></div>
+      {orders.length === 0 ? <EmptyState icon="deals" title="Заказов пока нет" description="Здесь появятся оплаченные заказы, полученные от FunPay. Убедитесь, что интеграция подключена и на витрине есть активный лот." action={<Link className="button button--secondary" to="/lots">Проверить лоты<Icon name="arrow-right" /></Link>} /> : filtered.length === 0 ? <EmptyState icon="search" title="Заказы не найдены" description="Измените поиск или фильтр статуса." /> : <TableShell><table className="data-table"><thead><tr><th>Заказ</th><th>Покупатель</th><th>Создан</th><th>Лот, срок и условие</th><th>Сумма</th><th>Статус</th></tr></thead><tbody>{filtered.map((order) => <tr key={order.id}><td><div className="identity-cell"><span className="identity-avatar identity-avatar--blue"><Icon name="deals" size={16} /></span><span><strong>#{order.funpay_order_id}</strong><small>Внутренний ID {order.id}</small></span></div></td><td><strong>{order.buyer_funpay_id}</strong><small className="table-subline">Чат {order.funpay_chat_id}</small></td><td>{formatDateTime(order.created_at)}</td><td>{order.lot_id ? `#${order.lot_id}` : '—'}<small className="table-subline">Срок: {purchasedDuration(order.duration_id, durations)}</small><small className="table-subline">{purchasedLimitCondition(order)}</small></td><td className="table-number">{formatCurrency(order.price)}</td><td><div className="credential-delivery-cell"><StatusBadge value={order.status} />{order.fulfillment_attempts > 0 && <small>Попыток: {order.fulfillment_attempts}</small>}{order.fulfillment_next_attempt_at && <small>Следующая: {formatDateTime(order.fulfillment_next_attempt_at)}</small>}{safeOrderRetryError(order.fulfillment_last_error) && <small className="credential-delivery-error">{safeOrderRetryError(order.fulfillment_last_error)}</small>}</div></td></tr>)}</tbody></table></TableShell>}
     </section>
   )
 }
 
-function RentalsTab({ query }: { query: ReturnType<typeof useRentals> }) {
+function RentalsTab({ query, durations }: { query: ReturnType<typeof useRentals>; durations: Duration[] }) {
   const [status, setStatus] = useState('all')
   const retryDelivery = useRetryRentalDelivery()
   const rentals = query.data ?? []
@@ -61,13 +66,21 @@ function RentalsTab({ query }: { query: ReturnType<typeof useRentals> }) {
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
   return (
     <section className="panel panel--flush">
-      <div className="toolbar"><div className="toolbar__title"><strong>Жизненный цикл аренд</strong><span>Выдача, срок доступа и замены аккаунтов</span></div><label className="select-field"><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">Все</option><option value="active">Активные</option><option value="expired">Истекли</option><option value="revoked">Отозваны</option><option value="replaced">Заменены</option></select><Icon name="chevron-down" size={15} /></label><span className="toolbar__count">Показано: {filtered.length}</span></div>
-      {rentals.length === 0 ? <EmptyState icon="clock" title="Аренд пока нет" description="Аренда создаётся после оплаченного заказа, когда система находит подходящий проверенный аккаунт. Проверьте пул, если заказ уже есть, а аренда не появилась." action={<Link className="button button--secondary" to="/accounts">Проверить аккаунты<Icon name="arrow-right" /></Link>} /> : filtered.length === 0 ? <EmptyState icon="search" title="Аренды не найдены" description="Для выбранного статуса записей нет. Смените фильтр." /> : <TableShell><table className="data-table"><thead><tr><th>Аренда</th><th>Аккаунт и лимиты</th><th>Покупатель</th><th>Начало</th><th>Окончание</th><th>Замены</th><th>Выдача данных</th><th>Статус</th></tr></thead><tbody>{filtered.map((rental) => {
+      <div className="toolbar"><div className="toolbar__title"><strong>Жизненный цикл аренд</strong><span>Выдача, срок доступа и замены аккаунтов</span></div><label className="select-field"><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">Все</option><option value="active">Активные</option><option value="expiry_pending">Доступ завершается</option><option value="expired">Истекли</option><option value="refunded">Возвраты</option><option value="revoked">Отозваны</option></select><Icon name="chevron-down" size={15} /></label><span className="toolbar__count">Показано: {filtered.length}</span></div>
+      {rentals.length === 0 ? <EmptyState icon="clock" title="Аренд пока нет" description="Аренда создаётся после оплаченного заказа, когда система находит подходящий проверенный аккаунт. Проверьте пул, если заказ уже есть, а аренда не появилась." action={<Link className="button button--secondary" to="/accounts">Проверить аккаунты<Icon name="arrow-right" /></Link>} /> : filtered.length === 0 ? <EmptyState icon="search" title="Аренды не найдены" description="Для выбранного статуса записей нет. Смените фильтр." /> : <TableShell><table className="data-table"><thead><tr><th>Аренда и срок</th><th>Аккаунт и лимиты</th><th>Покупатель</th><th>Начало</th><th>Окончание</th><th>Замены</th><th>Выдача данных</th><th>Статус</th></tr></thead><tbody>{filtered.map((rental) => {
         const deliveryError = safeDeliveryError(rental.credentials_delivery_last_error)
-        return <tr key={rental.id}><td><strong>#{rental.id}</strong><small className="table-subline">Заказ #{rental.order_id}</small></td><td><span className="mono-chip">Account #{rental.account_id}</span><small className="table-subline">{issuedLimitsSnapshot(rental)}</small><small className="table-subline">{issuedWindowContract(rental)}</small><small className="table-subline">{purchasedLimitCondition(rental)}</small>{rental.issued_limits_measured_at && <small className="table-subline">Замер: {formatDateTime(rental.issued_limits_measured_at)}</small>}</td><td><strong>{rental.buyer_funpay_id}</strong><small className="table-subline">Чат {rental.buyer_funpay_chat_id}</small></td><td>{formatDateTime(rental.started_at)}</td><td>{formatDateTime(rental.expires_at)}</td><td>{rental.replacement_count}</td><td><div className="credential-delivery-cell"><StatusBadge value={deliveryTone(rental.credentials_delivery_status)} label={deliveryLabel(rental.credentials_delivery_status)} /><small>Попыток: {rental.credentials_delivery_attempts}</small>{rental.credentials_delivery_next_attempt_at && <small>Следующая: {formatDateTime(rental.credentials_delivery_next_attempt_at)}</small>}{rental.credentials_delivery_status === 'manual' && <><small className="credential-delivery-error">Требуется вмешательство оператора</small><button className="button button--ghost button--compact" disabled={retryDelivery.isPending} onClick={() => retryDelivery.mutate(rental.id)}>{retryDelivery.isPending ? 'Повторяем…' : 'Повторить выдачу'}</button></>}{deliveryError && <small className="credential-delivery-error">{deliveryError}</small>}</div></td><td><StatusBadge value={rental.status} /></td></tr>
+        const initialDeliveryPending = isInitialRentalDeliveryPending(rental)
+        const provisionalTermHint = 'Оплаченный срок начнётся с первой попытки первичной выдачи данных'
+        return <tr key={rental.id}><td><strong>#{rental.id}</strong><small className="table-subline">Заказ #{rental.order_id}</small><small className="table-subline">Срок: {purchasedDuration(rental.duration_id, durations)}</small></td><td><span className="mono-chip">Account #{rental.account_id}</span><small className="table-subline">{issuedLimitsSnapshot(rental)}</small><small className="table-subline">{issuedWindowContract(rental)}</small><small className="table-subline">{purchasedLimitCondition(rental)}</small>{rental.issued_limits_measured_at && <small className="table-subline">Замер: {formatDateTime(rental.issued_limits_measured_at)}</small>}</td><td><strong>{rental.buyer_funpay_id}</strong><small className="table-subline">Чат {rental.buyer_funpay_chat_id}</small></td><td>{initialDeliveryPending ? <span className="muted" title={provisionalTermHint}>После первой отправки</span> : formatDateTime(rental.started_at)}</td><td>{initialDeliveryPending ? <span className="muted" title={provisionalTermHint}>Не началась</span> : formatDateTime(rental.expires_at)}</td><td>{rental.replacement_count}</td><td><div className="credential-delivery-cell"><StatusBadge value={deliveryTone(rental.credentials_delivery_status)} label={deliveryLabel(rental.credentials_delivery_status)} /><small>Попыток: {rental.credentials_delivery_attempts}</small>{rental.credentials_delivery_next_attempt_at && <small>Следующая: {formatDateTime(rental.credentials_delivery_next_attempt_at)}</small>}{rental.credentials_delivery_status === 'manual' && <><small className="credential-delivery-error">Требуется вмешательство оператора</small><button className="button button--ghost button--compact" disabled={retryDelivery.isPending} onClick={() => retryDelivery.mutate(rental.id)}>{retryDelivery.isPending ? 'Повторяем…' : 'Повторить выдачу'}</button></>}{deliveryError && <small className="credential-delivery-error">{deliveryError}</small>}</div></td><td><StatusBadge value={rental.status} /></td></tr>
       })}</tbody></table></TableShell>}
     </section>
   )
+}
+
+function purchasedDuration(durationId: number | null, durations: Duration[]) {
+  if (durationId === null) return 'не указан'
+  const duration = durations.find((item) => item.id === durationId)
+  return duration ? formatDurationMinutes(duration.minutes) : `#${durationId}`
 }
 
 function issuedLimitsSnapshot(rental: Rental) {

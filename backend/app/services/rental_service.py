@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
@@ -11,15 +13,38 @@ from app.models.audit import AuditLog
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
-from app.services.account_pool import AccountCriteria, AccountPool
+from app.services.account_pool import (
+    AccountCriteria,
+    AccountPool,
+    limits_freshness_for_duration,
+)
+from app.services.delivery_policy import (
+    CREDENTIAL_DELIVERY_MAX_ATTEMPTS,
+    CREDENTIAL_SEND_TIMEOUT_SECONDS,
+    DELIVERY_ALLOCATION_HEADROOM,
+    credential_delivery_retry_delay_seconds,
+)
+from app.services.durations import (
+    format_access_expiry,
+    format_duration,
+    format_legacy_days,
+    format_plan_expiry,
+    format_remaining_seconds,
+)
+from app.services.limit_eligibility import apply_limit_scope_filters
 from app.services.messages import issued_usage_template_variables, render_message
 
 
 CREDENTIAL_DELIVERY_LEASE = timedelta(minutes=5)
-CREDENTIAL_DELIVERY_MAX_ATTEMPTS = 6
-_CREDENTIAL_RETRY_BASE = timedelta(minutes=1)
-_CREDENTIAL_RETRY_MAX = timedelta(hours=1)
+INITIAL_DELIVERY_SUBSCRIPTION_HEADROOM = DELIVERY_ALLOCATION_HEADROOM
+REPLACEMENT_DELIVERY_MIN_REMAINING = timedelta(minutes=2)
 _FULFILLABLE_ORDER_STATUSES = {"pending", "completed"}
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class RentalService:
@@ -46,7 +71,10 @@ class RentalService:
         # workers from allocating and delivering two independent rentals.
         order = (
             await session.execute(
-                select(Order).where(Order.id == order_id).with_for_update()
+                select(Order)
+                .where(Order.id == order_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if order is None:
@@ -71,7 +99,7 @@ class RentalService:
 
         criteria = AccountCriteria(
             tier_id=order.tier_id,
-            duration_days=duration.days,
+            duration_minutes=duration.minutes,
             scope=scope_code,
             min_limit_pct=order.min_limit_pct,
             max_5h_pct=order.max_5h_pct,
@@ -98,10 +126,8 @@ class RentalService:
             max_weekly_pct=order.max_weekly_pct,
             lang=order.buyer_locale or "ru",
             started_at=now,
-            expires_at=now + timedelta(days=duration.days),
+            expires_at=now + timedelta(minutes=duration.minutes),
             status="active",
-            issued_chat_5h_pct=limits.chat_5h_remaining_pct if limits else None,
-            issued_chat_weekly_pct=limits.chat_weekly_remaining_pct if limits else None,
             issued_codex_5h_pct=limits.codex_5h_remaining_pct if limits else None,
             issued_codex_weekly_pct=limits.codex_weekly_remaining_pct if limits else None,
             issued_codex_primary_pct=(
@@ -133,7 +159,7 @@ class RentalService:
             credentials_delivery_template="welcome",
             credentials_delivery_started_at=now,
             credentials_delivery_next_attempt_at=None,
-            credentials_delivery_attempts=1,
+            credentials_delivery_attempts=0,
         )
         session.add(rental)
         await session.flush()
@@ -150,11 +176,15 @@ class RentalService:
         rental_id: int,
     ) -> Rental:
         """Deliver a previously committed primary/replacement credential claim."""
-        rental = await session.get(Rental, rental_id)
-        if rental is None:
+        # Read only the FK here. ``_deliver_claimed`` establishes the global
+        # Order -> Rental lock order shared with refund processing.
+        order_id = await session.scalar(
+            select(Rental.order_id).where(Rental.id == rental_id)
+        )
+        if order_id is None:
             raise KeyError(f"Rental {rental_id} not found")
         return await self._deliver_claimed(
-            session, gateway, rental.order_id, rental.id,
+            session, gateway, order_id, rental_id,
         )
 
     async def revoke_rental(self, session: AsyncSession, rental_id: int) -> Rental:
@@ -205,7 +235,6 @@ class RentalService:
         rental.credentials_delivery_status = "sending"
         rental.credentials_delivery_started_at = now
         rental.credentials_delivery_next_attempt_at = None
-        rental.credentials_delivery_attempts += 1
         rental.credentials_delivery_last_error = None
         return True
 
@@ -220,10 +249,20 @@ class RentalService:
         # uses the same lock, so credentials cannot race a completed refund.
         order = (
             await session.execute(
-                select(Order).where(Order.id == order_id).with_for_update()
+                select(Order)
+                .where(Order.id == order_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         ).scalar_one()
-        rental = await session.get(Rental, rental_id)
+        rental = (
+            await session.execute(
+                select(Rental)
+                .where(Rental.id == rental_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         if rental is None:
             raise KeyError(f"Rental {rental_id} not found")
         if (
@@ -238,7 +277,14 @@ class RentalService:
                 await session.commit()
             return rental
 
-        account = await session.get(Account, rental.account_id)
+        account = (
+            await session.execute(
+                select(Account)
+                .where(Account.id == rental.account_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         duration = await session.get(Duration, rental.duration_id)
         if account is None or duration is None:
             rental.credentials_delivery_status = "manual"
@@ -247,6 +293,187 @@ class RentalService:
             self._record_manual_delivery_required(session, rental)
             await session.commit()
             return rental
+        limits = await self._delivery_limits_if_eligible(
+            session,
+            account,
+            rental,
+            duration,
+        )
+        if (
+            limits is None
+            and rental.credentials_delivery_template == "welcome"
+            # Once any external send was attempted, an exception/timeout is
+            # ambiguous: FunPay may already have accepted the credentials.
+            # Never switch that buyer to a second account on a retry.
+            and rental.credentials_delivery_attempts == 0
+        ):
+            reallocated = await self._reallocate_initial_delivery(
+                session, rental, duration, account.id,
+            )
+            if reallocated is not None:
+                # Reallocation persists the target and releases all locks.
+                # Refund handling uses the same Order lock, so reacquire and
+                # repopulate every authorization row before disclosing data.
+                order = (
+                    await session.execute(
+                        select(Order)
+                        .where(Order.id == order_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                rental = (
+                    await session.execute(
+                        select(Rental)
+                        .where(Rental.id == rental_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                if (
+                    order.status not in _FULFILLABLE_ORDER_STATUSES
+                    or rental.status != "active"
+                    or rental.credentials_delivery_status != "sending"
+                    or rental.account_id != reallocated.id
+                ):
+                    if rental.credentials_delivery_status == "sending":
+                        rental.credentials_delivery_status = "failed"
+                        rental.credentials_delivery_last_error = (
+                            "order_not_fulfillable_after_reallocation"
+                        )
+                        rental.credentials_delivery_next_attempt_at = None
+                        await session.commit()
+                    return rental
+                account = (
+                    await session.execute(
+                        select(Account)
+                        .where(Account.id == reallocated.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                limits = await self._delivery_limits_if_eligible(
+                    session, account, rental, duration,
+                )
+        if limits is None:
+            rental.credentials_delivery_status = "manual"
+            rental.credentials_delivery_last_error = (
+                "delivery_account_no_longer_eligible"
+            )
+            rental.credentials_delivery_next_attempt_at = None
+            self._record_manual_delivery_required(session, rental)
+            await session.commit()
+            return rental
+        self._copy_issued_limit_snapshot(rental, limits)
+
+        # Persist the earliest possible disclosure boundary before external
+        # I/O. If the process dies after FunPay accepts the message, expiry can
+        # still revoke this account at a finite deadline. A retry never changes
+        # the account target and never grants a fresh full term.
+        send_started_at = datetime.now(timezone.utc)
+        attempt_number = rental.credentials_delivery_attempts + 1
+        rental.credentials_delivery_attempts = attempt_number
+        rental.credentials_delivery_started_at = send_started_at
+        if (
+            rental.credentials_delivery_template == "welcome"
+            and attempt_number == 1
+        ):
+            rental.started_at = send_started_at
+            rental.expires_at = send_started_at + timedelta(
+                minutes=duration.minutes
+            )
+        expected_account_id = rental.account_id
+        await session.commit()
+
+        # Committing the disclosure boundary releases every lock. Reacquire in
+        # the canonical Order -> Rental -> Account order and re-authorize once
+        # more before sending any secret.
+        order = (
+            await session.execute(
+                select(Order)
+                .where(Order.id == order_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        rental = (
+            await session.execute(
+                select(Rental)
+                .where(Rental.id == rental_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        if (
+            order.status not in _FULFILLABLE_ORDER_STATUSES
+            or rental.status != "active"
+            or rental.credentials_delivery_status != "sending"
+            or rental.account_id != expected_account_id
+            or rental.credentials_delivery_attempts != attempt_number
+        ):
+            if rental.credentials_delivery_status == "sending":
+                rental.credentials_delivery_status = "failed"
+                rental.credentials_delivery_last_error = (
+                    "delivery_state_changed_before_send"
+                )
+                rental.credentials_delivery_next_attempt_at = None
+                await session.commit()
+            return rental
+        account = (
+            await session.execute(
+                select(Account)
+                .where(Account.id == expected_account_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if account is None:
+            limits = None
+        else:
+            limits = await self._delivery_limits_if_eligible(
+                session, account, rental, duration,
+            )
+        if limits is None:
+            rental.credentials_delivery_status = "manual"
+            rental.credentials_delivery_last_error = (
+                "delivery_account_no_longer_eligible_after_boundary"
+            )
+            rental.credentials_delivery_next_attempt_at = None
+            self._record_manual_delivery_required(session, rental)
+            await session.commit()
+            return rental
+        self._copy_issued_limit_snapshot(rental, limits)
+
+        if rental.credentials_delivery_template == "welcome":
+            access_duration_seconds = (
+                None
+                if attempt_number == 1
+                else max(
+                    1,
+                    (_as_utc(rental.expires_at) - send_started_at)
+                    .total_seconds(),
+                )
+            )
+            access_duration_minutes = (
+                duration.minutes
+                if access_duration_seconds is None
+                else max(1, math.ceil(access_duration_seconds / 60))
+            )
+            access_expires_at = None
+        else:
+            access_expires_at = rental.expires_at
+            if access_expires_at.tzinfo is None:
+                access_expires_at = access_expires_at.replace(
+                    tzinfo=timezone.utc
+                )
+            access_duration_seconds = max(
+                1,
+                (access_expires_at - send_started_at).total_seconds(),
+            )
+            access_duration_minutes = max(
+                1,
+                math.ceil(access_duration_seconds / 60),
+            )
         try:
             await self._send_welcome(
                 session,
@@ -254,7 +481,9 @@ class RentalService:
                 order,
                 account,
                 rental,
-                duration.days,
+                access_duration_minutes,
+                access_duration_seconds,
+                access_expires_at,
                 template_key=rental.credentials_delivery_template,
             )
         except Exception as exc:
@@ -266,6 +495,9 @@ class RentalService:
             await session.commit()
             raise
 
+        # Access starts only after FunPay confirmed delivery. The welcome
+        # message intentionally advertises the exact duration rather than an
+        # unknowable pre-send absolute deadline.
         delivered_at = datetime.now(timezone.utc)
         rental.credentials_delivery_status = "sent"
         rental.credentials_delivered_at = delivered_at
@@ -274,11 +506,186 @@ class RentalService:
         # Only the initial paid rental begins at credential delivery. A
         # replacement must preserve the customer's original expiry instead of
         # silently granting a new full term.
-        if rental.credentials_delivery_template == "welcome":
+        if (
+            rental.credentials_delivery_template == "welcome"
+            and attempt_number == 1
+        ):
+            access_expires_at = delivered_at + timedelta(
+                minutes=access_duration_minutes
+            )
             rental.started_at = delivered_at
-            rental.expires_at = delivered_at + timedelta(days=duration.days)
+            rental.expires_at = access_expires_at
         await session.commit()
         return rental
+
+    async def _delivery_limits_if_eligible(
+        self,
+        session: AsyncSession,
+        account: Account,
+        rental: Rental,
+        duration: Duration,
+    ) -> AccountLimits | None:
+        """Re-authorize the reserved account immediately before disclosure.
+
+        A retry may happen long after allocation. Never disclose credentials
+        from an account whose plan, measured limits, status or subscription
+        headroom changed while FunPay delivery was unavailable.
+        """
+
+        now = datetime.now(timezone.utc)
+        tier = (
+            await session.execute(
+                select(SubscriptionTier)
+                .where(SubscriptionTier.id == rental.tier_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        scope = (
+            await session.execute(
+                select(LimitScope)
+                .where(LimitScope.id == rental.limit_scope_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            tier is None
+            or scope is None
+            or not tier.is_active
+            or not tier.is_sellable
+            or not scope.is_enabled
+            or scope.code not in {"any", "codex"}
+        ):
+            return None
+
+        if (
+            rental.credentials_delivery_template == "welcome"
+            and rental.credentials_delivery_attempts == 0
+        ):
+            required_until = (
+                now
+                + timedelta(minutes=duration.minutes)
+                + INITIAL_DELIVERY_SUBSCRIPTION_HEADROOM
+            )
+            freshness_minutes = duration.minutes
+        else:
+            required_until = rental.expires_at
+            if required_until.tzinfo is None:
+                required_until = required_until.replace(tzinfo=timezone.utc)
+            if required_until - now <= REPLACEMENT_DELIVERY_MIN_REMAINING:
+                return None
+            freshness_minutes = max(
+                1,
+                int((required_until - now).total_seconds() // 60),
+            )
+
+        freshness = limits_freshness_for_duration(freshness_minutes)
+        expiry_condition = Account.subscription_expires_at >= required_until
+        if tier.code == "free":
+            expiry_condition = or_(
+                expiry_condition,
+                Account.subscription_expires_at.is_(None),
+            )
+        stmt = (
+            select(AccountLimits)
+            .select_from(Account)
+            .join(AccountLimits, AccountLimits.account_id == Account.id)
+            .join(SubscriptionTier, SubscriptionTier.id == Account.tier_id)
+            .where(
+                Account.id == account.id,
+                Account.status == "active",
+                Account.operator_status_override.is_(None),
+                Account.tier_id == rental.tier_id,
+                SubscriptionTier.is_active.is_(True),
+                SubscriptionTier.is_sellable.is_(True),
+                expiry_condition,
+                AccountLimits.measured_at >= now - freshness,
+                AccountLimits.refresh_status == "ok",
+                AccountLimits.plan_window_status == "ok",
+            )
+        )
+        stmt = apply_limit_scope_filters(
+            stmt,
+            scope=scope.code,
+            min_limit_pct=rental.min_limit_pct,
+            max_short_pct=rental.max_5h_pct,
+            max_long_pct=rental.max_weekly_pct,
+        )
+        return (
+            await session.execute(
+                stmt.limit(1).execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+
+    async def _reallocate_initial_delivery(
+        self,
+        session: AsyncSession,
+        rental: Rental,
+        duration: Duration,
+        old_account_id: int,
+    ) -> Account | None:
+        """Move an unsent initial rental off an account that became unsafe."""
+
+        scope = await session.get(LimitScope, rental.limit_scope_id)
+        if scope is None or scope.code not in {"any", "codex"}:
+            return None
+        criteria = AccountCriteria(
+            tier_id=rental.tier_id,
+            duration_minutes=duration.minutes,
+            scope=scope.code,
+            min_limit_pct=rental.min_limit_pct,
+            max_5h_pct=rental.max_5h_pct,
+            max_weekly_pct=rental.max_weekly_pct,
+        )
+        account = await self._pool.acquire_excluding(
+            session,
+            criteria,
+            exclude_account_id=old_account_id,
+            default_max_active_rentals=1,
+        )
+        if account is None:
+            return None
+        rental.account_id = account.id
+        session.add(
+            AuditLog(
+                event_type="credential_delivery_reallocated",
+                account_id=account.id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+                metadata_={"old_account_id": old_account_id},
+            )
+        )
+        # Persist the exact new target before any external message is sent.
+        await session.commit()
+        return account
+
+    @staticmethod
+    def _copy_issued_limit_snapshot(
+        rental: Rental,
+        limits: AccountLimits,
+    ) -> None:
+        """Make the durable buyer claim match the final eligibility sample."""
+
+        rental.issued_codex_5h_pct = limits.codex_5h_remaining_pct
+        rental.issued_codex_weekly_pct = limits.codex_weekly_remaining_pct
+        rental.issued_codex_primary_pct = limits.codex_primary_remaining_pct
+        rental.issued_codex_primary_window_seconds = (
+            limits.codex_primary_window_seconds
+        )
+        rental.issued_codex_primary_resets_at = limits.codex_primary_resets_at
+        rental.issued_codex_secondary_pct = limits.codex_secondary_remaining_pct
+        rental.issued_codex_secondary_window_seconds = (
+            limits.codex_secondary_window_seconds
+        )
+        rental.issued_codex_secondary_resets_at = (
+            limits.codex_secondary_resets_at
+        )
+        rental.issued_plan_window_status = limits.plan_window_status
+        rental.issued_expected_long_window_seconds = (
+            limits.expected_long_window_seconds
+        )
+        rental.issued_limits_measured_at = limits.measured_at
 
     @staticmethod
     def _schedule_delivery_retry(
@@ -293,10 +700,8 @@ class RentalService:
             RentalService._record_manual_delivery_required(session, rental)
             return
 
-        exponent = max(0, rental.credentials_delivery_attempts - 1)
-        delay_seconds = min(
-            _CREDENTIAL_RETRY_BASE.total_seconds() * (2**exponent),
-            _CREDENTIAL_RETRY_MAX.total_seconds(),
+        delay_seconds = credential_delivery_retry_delay_seconds(
+            rental.credentials_delivery_attempts,
         )
         rental.credentials_delivery_status = "failed"
         rental.credentials_delivery_next_attempt_at = (
@@ -328,7 +733,9 @@ class RentalService:
         order: Order,
         account: Account,
         rental: Rental,
-        days: int,
+        duration_minutes: int,
+        duration_seconds: float | None,
+        access_expires_at: datetime | None,
         *,
         template_key: str = "welcome",
     ) -> None:
@@ -339,16 +746,34 @@ class RentalService:
         lang = order.buyer_locale or "ru"
         if template_key not in {"welcome", "replace_success"}:
             template_key = "welcome"
-        text = await render_message(
-            session, template_key, lang,
+        duration_text = (
+            format_remaining_seconds(duration_seconds, lang)
+            if duration_seconds is not None
+            else format_duration(duration_minutes, lang)
+        )
+        variables = dict(
             login=account.login,
             password=password,
             tier=tier.name if tier else "",
-            days=days,
-            expires_at=_fmt_expires(account.subscription_expires_at),
+            duration=duration_text,
+            duration_minutes=duration_minutes,
+            days=format_legacy_days(duration_minutes),
+            expires_at=format_plan_expiry(
+                account.subscription_expires_at, lang
+            ),
             **issued_usage_template_variables(rental, lang=lang),
         )
-        await gateway.send_message(chat_id=int(order.funpay_chat_id), text=text)
+        if access_expires_at is not None:
+            variables["access_expires_at"] = format_access_expiry(
+                access_expires_at, lang
+            )
+        text = await render_message(
+            session, template_key, lang, **variables,
+        )
+        await asyncio.wait_for(
+            gateway.send_message(chat_id=int(order.funpay_chat_id), text=text),
+            timeout=CREDENTIAL_SEND_TIMEOUT_SECONDS,
+        )
 
     async def _send_no_account(
         self,
@@ -361,7 +786,20 @@ class RentalService:
         text = await render_message(
             session, "no_account_available", lang, retry_minutes=retry_minutes,
         )
-        await gateway.send_message(chat_id=int(order.funpay_chat_id), text=text)
+        try:
+            await asyncio.wait_for(
+                gateway.send_message(
+                    chat_id=int(order.funpay_chat_id), text=text,
+                ),
+                timeout=CREDENTIAL_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            # ``fulfill_order`` still owns the Order row lock on this path.
+            # Release it promptly when FunPay is unavailable instead of
+            # blocking refund and scheduled fulfillment until a hung socket
+            # eventually fails on its own.
+            await session.rollback()
+            raise
 
     @staticmethod
     async def _retry_minutes(session: AsyncSession) -> int:
@@ -369,9 +807,3 @@ class RentalService:
         if settings is not None:
             return settings.limits_check_interval_minutes
         return 5
-
-
-def _fmt_expires(dt: datetime | None) -> str:
-    if dt is None:
-        return "—"
-    return dt.strftime("%d.%m.%Y")

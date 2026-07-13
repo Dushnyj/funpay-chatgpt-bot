@@ -16,6 +16,10 @@ import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader } from '../components/ui'
 import type { LotTemplate, LotTemplateCreate, LotTemplateUpdate } from '../types/api'
 import {
+  classifyTemplateFields,
+  DEPRECATED_DURATION_TEMPLATE_FIELDS,
+  DEPRECATED_LIMIT_TEMPLATE_FIELDS,
+  DEPRECATED_MESSAGE_TEMPLATE_FIELDS,
   extractTemplateFields,
   insertTemplateField,
   normalizeTemplateKey,
@@ -39,9 +43,12 @@ const MESSAGE_META: Record<string, MessageMeta> = {
   welcome: { title: 'Выдача аккаунта', description: 'Данные после успешной оплаты', category: 'delivery' },
   order_confirmed: { title: 'Заказ подтверждён', description: 'Финальное сообщение покупателю', category: 'delivery' },
   no_account_available: { title: 'Нет свободного аккаунта', description: 'Выдача временно невозможна', category: 'delivery' },
+  delivery_pending: { title: 'Выдача ещё выполняется', description: 'Данные аккаунта ещё доставляются', category: 'delivery' },
   code_success: { title: 'Код входа', description: 'Ответ на команду получения кода', category: 'access' },
   code_expired: { title: 'Доступ завершён', description: 'Аренда истекла или не найдена', category: 'access' },
+  code_expiring: { title: 'Код уже не выдаётся', description: 'До окончания доступа осталось меньше минуты', category: 'access' },
   code_rate_limited: { title: 'Запрос кода ограничен', description: 'Повторный запрос сделан слишком рано', category: 'access' },
+  account_unavailable: { title: 'Аккаунт временно недоступен', description: 'Код не выдаётся до восстановления или замены', category: 'access' },
   rental_ambiguous: { title: 'Несколько заказов', description: 'Нужно выбрать конкретный заказ', category: 'access' },
   email_code_success: { title: 'Код из почты', description: 'Код подтверждения получен из почты', category: 'access' },
   email_code_duplicate: { title: 'Код уже отправлен', description: 'Покупатель повторно запросил тот же код', category: 'access' },
@@ -52,7 +59,9 @@ const MESSAGE_META: Record<string, MessageMeta> = {
   replace_success: { title: 'Замена выполнена', description: 'Новые данные после замены', category: 'replacement' },
   replace_declined: { title: 'Замена не нужна', description: 'Аккаунт работает корректно', category: 'replacement' },
   replace_no_account: { title: 'Нет аккаунта для замены', description: 'Свободная замена не найдена', category: 'replacement' },
+  replace_expiring: { title: 'Замена уже невозможна', description: 'До окончания доступа осталось меньше двух минут', category: 'replacement' },
   subscription: { title: 'Статус подписки', description: 'Тариф, срок и актуальные лимиты', category: 'lifecycle' },
+  subscription_limits_unavailable: { title: 'Лимиты временно недоступны', description: 'Статус подписки без свежего замера Codex', category: 'lifecycle' },
   expiry: { title: 'Аренда завершена', description: 'Уведомление об окончании доступа', category: 'lifecycle' },
   disconnect: { title: 'Временное отключение', description: 'Сессия аккаунта завершена', category: 'lifecycle' },
 }
@@ -77,11 +86,14 @@ const REQUIRED_FIELDS: Record<string, string[]> = {
   email_code_success: ['email_code'],
 }
 
+const visibleTemplateFields = (fields: string[]) => fields.filter((field) => !DEPRECATED_MESSAGE_TEMPLATE_FIELDS.has(field))
+
 const SAMPLE_VALUES: Record<string, string> = {
   tier: 'Plus',
   plan: 'Plus',
-  days: '7',
-  duration: '7 дней',
+  days: '0.1041666667',
+  duration: '2 часа 30 минут',
+  duration_minutes: '150',
   condition: 'Codex от 70%',
   long_window_days: '7',
   short_limit: '91%',
@@ -92,13 +104,14 @@ const SAMPLE_VALUES: Record<string, string> = {
   login: 'buyer@example.com',
   password: '••••••••••',
   expires_at: '20.07.2026 10:30',
+  access_expires_at: '13.07.2026 12:30',
   expires_in: '6 дн. 23 ч.',
   code: '482 913',
   email_code: '731 204',
   retry_in_sec: '24',
   retry_minutes: '5',
-  chat_5h: '82',
-  chat_weekly: '64',
+  chat_5h: '—',
+  chat_weekly: '—',
   codex_5h: '82',
   codex_weekly: '64',
   codex_primary_limit: '79%',
@@ -115,8 +128,8 @@ const SAMPLE_VALUES: Record<string, string> = {
 const VARIABLE_LABELS: Record<string, string> = {
   tier: 'тариф',
   plan: 'тариф',
-  days: 'дней аренды',
   duration: 'срок аренды',
+  duration_minutes: 'срок аренды в минутах',
   condition: 'условия лота',
   long_window_days: 'дней в длинном окне',
   short_limit: 'лимит короткого окна',
@@ -126,14 +139,13 @@ const VARIABLE_LABELS: Record<string, string> = {
   price: 'цена',
   login: 'логин',
   password: 'пароль',
-  expires_at: 'дата окончания',
+  expires_at: 'срок тарифа аккаунта',
+  access_expires_at: 'доступ покупателя до',
   expires_in: 'осталось времени',
   code: 'одноразовый код',
   email_code: 'код из письма',
   retry_in_sec: 'повтор через, сек.',
   retry_minutes: 'ожидание, мин.',
-  chat_5h: 'Chat, 5 ч',
-  chat_weekly: 'Chat, 7 дней',
   codex_primary_limit: 'Codex, остаток',
   codex_primary_window: 'Codex, окно',
   codex_primary_reset: 'Codex, сброс',
@@ -229,10 +241,10 @@ export default function Templates() {
     name: '',
     tier_id: null,
     limit_scope_id: null,
-    title_ru: 'ChatGPT {plan} на {days} дн. — {condition}',
-    title_en: 'ChatGPT {plan} for {days} days — {condition}',
-    description_ru: 'Доступ к ChatGPT {plan}. Длинное окно: {long_window_days} дн., остаток от {min_limit}. Моментальная выдача.',
-    description_en: 'ChatGPT {plan} access. Long window: {long_window_days} days, at least {min_limit} remaining. Instant delivery.',
+    title_ru: 'ChatGPT {plan} на {duration} — {condition}',
+    title_en: 'ChatGPT {plan} for {duration} — {condition}',
+    description_ru: 'Доступ к ChatGPT {plan} на {duration}. Условие выдачи: {condition}. Моментальная выдача.',
+    description_en: 'ChatGPT {plan} access for {duration}. Delivery condition: {condition}. Instant delivery.',
     enabled: true,
   })
   const messageEditorRef = useRef<HTMLTextAreaElement>(null)
@@ -295,13 +307,23 @@ export default function Templates() {
     ?? templates.find((item) => item.key === selectedMessageKey)
   const activeMessageId = activeMessage ? messageId(activeMessage.key, activeMessage.lang) : ''
   const messageContent = activeMessage ? messageDrafts[activeMessageId] ?? activeMessage.content : ''
-  const messageFields = activeMessage?.allowed_fields ?? []
+  const messageAllowedFields = activeMessage?.allowed_fields ?? []
+  const messageFields = visibleTemplateFields(messageAllowedFields)
   const messageUsedFields = extractTemplateFields(messageContent)
-  const messageUnknownFields = messageUsedFields.filter((field) => !messageFields.includes(field))
+  const messageFieldClassification = classifyTemplateFields(
+    messageUsedFields,
+    messageAllowedFields,
+    DEPRECATED_MESSAGE_TEMPLATE_FIELDS,
+  )
+  const messageUnknownFields = messageFieldClassification.unknown
+  const messageDeprecatedLimitFields = messageFieldClassification.deprecated.filter((field) => DEPRECATED_LIMIT_TEMPLATE_FIELDS.has(field))
+  const messageDeprecatedDurationFields = messageFieldClassification.deprecated.filter((field) => DEPRECATED_DURATION_TEMPLATE_FIELDS.has(field))
   const messageMissingFields = (REQUIRED_FIELDS[selectedMessageKey] ?? []).filter((field) => !messageUsedFields.includes(field))
 
   const activeLot = lots.find((item) => item.key === selectedLotKey)
   const activeLotDraft = activeLot ? lotDrafts[activeLot.key] ?? toLotDraft(activeLot) : null
+  const activeLotAllowedFields = activeLot?.allowed_fields ?? []
+  const activeLotFields = visibleTemplateFields(activeLotAllowedFields)
   const availableLotScopes = (scopesQuery.data ?? [])
     .filter(isAvailableOfferScope)
     .sort(compareOfferScopes)
@@ -320,8 +342,17 @@ export default function Templates() {
   const lotDescription = activeLotDraft?.[lotDescriptionField] ?? ''
   const lotUsedFields = extractTemplateFields(`${lotTitle}\n${lotDescription}`)
   const lotTitleFields = extractTemplateFields(lotTitle)
-  const lotMissingTitleFields = ['plan', 'days', 'condition'].filter((field) => !lotTitleFields.includes(field))
-  const lotUnknownFields = lotUsedFields.filter((field) => !(activeLot?.allowed_fields ?? []).includes(field))
+  const lotMissingTitleFields = [
+    ...['plan', 'condition'].filter((field) => !lotTitleFields.includes(field)),
+    ...(['duration', 'duration_minutes', 'days'].some((field) => lotTitleFields.includes(field)) ? [] : ['duration']),
+  ]
+  const lotFieldClassification = classifyTemplateFields(
+    lotUsedFields,
+    activeLotAllowedFields,
+    DEPRECATED_DURATION_TEMPLATE_FIELDS,
+  )
+  const lotUnknownFields = lotFieldClassification.unknown
+  const lotDeprecatedDurationFields = lotFieldClassification.deprecated
 
   const activeDirtyCount = section === 'messages' ? messageDirty.size : lotDirty.size
   const totalDirtyCount = messageDirty.size + lotDirty.size
@@ -674,6 +705,8 @@ export default function Templates() {
                     </div>
                     {messageMissingFields.length > 0 && <div className="templates-validation is-error"><Icon name="warning" size={15} /><span>Обязательные переменные: {messageMissingFields.map((field) => `{${field}}`).join(', ')}</span></div>}
                     {messageUnknownFields.length > 0 && <div className="templates-validation is-error"><Icon name="warning" size={15} /><span>Не поддерживаются: {messageUnknownFields.map((field) => `{${field}}`).join(', ')}</span></div>}
+                    {messageDeprecatedLimitFields.length > 0 && <div className="templates-validation is-warning"><Icon name="warning" size={15} /><span>Устаревшие переменные лимитов: {messageDeprecatedLimitFields.map((field) => `{${field}}`).join(', ')}. Chat-поля дадут «—»; замените их на точные Codex-поля или сбросьте шаблон.</span></div>}
+                    {messageDeprecatedDurationFields.length > 0 && <div className="templates-validation is-warning"><Icon name="warning" size={15} /><span>Переменная {'{days}'} устарела: для срока меньше суток она выведет дробное число. Замените на {'{duration}'}.</span></div>}
                   </>
                 ) : activeLot && activeLotDraft ? (
                   <>
@@ -694,9 +727,10 @@ export default function Templates() {
                     </label>
                     <div className="templates-variables">
                       <div><strong>Переменные</strong><span>Вставка в поле «{lotInsertTarget === 'title' ? 'Название' : 'Описание'}»</span></div>
-                      <div>{activeLot.allowed_fields.map((field) => <button key={field} className={lotUsedFields.includes(field) ? 'is-used' : ''} onClick={() => insertLotVariable(field)} disabled={editorBusy} title={VARIABLE_LABELS[field] ?? field}><code>{`{${field}}`}</code><span>{VARIABLE_LABELS[field] ?? field}</span></button>)}</div>
+                      <div>{activeLotFields.map((field) => <button key={field} className={lotUsedFields.includes(field) ? 'is-used' : ''} onClick={() => insertLotVariable(field)} disabled={editorBusy} title={VARIABLE_LABELS[field] ?? field}><code>{`{${field}}`}</code><span>{VARIABLE_LABELS[field] ?? field}</span></button>)}</div>
                     </div>
                     {lotUnknownFields.length > 0 && <div className="templates-validation is-error"><Icon name="warning" size={15} /><span>Не поддерживаются: {lotUnknownFields.map((field) => `{${field}}`).join(', ')}</span></div>}
+                    {lotDeprecatedDurationFields.length > 0 && <div className="templates-validation is-warning"><Icon name="warning" size={15} /><span>Переменная {'{days}'} устарела: для срока меньше суток автогенерация приостановит соответствующий лот. Замените на {'{duration}'} или сбросьте шаблон.</span></div>}
                     {lotMissingTitleFields.length > 0 && <div className="templates-validation is-error"><Icon name="warning" size={15} /><span>В названии обязательны: {lotMissingTitleFields.map((field) => `{${field}}`).join(', ')}</span></div>}
                   </>
                 ) : null}

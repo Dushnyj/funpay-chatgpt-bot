@@ -35,7 +35,7 @@ async def _make_rental(
 ) -> Rental:
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope = LimitScope(code="any", name="Любой")
     session.add(scope)
@@ -61,6 +61,11 @@ async def _make_rental(
         lang="ru", started_at=datetime.now(timezone.utc) - timedelta(days=8),
         expires_at=datetime.now(timezone.utc) + expires_delta,
         status=status,
+        credentials_delivery_status="sent",
+        credentials_delivery_template="welcome",
+        expiry_notified_at=(
+            datetime.now(timezone.utc) if status == "expired" else None
+        ),
     )
     session.add(rental)
     await session.flush()
@@ -80,6 +85,76 @@ async def test_expire_marks_overdue_rentals(session: AsyncSession):
     assert len(gateway.sent_messages) == 1
 
 
+async def test_expiry_releases_stale_replacement_target(
+    session: AsyncSession,
+):
+    rental = await _make_rental(
+        session, expires_delta=timedelta(seconds=-1),
+    )
+    target = Account(
+        login="stale-expiry-target",
+        password_encrypted="enc",
+        totp_secret_encrypted="enc",
+        tier_id=rental.tier_id,
+        status="active",
+        subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    session.add(target)
+    await session.flush()
+    rental.replacement_target_account_id = target.id
+    rental.expiry_revoke_started_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=6)
+    )
+    await session.commit()
+
+    await _service().expire_overdue(session, gateway=None)
+
+    await session.refresh(rental)
+    assert rental.status == "expired"
+    assert rental.replacement_target_account_id is None
+
+
+@pytest.mark.parametrize(
+    ("claim_age", "released"),
+    [
+        (timedelta(minutes=6), True),
+        (timedelta(minutes=1), False),
+    ],
+)
+async def test_periodic_cleanup_releases_only_stale_exact_replacement_claim(
+    session: AsyncSession,
+    claim_age: timedelta,
+    released: bool,
+):
+    rental = await _make_rental(
+        session, expires_delta=timedelta(days=1),
+    )
+    target = Account(
+        login="periodic-cleanup-target",
+        password_encrypted="enc",
+        totp_secret_encrypted="enc",
+        tier_id=rental.tier_id,
+        status="active",
+        subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+    )
+    session.add(target)
+    await session.flush()
+    rental.replacement_target_account_id = target.id
+    rental.expiry_revoke_started_at = datetime.now(timezone.utc) - claim_age
+    old_account = await session.get(Account, rental.account_id)
+    old_account.status = "maintenance"
+    await session.commit()
+
+    processed = await _service().expire_overdue(session, gateway=None)
+
+    await session.refresh(rental)
+    await session.refresh(old_account)
+    assert processed == []
+    assert (rental.replacement_target_account_id is None) is released
+    assert (rental.expiry_revoke_started_at is None) is released
+    assert old_account.status == "maintenance"
+
+
 async def test_expire_skips_active_rentals(session: AsyncSession):
     await _make_rental(session, expires_delta=timedelta(days=1))
     gateway = FakeChatGateway()
@@ -87,6 +162,22 @@ async def test_expire_skips_active_rentals(session: AsyncSession):
     expired = await svc.expire_overdue(session, gateway)
     assert len(expired) == 0
     assert len(gateway.sent_messages) == 0
+
+
+async def test_expire_skips_unsent_initial_rental_provisional_deadline(
+    session: AsyncSession,
+):
+    rental = await _make_rental(
+        session, expires_delta=timedelta(minutes=-5)
+    )
+    rental.credentials_delivery_status = "failed"
+    await session.flush()
+
+    expired = await _service().expire_overdue(session, gateway=None)
+
+    assert expired == []
+    await session.refresh(rental)
+    assert rental.status == "active"
 
 
 async def test_expire_skips_already_expired(session: AsyncSession):
@@ -124,6 +215,41 @@ async def test_expire_never_races_refund_owned_rental(
     assert expired == []
     assert rental.status == "active"
     assert kick.account_ids == []
+
+
+async def test_refund_claim_between_expiry_claim_and_finalize_owns_rental(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _make_rental(
+        session,
+        expires_delta=timedelta(seconds=-1),
+    )
+    order = await session.get(Order, rental.order_id)
+    assert order is not None
+
+    class RefundDuringKick:
+        async def kick(self, db, _account_id: int) -> KickResult:
+            current_order = await db.get(Order, order.id)
+            assert current_order is not None
+            current_order.status = "refund_pending"
+            await db.commit()
+            return KickResult(success=True)
+
+    gateway = FakeChatGateway()
+    processed = await RentalExpiryService(
+        kick_service=RefundDuringKick(),
+    ).expire_overdue(session, gateway)
+
+    await session.refresh(order)
+    await session.refresh(rental)
+    assert len(processed) == 1
+    assert order.status == "refund_pending"
+    assert rental.status == "expiry_pending"
+    assert rental.expiry_revoke_started_at is None
+    assert gateway.sent_messages == []
 
 
 async def test_expire_sends_to_correct_chat(session: AsyncSession):
@@ -175,36 +301,63 @@ async def test_expiry_failure_is_explicit_and_retryable(session: AsyncSession):
     assert rental.status == "expired"
 
 
-async def test_expiry_notifies_other_active_renters_after_shared_account_kick(
+async def test_expiry_notification_survives_crash_after_revoke_finalize(
     session: AsyncSession,
 ):
     from app.services.seed_data import seed_message_templates
 
     await seed_message_templates(session)
-    overdue = await _make_rental(session, expires_delta=timedelta(seconds=-1))
-    other_order = Order(
-        funpay_order_id="o2", funpay_chat_id="777", buyer_funpay_id="201",
-        tier_id=overdue.tier_id, duration_id=overdue.duration_id,
-        limit_scope_id=overdue.limit_scope_id, price=100, status="pending",
+    rental = await _make_rental(
+        session, expires_delta=timedelta(seconds=-1)
     )
-    session.add(other_order)
-    await session.flush()
-    session.add(Rental(
-        order_id=other_order.id,
-        account_id=overdue.account_id,
-        buyer_funpay_id="201",
-        buyer_funpay_chat_id="777",
-        tier_id=overdue.tier_id,
-        duration_id=overdue.duration_id,
-        limit_scope_id=overdue.limit_scope_id,
-        lang="ru",
-        started_at=datetime.now(timezone.utc),
-        expires_at=datetime.now(timezone.utc) + timedelta(days=2),
-        status="active",
-    ))
-    await session.flush()
+    service = _service()
+
+    # Simulate a process dying after the durable revoke finalization and before
+    # it had a gateway capable of sending the terminal buyer message.
+    await service.expire_overdue(session, gateway=None)
+    await session.refresh(rental)
+    assert rental.status == "expired"
+    assert rental.expiry_notified_at is None
+
     gateway = FakeChatGateway()
+    processed = await service.expire_overdue(session, gateway)
 
+    assert processed == []
+    assert len(gateway.sent_messages) == 1
+    await session.refresh(rental)
+    assert rental.expiry_notified_at is not None
+
+
+async def test_expiry_notification_send_is_bounded_and_retryable(
+    session: AsyncSession,
+    monkeypatch,
+):
+    import asyncio
+    import app.services.rental_expiry as expiry_module
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _make_rental(
+        session, expires_delta=timedelta(seconds=-1)
+    )
+    monkeypatch.setattr(
+        expiry_module, "EXPIRY_MESSAGE_TIMEOUT_SECONDS", 0.01,
+    )
+
+    class SlowGateway(FakeChatGateway):
+        async def send_message(self, chat_id: int, text: str) -> int:
+            await asyncio.sleep(60)
+            return await super().send_message(chat_id, text)
+
+    await _service().expire_overdue(session, SlowGateway())
+
+    await session.refresh(rental)
+    assert rental.status == "expired"
+    assert rental.expiry_notified_at is None
+    assert rental.expiry_revoke_started_at is None
+
+    gateway = FakeChatGateway()
     await _service().expire_overdue(session, gateway)
-
-    assert {chat_id for chat_id, _ in gateway.sent_messages} == {100, 777}
+    assert len(gateway.sent_messages) == 1
+    await session.refresh(rental)
+    assert rental.expiry_notified_at is not None

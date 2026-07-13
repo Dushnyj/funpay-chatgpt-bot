@@ -145,6 +145,46 @@ async def test_fetch_next_pending_respects_priority_across_accounts(
     assert next_job.id == high.id
 
 
+async def test_fetch_next_pending_fresh_recheck_skips_busy_candidate(
+    session: AsyncSession,
+    monkeypatch,
+):
+    """A rental committed before Account lock must defer that account's job."""
+
+    import asyncio
+
+    first_account = await _add_account(session, "fresh-busy-first")
+    queue = CheckJobQueue()
+    first_job = await queue.enqueue(
+        session,
+        first_account.id,
+        priority="scheduled",
+        job_type="limit_check",
+    )
+    await asyncio.sleep(0.01)
+    second_account = await _add_account(session, "fresh-busy-second")
+    second_job = await queue.enqueue(
+        session,
+        second_account.id,
+        priority="scheduled",
+        job_type="limit_check",
+    )
+    checked: list[int] = []
+
+    async def fresh_busy(_session: AsyncSession, account_id: int) -> bool:
+        checked.append(account_id)
+        return account_id == first_account.id
+
+    monkeypatch.setattr("app.check_job_queue.account_is_busy", fresh_busy)
+
+    next_job = await queue.fetch_next_pending(session, ("limit_check",))
+
+    assert next_job is not None
+    assert next_job.id == second_job.id
+    assert first_job.status == "pending"
+    assert checked == [first_account.id, second_account.id]
+
+
 async def test_mark_running_updates_status(session: AsyncSession):
     acc = await _add_account(session)
     q = CheckJobQueue()

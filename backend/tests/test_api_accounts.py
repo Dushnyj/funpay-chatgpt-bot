@@ -75,6 +75,20 @@ async def test_create_account(auth_client: AsyncClient, session: AsyncSession):
     ]
 
 
+async def test_account_capacity_above_one_is_rejected(
+    auth_client: AsyncClient,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "unsafe-capacity",
+            "password": "pass",
+            "max_active_rentals": 2,
+        },
+    )
+    assert created.status_code == 422
+
+
 async def test_get_account_detail(auth_client: AsyncClient, session: AsyncSession):
     tier_id = await _seed_tier(session)
     resp = await auth_client.post("/api/accounts", json={
@@ -691,11 +705,11 @@ async def test_totp_code_waits_for_a_safe_window_at_boundary(
     assert response.json()["seconds_remaining"] == 28
 
 
-async def test_account_list_reports_active_rentals_count(
+async def test_account_list_reports_occupying_rentals_count(
     auth_client: AsyncClient, session: AsyncSession
 ):
     tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="any", name="Any")
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -709,7 +723,9 @@ async def test_account_list_reports_active_rentals_count(
     session.add(account)
     await session.flush()
     now = datetime.now(timezone.utc)
-    for index, status in enumerate(("active", "expired"), start=1):
+    for index, status in enumerate(
+        ("expiry_pending", "expired"), start=1
+    ):
         order = Order(
             funpay_order_id=f"count-order-{index}",
             funpay_chat_id=f"chat-{index}",
@@ -755,5 +771,112 @@ async def test_account_list_reports_active_rentals_count(
     assert updated.json()["active_rentals_count"] == 1
 
     rechecked = await auth_client.post(f"/api/accounts/{account.id}/recheck")
-    assert rechecked.status_code == 202
-    assert rechecked.json()["active_rentals_count"] == 1
+    assert rechecked.status_code == 409
+    await session.refresh(account)
+    assert account.status == "active"
+
+    rentals = (
+        await session.execute(
+            select(Rental).where(Rental.account_id == account.id)
+        )
+    ).scalars().all()
+    blocked_delete = await auth_client.delete(f"/api/accounts/{account.id}")
+    assert blocked_delete.status_code == 409
+
+
+async def test_replacement_target_is_mutation_locked_but_not_counted_as_sold(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
+    duration = Duration(minutes=60, is_enabled=True, sort_order=10)
+    scope = LimitScope(code="any", name="Any")
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    old_account = Account(
+        login="old-rented@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        tier_id=tier.id,
+        status="maintenance",
+    )
+    target = Account(
+        login="reserved-target@outlook.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        email="reserved-target@outlook.com",
+        tier_id=tier.id,
+        status="active",
+    )
+    session.add_all([old_account, target])
+    await session.flush()
+    now = datetime.now(timezone.utc)
+    order = Order(
+        funpay_order_id="replacement-reservation-order",
+        funpay_chat_id="replacement-chat",
+        buyer_funpay_id="replacement-buyer",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(Rental(
+        order_id=order.id,
+        account_id=old_account.id,
+        replacement_target_account_id=target.id,
+        buyer_funpay_id="replacement-buyer",
+        buyer_funpay_chat_id="replacement-chat",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        lang="ru",
+        started_at=now,
+        expires_at=now + timedelta(hours=1),
+        status="active",
+        expiry_revoke_started_at=now,
+        credentials_delivery_status="sent",
+        credentials_delivery_template="welcome",
+        credentials_delivery_attempts=1,
+    ))
+    await session.commit()
+
+    listed_response = await auth_client.get("/api/accounts")
+    assert listed_response.status_code == 200
+    listed = next(
+        item for item in listed_response.json() if item["id"] == target.id
+    )
+    assert listed["active_rentals_count"] == 0
+    assert listed["replacement_reserved"] is True
+
+    notes_update = await auth_client.patch(
+        f"/api/accounts/{target.id}",
+        json={"notes": "safe while reserved"},
+    )
+    assert notes_update.status_code == 200
+    assert notes_update.json()["replacement_reserved"] is True
+
+    blocked_requests = [
+        await auth_client.patch(
+            f"/api/accounts/{target.id}", json={"status": "maintenance"},
+        ),
+        await auth_client.patch(
+            f"/api/accounts/{target.id}",
+            json={"subscription_expires_at": (now - timedelta(days=1)).isoformat()},
+        ),
+        await auth_client.patch(
+            f"/api/accounts/{target.id}/credentials",
+            json={"password": "new-password"},
+        ),
+        await auth_client.post(f"/api/accounts/{target.id}/recheck"),
+        await auth_client.post(f"/api/accounts/{target.id}/device-auth"),
+        await auth_client.post(
+            f"/api/accounts/{target.id}/email-oauth/microsoft"
+        ),
+        await auth_client.delete(f"/api/accounts/{target.id}"),
+    ]
+    assert [response.status_code for response in blocked_requests] == [
+        409, 409, 409, 409, 409, 409, 409,
+    ]

@@ -194,7 +194,7 @@ async def test_lot_template_crud_validation_and_system_reset(
 ):
     await seed_lot_templates(session)
     tier = SubscriptionTier(name="Custom", is_active=True)
-    scope = LimitScope(code="custom", name="Custom")
+    scope = LimitScope(code="any", name="Без гарантии", is_enabled=True)
     session.add_all([tier, scope])
     await session.commit()
 
@@ -203,7 +203,9 @@ async def test_lot_template_crud_validation_and_system_reset(
     default = listed.json()[0]
     assert default["key"] == "default"
     assert default["system_managed"] is True
-    assert {"plan", "days", "condition"} <= set(default["allowed_fields"])
+    assert {"plan", "duration", "condition"} <= set(
+        default["allowed_fields"]
+    )
 
     payload = {
         "key": "custom-plus",

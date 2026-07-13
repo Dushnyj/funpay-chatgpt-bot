@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import AccountLimits
+from app.models.audit import AuditLog
 from app.models.message import MessageTemplate
 from app.models.rental import Rental
 
@@ -15,10 +16,9 @@ SUPPORTED_TEMPLATE_LANGS = frozenset({"ru", "en"})
 
 _USAGE_FIELDS = frozenset(
     {
-        # Legacy variables remain available for operator templates created
-        # before exact OpenAI usage windows were stored.
-        "chat_5h",
-        "chat_weekly",
+        # Codex aliases remain available for operator templates created before
+        # exact OpenAI usage windows were stored. They represent the same
+        # agentic pool, not a separate product allowance.
         "codex_5h",
         "codex_weekly",
         # Exact, display-ready Codex observations.
@@ -31,12 +31,30 @@ _USAGE_FIELDS = frozenset(
     }
 )
 
+# Hidden parser compatibility only. These placeholders are not returned in
+# ``allowed_fields`` and always render as unavailable because no Chat allowance
+# exists in the active model. This prevents an operator-edited legacy template
+# from breaking credential delivery during the migration.
+_DEPRECATED_CHAT_TEMPLATE_FIELDS = frozenset({"chat_5h", "chat_weekly"})
+_USAGE_TEMPLATE_KEYS = frozenset({"welcome", "subscription", "replace_success"})
+
 TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
     "welcome": frozenset(
-        {"login", "password", "tier", "days", "expires_at"}
+        {
+            "login",
+            "password",
+            "tier",
+            "duration",
+            "duration_minutes",
+            "days",
+            "expires_at",
+        }
     )
     | _USAGE_FIELDS,
     "code_success": frozenset({"code", "expires_in"}),
+    "code_expiring": frozenset(),
+    "account_unavailable": frozenset(),
+    "delivery_pending": frozenset(),
     "code_expired": frozenset(),
     "rental_ambiguous": frozenset(),
     "code_rate_limited": frozenset({"retry_in_sec"}),
@@ -44,18 +62,33 @@ TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
     "email_code_duplicate": frozenset(),
     "email_code_not_found": frozenset(),
     "email_code_unavailable": frozenset(),
-    "subscription": frozenset({"tier", "expires_at", "expires_in"})
+    "subscription": frozenset(
+        {"tier", "expires_at", "access_expires_at", "expires_in"}
+    )
     | _USAGE_FIELDS,
+    "subscription_limits_unavailable": frozenset(
+        {"tier", "expires_at", "access_expires_at", "expires_in"}
+    ),
     "replace_success": frozenset(
-        {"login", "password", "tier", "days", "expires_at"}
+        {
+            "login",
+            "password",
+            "tier",
+            "duration",
+            "duration_minutes",
+            "days",
+            "expires_at",
+            "access_expires_at",
+        }
     )
     | _USAGE_FIELDS,
     "replace_declined": frozenset(),
+    "replace_expiring": frozenset(),
     "replace_no_account": frozenset(),
     "seller_called": frozenset(),
     "help": frozenset(),
     "order_confirmed": frozenset(),
-    "expiry": frozenset({"tier", "days"}),
+    "expiry": frozenset({"tier", "duration", "duration_minutes", "days"}),
     "disconnect": frozenset({"expires_in"}),
     "no_account_available": frozenset({"retry_minutes"}),
 }
@@ -102,6 +135,11 @@ def validate_template_content(key: str, lang: str, content: str) -> frozenset[st
     runtime-only failures.
     """
     allowed = allowed_template_fields(key, lang)
+    accepted = (
+        allowed | _DEPRECATED_CHAT_TEMPLATE_FIELDS
+        if key in _USAGE_TEMPLATE_KEYS
+        else allowed
+    )
     used: set[str] = set()
     try:
         parts = list(_FORMATTER.parse(content))
@@ -117,7 +155,7 @@ def validate_template_content(key: str, lang: str, content: str) -> frozenset[st
             raise TemplateValidationError(
                 f"Positional placeholders are not allowed in {key}/{lang}"
             )
-        if field_name not in allowed:
+        if field_name not in accepted:
             allowed_display = ", ".join(f"{{{name}}}" for name in sorted(allowed))
             raise TemplateValidationError(
                 f"Unknown placeholder {{{field_name}}} in {key}/{lang}. "
@@ -166,6 +204,21 @@ async def render_message(
             f"Missing variables for {template.key}/{template.lang}: "
             f"{missing_display}"
         )
+    if "days" in used and "duration_minutes" in variables:
+        duration_minutes = int(variables["duration_minutes"])
+        if duration_minutes % (24 * 60) != 0:
+            # Delivery must not fail after a buyer has paid merely because an
+            # operator-edited legacy template still uses {days}. Render the
+            # exact fraction and leave a durable warning for the operator.
+            session.add(
+                AuditLog(
+                    event_type="deprecated_days_template_rendered",
+                    metadata_={
+                        "template": f"{template.key}/{template.lang}",
+                        "duration_minutes": duration_minutes,
+                    },
+                )
+            )
     return template.content.format_map(variables)
 
 
@@ -174,15 +227,15 @@ def usage_template_variables(
     *,
     lang: str,
 ) -> dict[str, str]:
-    """Build legacy and exact usage variables for buyer-facing templates.
+    """Build compatible and exact agentic usage variables for templates.
 
     The window labels are derived solely from the observed ``window_seconds``.
     Thus a Free 30-day window is rendered as 30 days while a paid 7-day window
     is rendered as 7 days, without inferring either value from a plan name.
     """
     return {
-        "chat_5h": _legacy_percentage(limits, "chat_5h"),
-        "chat_weekly": _legacy_percentage(limits, "chat_weekly"),
+        "chat_5h": "—",
+        "chat_weekly": "—",
         "codex_5h": _legacy_percentage(limits, "codex_5h"),
         "codex_weekly": _legacy_percentage(limits, "codex_weekly"),
         "codex_primary_limit": _exact_percentage(
@@ -218,8 +271,8 @@ def issued_usage_template_variables(
     panel for this issuance or replacement.
     """
     return {
-        "chat_5h": _legacy_value(rental.issued_chat_5h_pct),
-        "chat_weekly": _legacy_value(rental.issued_chat_weekly_pct),
+        "chat_5h": "—",
+        "chat_weekly": "—",
         "codex_5h": _legacy_value(rental.issued_codex_5h_pct),
         "codex_weekly": _legacy_value(rental.issued_codex_weekly_pct),
         "codex_primary_limit": _exact_percentage(

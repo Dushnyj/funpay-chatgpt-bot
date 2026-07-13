@@ -21,14 +21,20 @@ async def test_create_subscription_tier(session):
 
 @pytest.mark.asyncio
 async def test_create_duration(session):
-    dur = Duration(days=7, is_enabled=True, sort_order=7)
+    dur = Duration(
+        minutes=7 * 24 * 60,
+        is_enabled=True,
+        sort_order=7 * 24 * 60,
+    )
     session.add(dur)
     await session.commit()
 
-    result = await session.execute(select(Duration).where(Duration.days == 7))
+    result = await session.execute(
+        select(Duration).where(Duration.minutes == 7 * 24 * 60)
+    )
     fetched = result.scalar_one()
     assert fetched.is_enabled is True
-    assert fetched.sort_order == 7
+    assert fetched.sort_order == 7 * 24 * 60
 
 
 @pytest.mark.asyncio

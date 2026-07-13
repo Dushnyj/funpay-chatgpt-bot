@@ -60,7 +60,7 @@ class TierUpdate(BaseModel):
 
 class DurationOut(_Base):
     id: int
-    days: int
+    minutes: int
     is_enabled: bool
     sort_order: int
 
@@ -68,7 +68,7 @@ class DurationOut(_Base):
 class DurationCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    days: int = Field(strict=True, ge=1, le=30)
+    minutes: int = Field(strict=True, ge=30, le=43_200, multiple_of=30)
     is_enabled: bool = True
 
 
@@ -161,6 +161,7 @@ class AccountOut(_Base):
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = None
     active_rentals_count: int = 0
+    replacement_reserved: bool = False
     status: str
     operator_status_override: str | None = None
     notes: str | None = None
@@ -181,13 +182,13 @@ class AccountCreate(BaseModel):
     email: str | None = Field(default=None, max_length=320)
     email_password: str | None = Field(default=None, max_length=4096)
     subscription_expires_at: datetime | None = None
-    max_active_rentals: int | None = Field(default=None, ge=1, le=100)
+    max_active_rentals: int | None = Field(default=None, ge=1, le=1)
     notes: str | None = Field(default=None, max_length=4000)
 
 
 class AccountUpdate(BaseModel):
     subscription_expires_at: datetime | None = None
-    max_active_rentals: int | None = Field(default=None, ge=1, le=100)
+    max_active_rentals: int | None = Field(default=None, ge=1, le=1)
     # A human operator may suspend an account, but cannot certify credentials.
     # Returning to active always goes through the recheck endpoint.
     status: Literal["maintenance", "disabled"] | None = None
@@ -229,8 +230,6 @@ class AccountCredentialsUpdate(BaseModel):
 
 class AccountLimitsOut(_Base):
     account_id: int
-    chat_5h_remaining_pct: int | None = None
-    chat_weekly_remaining_pct: int | None = None
     codex_5h_remaining_pct: int | None = None
     codex_weekly_remaining_pct: int | None = None
     codex_primary_remaining_pct: int | None = None
@@ -457,7 +456,7 @@ class RentalOut(_Base):
 
 
 class RentalPatch(BaseModel):
-    status: Literal["active", "expired", "refunded", "replaced"] | None = None
+    status: Literal["active", "expired", "refunded", "revoked"] | None = None
 
     @field_validator("status", mode="before")
     @classmethod
@@ -489,7 +488,7 @@ class SettingsUpdate(BaseModel):
     funpay_node_id: int | None = Field(default=None, gt=0)
     auto_bump_enabled: bool | None = None
     bump_interval_hours: int | None = Field(default=None, ge=1, le=168)
-    default_max_active_rentals: int | None = Field(default=None, ge=1, le=100)
+    default_max_active_rentals: int | None = Field(default=None, ge=1, le=1)
     funpay_commission_percent: int | None = Field(default=None, ge=0, le=100)
     check_interval_minutes: int | None = Field(default=None, ge=1, le=10_080)
     limits_check_interval_minutes: int | None = Field(default=None, ge=1, le=55)

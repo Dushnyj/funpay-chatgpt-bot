@@ -30,7 +30,7 @@ async def test_manual_status_patch_cannot_bypass_revocation_workflow(
     session: AsyncSession,
 ):
     tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="any", name="Any")
     session.add_all([tier, duration, scope])
     await session.flush()

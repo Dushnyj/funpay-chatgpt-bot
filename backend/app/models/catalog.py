@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Float, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, Float, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -22,9 +22,15 @@ class SubscriptionTier(Base):
 
 class Duration(Base):
     __tablename__ = "durations"
+    __table_args__ = (
+        CheckConstraint(
+            "minutes >= 30 AND minutes <= 43200 AND minutes % 30 = 0",
+            name="duration_minutes_range_step",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    days: Mapped[int] = mapped_column(unique=True)
+    minutes: Mapped[int] = mapped_column(unique=True)
     is_enabled: Mapped[bool] = mapped_column(default=True)
     sort_order: Mapped[int] = mapped_column(default=0)
 
@@ -33,7 +39,7 @@ class LimitScope(Base):
     __tablename__ = "limit_scopes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    code: Mapped[str] = mapped_column(unique=True)  # any | chat | codex
+    code: Mapped[str] = mapped_column(unique=True)  # any | codex
     name: Mapped[str] = mapped_column(unique=True)
     # Codes and names are stable system identifiers. Operators may only
     # control whether a scope participates in new offers and how it is shown.

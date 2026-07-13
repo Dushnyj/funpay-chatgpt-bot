@@ -26,7 +26,12 @@ import type {
   Tier,
   TierUpdate,
 } from '../types/api'
-import { compareDurationsByDays, durationUnit, validateDurationDays } from '../utils/catalogEditor'
+import {
+  compareDurationsByMinutes,
+  formatDurationMinutes,
+  validateDurationInput,
+  type DurationInputMode,
+} from '../utils/catalogEditor'
 import { compareOfferScopes, isSupportedOfferScopeCode } from '../utils/offerScopes'
 
 type CatalogTab = 'tiers' | 'durations' | 'scopes'
@@ -145,19 +150,19 @@ function DurationsTab() {
   if (query.isLoading) return <LoadingState label="Загружаем сроки аренды" />
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
 
-  const durations = [...(query.data ?? [])].sort(compareDurationsByDays)
+  const durations = [...(query.data ?? [])].sort(compareDurationsByMinutes)
 
   return (
     <section className="panel panel--flush">
-      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен и всегда показаны по возрастанию дней.</p></div><div className="catalog-toolbar-actions"><button type="button" className="button button--secondary" onClick={() => setCreateOpen(true)} title="Добавить пользовательский срок аренды"><Icon name="plus" size={16} />Добавить срок</button></div></div>
-      {durations.length === 0 ? <EmptyState icon="clock" title="Сроки не настроены" description="Добавьте первый период аренды от 1 до 30 дней." action={<button type="button" className="button button--primary" onClick={() => setCreateOpen(true)}><Icon name="plus" />Добавить срок</button>} /> : (
+      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Периоды задаются с шагом 30 минут и всегда показаны по возрастанию продолжительности.</p></div><div className="catalog-toolbar-actions"><button type="button" className="button button--secondary" onClick={() => setCreateOpen(true)} title="Добавить пользовательский срок аренды"><Icon name="plus" size={16} />Добавить срок</button></div></div>
+      {durations.length === 0 ? <EmptyState icon="clock" title="Сроки не настроены" description="Добавьте первый период аренды от 30 минут до 30 дней." action={<button type="button" className="button button--primary" onClick={() => setCreateOpen(true)}><Icon name="plus" />Добавить срок</button>} /> : (
         <div className="duration-grid">{durations.map((duration) => (
           <article className={`duration-card ${duration.is_enabled ? 'duration-card--active' : ''}`} key={duration.id}>
-            <span>{duration.days}</span>
-            <strong>{durationUnit(duration.days)}</strong>
+            <span title={`${duration.minutes} минут`}>{formatDurationMinutes(duration.minutes)}</span>
+            <strong>срок аренды</strong>
             <div className="catalog-card__footer">
               <StatusBadge value={duration.is_enabled ? 'active' : 'paused'} label={duration.is_enabled ? 'Включён' : 'Выключен'} />
-              <button type="button" className="catalog-card__edit" onClick={() => setEditing(duration)} aria-label={`Настроить срок ${duration.days} ${durationUnit(duration.days)}`} title="Настроить">
+              <button type="button" className="catalog-card__edit" onClick={() => setEditing(duration)} aria-label={`Настроить срок ${formatDurationMinutes(duration.minutes)}`} title="Настроить">
                 <Icon name="settings" size={15} /><span>Настроить</span>
               </button>
             </div>
@@ -181,7 +186,7 @@ function DurationSettingsDialog({ duration, onClose }: { duration: Duration; onC
   const [deleteError, setDeleteError] = useState('')
   const hasChanges = nextEnabled !== duration.is_enabled
   const busy = updateDuration.isPending || deleteDuration.isPending
-  const durationLabel = `${duration.days} ${durationUnit(duration.days)}`
+  const durationLabel = formatDurationMinutes(duration.minutes)
 
   const save = async (event: FormEvent) => {
     event.preventDefault()
@@ -230,7 +235,7 @@ function DurationSettingsDialog({ duration, onClose }: { duration: Duration; onC
     <ModalOverlay key="duration-settings" onClose={onClose} canClose={!busy}>
       <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-busy={busy} aria-labelledby="duration-settings-title" aria-describedby="duration-settings-description" onSubmit={save}>
         <div className="modal__header">
-          <div><span className="eyebrow">Настройка срока</span><h2 id="duration-settings-title">Срок {durationLabel}</h2><p id="duration-settings-description">Количество дней зафиксировано после создания. В списках сроки автоматически располагаются по возрастанию дней.</p></div>
+          <div><span className="eyebrow">Настройка срока</span><h2 id="duration-settings-title">Срок {durationLabel}</h2><p id="duration-settings-description">Продолжительность зафиксирована после создания. В списках сроки автоматически располагаются по возрастанию минут.</p></div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" title="Закрыть" disabled={busy}><Icon name="close" /></button>
         </div>
         {saveError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{saveError}</span></div>}
@@ -256,28 +261,36 @@ function DurationSettingsDialog({ duration, onClose }: { duration: Duration; onC
 
 function CreateDurationDialog({ durations, onClose }: { durations: Duration[]; onClose: () => void }) {
   const createDuration = useCreateDuration()
-  const [daysInput, setDaysInput] = useState('')
+  const [mode, setMode] = useState<DurationInputMode>('minutes')
+  const [amountInput, setAmountInput] = useState('30')
   const [enabled, setEnabled] = useState(true)
   const [attempted, setAttempted] = useState(false)
   const [serverError, setServerError] = useState('')
-  const daysValidation = validateDurationDays(daysInput, durations.map((duration) => duration.days))
-  const daysError = attempted && daysValidation.error
+  const durationValidation = validateDurationInput(mode, amountInput, durations.map((duration) => duration.minutes))
+  const durationError = attempted ? durationValidation.error : ''
+
+  const selectMode = (nextMode: DurationInputMode) => {
+    setMode(nextMode)
+    setAmountInput(nextMode === 'minutes' ? '30' : '1')
+    setAttempted(false)
+    setServerError('')
+  }
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     setAttempted(true)
     setServerError('')
-    if (daysValidation.days === null) return
+    if (durationValidation.minutes === null || durationValidation.error) return
     try {
       await createDuration.mutateAsync({
-        days: daysValidation.days,
+        minutes: durationValidation.minutes,
         is_enabled: enabled,
       })
       onClose()
     } catch (cause) {
       setServerError(cause instanceof ApiError
         ? cause.status === 409
-          ? `Срок ${daysValidation.days} ${durationUnit(daysValidation.days)} уже существует. Обновите список и выберите другое значение.`
+          ? `Срок «${formatDurationMinutes(durationValidation.minutes)}» уже существует. Обновите список и выберите другое значение.`
           : cause.message
         : 'Не удалось создать срок аренды')
     }
@@ -287,15 +300,31 @@ function CreateDurationDialog({ durations, onClose }: { durations: Duration[]; o
     <ModalOverlay onClose={onClose} canClose={!createDuration.isPending}>
       <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="create-duration-title" aria-describedby="create-duration-description" onSubmit={submit}>
         <div className="modal__header">
-          <div><span className="eyebrow">Справочник сроков</span><h2 id="create-duration-title">Новый срок аренды</h2><p id="create-duration-description">После создания количество дней изменить нельзя. Срок автоматически займёт место по возрастанию дней.</p></div>
+          <div><span className="eyebrow">Справочник сроков</span><h2 id="create-duration-title">Новый срок аренды</h2><p id="create-duration-description">Укажите срок в минутах, часах или днях. Значение сохраняется в минутах с шагом 30 минут.</p></div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" title="Закрыть" disabled={createDuration.isPending}><Icon name="close" /></button>
         </div>
         {serverError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{serverError}</span></div>}
-        <label className="field" htmlFor="create-duration-days">
-          <span className="field__label">Количество дней</span>
-          <input id="create-duration-days" data-autofocus type="number" min="1" max="30" step="1" inputMode="numeric" value={daysInput} onChange={(event) => { setDaysInput(event.target.value); setServerError('') }} onBlur={() => setAttempted(true)} disabled={createDuration.isPending} aria-invalid={Boolean(daysError)} aria-describedby="create-duration-days-hint" placeholder="Например, 8" />
-          <small id="create-duration-days-hint" className={`field__hint ${daysError ? 'text-danger' : ''}`}>{daysError || 'Целое уникальное значение от 1 до 30.'}</small>
+        <fieldset className="catalog-duration-mode">
+          <legend>Единица срока</legend>
+          <div role="radiogroup" aria-label="Единица срока аренды">
+            {([
+              ['minutes', 'Минуты'],
+              ['hours', 'Часы'],
+              ['days', 'Дни'],
+            ] as Array<[DurationInputMode, string]>).map(([value, label]) => (
+              <label key={value}>
+                <input data-autofocus={value === 'minutes' ? true : undefined} type="radio" name="duration-mode" value={value} checked={mode === value} onChange={() => selectMode(value)} disabled={createDuration.isPending} />
+                <span>{label}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <label className="field" htmlFor="create-duration-amount">
+          <span className="field__label">Количество {mode === 'minutes' ? 'минут' : mode === 'hours' ? 'часов' : 'дней'}</span>
+          <input id="create-duration-amount" type="number" min={mode === 'minutes' ? '30' : mode === 'hours' ? '0.5' : '1'} max={mode === 'minutes' ? '43200' : mode === 'hours' ? '720' : '30'} step={mode === 'minutes' ? '30' : mode === 'hours' ? '0.5' : '1'} inputMode="decimal" value={amountInput} onChange={(event) => { setAmountInput(event.target.value); setServerError('') }} onBlur={() => setAttempted(true)} disabled={createDuration.isPending} aria-invalid={Boolean(durationError)} aria-describedby="create-duration-amount-hint" />
+          <small id="create-duration-amount-hint" className={`field__hint ${durationError ? 'text-danger' : ''}`}>{durationError || (mode === 'minutes' ? 'От 30 до 43 200, шаг 30 минут.' : mode === 'hours' ? 'От 0,5 до 720, шаг 0,5 часа.' : 'Целое число от 1 до 30.')}</small>
         </label>
+        <div className="catalog-duration-summary" aria-live="polite"><span>Итоговый срок</span><strong>{durationValidation.minutes === null ? 'Укажите корректное значение' : formatDurationMinutes(durationValidation.minutes)}</strong></div>
         <div className="catalog-toggle-row catalog-create-toggle">
           <div><strong>Включить сразу</strong><small>Срок появится в создании цен и новых лотов.</small></div>
           <label className="switch-control">
@@ -320,18 +349,19 @@ function ScopesTab() {
   if (query.isLoading) return <LoadingState label="Загружаем типы лимитов" />
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
 
-  const scopes = [...(query.data ?? [])].sort(compareOfferScopes)
+  const scopes = [...(query.data ?? [])]
+    .filter((scope) => scope.code.toLowerCase() !== 'chat')
+    .sort(compareOfferScopes)
   const descriptions: Record<string, string> = {
     any: 'Без гарантии остатка конкретного лимита. Подходит для базовых предложений.',
-    chat: 'Недоступно для продажи с гарантией: OpenAI не публикует достоверный остаток сообщений ChatGPT.',
-    codex: 'Гарантированный остаток измеримых лимитов Codex в фактическом окне OpenAI.',
+    codex: 'Единый измеримый лимит Codex со всеми фактическими окнами OpenAI.',
   }
 
   return (
     <section className="panel panel--flush">
       <div className="section-toolbar"><div><h2>Типы лимитов</h2><p>Определяют, какие показатели учитываются при подборе аккаунта.</p></div></div>
       <div className="form-alert form-alert--info catalog-system-note"><Icon name="activity" /><span>Коды и названия типов лимитов системные: по ним работает подбор аккаунта. Здесь управляется только доступность, а пороговые проценты настраиваются в разделе «Цены».</span></div>
-      {scopes.length === 0 ? <EmptyState icon="activity" title="Типы лимитов не инициализированы" description="Ожидаются системные значения any, chat и codex." /> : (
+      {scopes.length === 0 ? <EmptyState icon="activity" title="Типы лимитов не инициализированы" description="Ожидаются системные значения any и codex." /> : (
         <div className="scope-grid">{scopes.map((scope) => {
           const code = scope.code.toLowerCase()
           const unavailable = !isSupportedOfferScopeCode(code)
@@ -339,11 +369,11 @@ function ScopesTab() {
             <article className={`scope-card ${unavailable ? 'scope-card--unavailable' : ''} ${scope.is_enabled ? '' : 'scope-card--disabled'}`} key={scope.id} data-state={scope.is_enabled ? 'enabled' : 'disabled'}>
               <div className="scope-card__main">
                 <div className="scope-card__icon"><Icon name={code === 'codex' ? 'templates' : unavailable ? 'activity' : 'catalog'} /></div>
-                <div className="scope-card__body"><span className="eyebrow">{code}</span><h3>{scope.name}</h3>{unavailable && <StatusBadge value="disabled" label={code === 'chat' ? 'Недоступно · не измеряется' : 'Недоступно · не поддерживается'} />}<p>{descriptions[code] ?? 'Неизвестный системный тип не используется в новых предложениях.'}</p></div>
+                <div className="scope-card__body"><span className="eyebrow">{code}</span><h3>{scope.name}</h3>{unavailable && <StatusBadge value="disabled" label="Недоступно · не поддерживается" />}<p>{descriptions[code] ?? 'Неизвестный системный тип не используется в новых предложениях.'}</p></div>
               </div>
               <div className="catalog-card__footer">
                 {unavailable ? (
-                  <span className="catalog-card__locked" title={code === 'chat' ? 'Chat нельзя включить: OpenAI не предоставляет измеримый остаток лимита' : 'Неизвестный системный тип не поддерживается'}><Icon name="shield" size={14} />Системное ограничение</span>
+                  <span className="catalog-card__locked" title="Неизвестный системный тип не поддерживается"><Icon name="shield" size={14} />Системное ограничение</span>
                 ) : (
                   <>
                     <StatusBadge value={scope.is_enabled ? 'active' : 'paused'} label={scope.is_enabled ? 'Включён' : 'Выключен'} />

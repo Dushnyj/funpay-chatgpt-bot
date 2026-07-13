@@ -12,7 +12,7 @@ from app.models.rental import Order, Rental
 @pytest.mark.asyncio
 async def test_rental_order_unique(session):
     tier = SubscriptionTier(name="Plus", is_active=True)
-    dur = Duration(days=7, is_enabled=True)
+    dur = Duration(minutes=7 * 24 * 60, is_enabled=True)
     scope = LimitScope(code="any", name="Любой")
     session.add_all([tier, dur, scope])
     await session.flush()
@@ -79,7 +79,7 @@ async def test_order_funpay_id_unique(session):
 @pytest.mark.asyncio
 async def test_rental_default_replacement_count(session):
     tier = SubscriptionTier(name="Plus", is_active=True)
-    dur = Duration(days=1, is_enabled=True)
+    dur = Duration(minutes=1 * 24 * 60, is_enabled=True)
     scope = LimitScope(code="any", name="Любой")
     session.add_all([tier, dur, scope])
     await session.flush()

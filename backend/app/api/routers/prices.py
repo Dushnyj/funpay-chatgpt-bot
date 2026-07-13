@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import PriceMatrixItem
+from app.models.catalog import LimitScope
 from app.models.lot import PriceMatrix
 from app.services.offer_configuration import (
     OfferConfigurationError,
@@ -27,7 +28,11 @@ class PriceUpdateRequest(BaseModel):
 
 @router.get("", response_model=list[PriceMatrixItem])
 async def list_prices(session: AsyncSession = Depends(get_db_session)):
-    result = await session.execute(select(PriceMatrix))
+    result = await session.execute(
+        select(PriceMatrix)
+        .join(LimitScope, LimitScope.id == PriceMatrix.limit_scope_id)
+        .where(LimitScope.code.in_(("any", "codex")))
+    )
     return [
         PriceMatrixItem(
             tier_id=pm.tier_id, duration_id=pm.duration_id, limit_scope_id=pm.limit_scope_id,
@@ -57,7 +62,16 @@ async def update_prices(
         )
     except OfferConfigurationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    await session.execute(delete(PriceMatrix))
+    canonical_scope_ids = select(LimitScope.id).where(
+        LimitScope.code.in_(("any", "codex"))
+    )
+    # Replace only the active canonical matrix. Disabled legacy tombstones are
+    # intentionally retained for historical recovery and never re-published.
+    await session.execute(
+        delete(PriceMatrix).where(
+            PriceMatrix.limit_scope_id.in_(canonical_scope_ids)
+        )
+    )
     for item in req.items:
         session.add(PriceMatrix(
             tier_id=item.tier_id, duration_id=item.duration_id,

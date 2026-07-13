@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -13,6 +13,8 @@ from app.api.auth import COOKIE_NAME, create_access_token
 from app.config import get_settings
 from app.main import app
 from app.models.account import Account, AccountCheckJob, EmailOAuthCredential
+from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.rental import Order, Rental
 from app.services.email_oauth import (
     EmailOAuthStateError,
     EmailOAuthStateManager,
@@ -50,6 +52,47 @@ async def _outlook_account(session: AsyncSession, email: str) -> Account:
     session.add(account)
     await session.commit()
     return account
+
+
+async def _occupy_account(session: AsyncSession, account: Account) -> Rental:
+    tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
+    duration = Duration(minutes=60, is_enabled=True, sort_order=60)
+    scope = LimitScope(code="any", name="Any")
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    account.tier_id = tier.id
+    account.status = "active"
+    order = Order(
+        funpay_order_id=f"oauth-order-{account.id}",
+        funpay_chat_id=f"oauth-chat-{account.id}",
+        buyer_funpay_id=f"oauth-buyer-{account.id}",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    rental = Rental(
+        order_id=order.id,
+        account_id=account.id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        buyer_funpay_chat_id=order.funpay_chat_id,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        lang="ru",
+        started_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        status="active",
+        credentials_delivery_status="sent",
+        credentials_delivery_template="welcome",
+        credentials_delivery_attempts=1,
+    )
+    session.add(rental)
+    await session.commit()
+    return rental
 
 
 async def test_state_is_pkce_bound_one_time_and_expires():
@@ -119,6 +162,24 @@ async def test_start_rejects_non_outlook_address(
     assert response.json()["detail"] == (
         "Account email must be a personal Outlook/Hotmail address"
     )
+
+
+async def test_start_rejects_mailbox_oauth_for_occupied_account(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+):
+    _configure_graph(monkeypatch)
+    account = await _outlook_account(session, "occupied@outlook.com")
+    await _occupy_account(session, account)
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/email-oauth/microsoft"
+    )
+
+    assert response.status_code == 409
+    await session.refresh(account)
+    assert account.status == "active"
 
 
 async def test_callback_verifies_identity_encrypts_refresh_and_exposes_status(
@@ -208,6 +269,56 @@ async def test_callback_verifies_identity_encrypts_refresh_and_exposes_status(
     assert token_form["client_secret"] == ["graph-client-secret"]
     assert token_form["code_verifier"][0]
     assert token_form["code"] == ["authorization-code"]
+
+
+async def test_callback_rechecks_occupancy_before_storing_mailbox_token(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+    httpx_mock,
+):
+    _configure_graph(monkeypatch)
+    account = await _outlook_account(session, "raced@outlook.com")
+    started = await auth_client.post(
+        f"/api/accounts/{account.id}/email-oauth/microsoft"
+    )
+    state = parse_qs(urlparse(started.json()["authorization_url"]).query)[
+        "state"
+    ][0]
+    await _occupy_account(session, account)
+    httpx_mock.add_response(
+        method="POST",
+        url="https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        json={
+            "access_token": "occupied-access-token",
+            "refresh_token": "occupied-refresh-token",
+            "scope": "openid offline_access User.Read Mail.Read",
+        },
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=re.compile(r"https://graph\.microsoft\.com/v1\.0/me.*"),
+        json={
+            "id": "occupied-subject",
+            "mail": "raced@outlook.com",
+            "userPrincipalName": "raced@outlook.com",
+        },
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as public:
+        callback = await public.post(
+            "/api/email-oauth/microsoft/callback",
+            data={"state": state, "code": "occupied-code"},
+        )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/accounts?email_oauth=failed&reason=account_in_use"
+    )
+    assert await session.get(EmailOAuthCredential, account.id) is None
+    await session.refresh(account)
+    assert account.status == "active"
 
     async with AsyncClient(transport=transport, base_url="http://test") as public:
         replay = await public.post(

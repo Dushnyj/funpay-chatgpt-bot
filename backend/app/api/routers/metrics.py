@@ -8,9 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import MetricsOut
-from app.models.account import Account, AccountLimits
+from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.catalog import SubscriptionTier
-from app.models.rental import Order, Rental
+from app.models.rental import OCCUPYING_RENTAL_STATUSES, Order, Rental
 from app.models.settings import SellerSettings
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"], dependencies=[Depends(get_current_user)])
@@ -43,20 +43,28 @@ async def get_metrics(request: Request, session: AsyncSession = Depends(get_db_s
 
     settings = await session.get(SellerSettings, 1)
     commission = settings.funpay_commission_percent if settings else 15
-    default_capacity = settings.default_max_active_rentals if settings else 1
     revenue_netto = int(revenue_brutto * (100 - commission) / 100)
 
     active_by_account = (
         select(Rental.account_id, func.count(Rental.id).label("active_count"))
-        .where(Rental.status == "active")
+        .where(Rental.status.in_(OCCUPYING_RENTAL_STATUSES))
         .group_by(Rental.account_id)
         .subquery()
     )
     active_count = func.coalesce(active_by_account.c.active_count, 0)
-    account_capacity = func.coalesce(Account.max_active_rentals, default_capacity)
+    # One account cannot isolate logout between multiple buyers.
+    account_capacity = 1
     free_capacity = case(
         (account_capacity > active_count, account_capacity - active_count),
         else_=0,
+    )
+    reserved_for_replacement = (
+        select(Rental.id)
+        .where(Rental.replacement_target_account_id == Account.id)
+        .exists()
+    )
+    active_checks = select(AccountCheckJob.account_id).where(
+        AccountCheckJob.status.in_(("pending", "running"))
     )
     available_accounts = (
         await session.execute(
@@ -73,6 +81,8 @@ async def get_metrics(request: Request, session: AsyncSession = Depends(get_db_s
                 AccountLimits.refresh_status == "ok",
                 AccountLimits.plan_window_status == "ok",
                 AccountLimits.measured_at >= now - timedelta(hours=1),
+                ~reserved_for_replacement,
+                Account.id.not_in(active_checks),
                 or_(
                     Account.subscription_expires_at > now,
                     (

@@ -126,7 +126,13 @@ async def reset_message_template(
 async def list_lot_templates(session: AsyncSession = Depends(get_db_session)):
     rows = (
         await session.execute(
-            select(LotTemplate).order_by(
+            select(LotTemplate)
+            .outerjoin(LimitScope, LimitScope.id == LotTemplate.limit_scope_id)
+            .where(
+                (LotTemplate.limit_scope_id.is_(None))
+                | (LimitScope.code.in_(("any", "codex")))
+            )
+            .order_by(
                 LotTemplate.system_managed.desc(),
                 LotTemplate.name,
                 LotTemplate.id,
@@ -350,6 +356,14 @@ async def _validate_lot_template_targets(
         raise HTTPException(status_code=422, detail="Unknown subscription tier")
     if (
         limit_scope_id is not None
-        and await session.get(LimitScope, limit_scope_id) is None
     ):
-        raise HTTPException(status_code=422, detail="Unknown limit scope")
+        scope = await session.get(LimitScope, limit_scope_id)
+        if (
+            scope is None
+            or scope.code not in {"any", "codex"}
+            or not scope.is_enabled
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Limit scope is disabled or unavailable",
+            )

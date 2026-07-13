@@ -2,6 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  classifyTemplateFields,
+  DEPRECATED_DURATION_TEMPLATE_FIELDS,
+  DEPRECATED_MESSAGE_TEMPLATE_FIELDS,
   extractTemplateFields,
   insertTemplateField,
   normalizeTemplateKey,
@@ -17,6 +20,24 @@ test('renders known samples and leaves unsupported placeholders visible', () => 
   assert.equal(
     renderTemplatePreview('{tier}: {limit}; {unknown}', { tier: 'Plus', limit: '79%' }),
     'Plus: 79%; {unknown}',
+  )
+})
+
+test('classifies supported legacy fields as deprecated instead of unknown', () => {
+  assert.deepEqual(
+    classifyTemplateFields(
+      ['chat_5h', 'chat_weekly', 'days', 'unknown'],
+      ['days'],
+      DEPRECATED_MESSAGE_TEMPLATE_FIELDS,
+    ),
+    {
+      deprecated: ['chat_5h', 'chat_weekly', 'days'],
+      unknown: ['unknown'],
+    },
+  )
+  assert.deepEqual(
+    classifyTemplateFields(['days', 'chat_5h'], [], DEPRECATED_DURATION_TEMPLATE_FIELDS),
+    { deprecated: ['days'], unknown: ['chat_5h'] },
   )
 })
 

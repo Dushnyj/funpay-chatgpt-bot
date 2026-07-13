@@ -94,7 +94,7 @@ async def delete_tier(tier_id: int, session: AsyncSession = Depends(get_db_sessi
 @router.get("/durations", response_model=list[DurationOut])
 async def list_durations(session: AsyncSession = Depends(get_db_session)):
     result = await session.execute(
-        select(Duration).order_by(Duration.days, Duration.id)
+        select(Duration).order_by(Duration.minutes, Duration.id)
     )
     return result.scalars().all()
 
@@ -105,11 +105,11 @@ async def create_duration(
     session: AsyncSession = Depends(get_db_session),
 ):
     duration = Duration(
-        days=req.days,
+        minutes=req.minutes,
         is_enabled=req.is_enabled,
         # Retained for database/API compatibility. Ordering is derived only
-        # from ``days`` and this mirror cannot be edited independently.
-        sort_order=req.days,
+        # from ``minutes`` and this mirror cannot be edited independently.
+        sort_order=req.minutes,
     )
     session.add(duration)
     try:
@@ -118,7 +118,7 @@ async def create_duration(
         await session.rollback()
         raise HTTPException(
             status_code=409,
-            detail="Duration with this number of days already exists",
+            detail="Duration with this number of minutes already exists",
         ) from exc
     await session.refresh(duration)
     return duration
@@ -160,7 +160,7 @@ async def update_durations_batch(
     if availability_changed:
         await _reconcile_lots(request, "Durations saved")
     result = await session.execute(
-        select(Duration).order_by(Duration.days, Duration.id)
+        select(Duration).order_by(Duration.minutes, Duration.id)
     )
     return result.scalars().all()
 
@@ -206,7 +206,7 @@ async def delete_duration(
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Duration {duration.days} days is still referenced by "
+                f"Duration {duration.minutes} minutes is still referenced by "
                 f"{references}; disable it instead or remove those references first"
             ),
         )
@@ -231,12 +231,13 @@ async def delete_duration(
 async def list_limit_scopes(session: AsyncSession = Depends(get_db_session)):
     canonical_order = case(
         (LimitScope.code == "any", 10),
-        (LimitScope.code == "chat", 20),
-        (LimitScope.code == "codex", 30),
+        (LimitScope.code == "codex", 20),
         else_=100,
     )
     result = await session.execute(
-        select(LimitScope).order_by(canonical_order, LimitScope.code, LimitScope.id)
+        select(LimitScope)
+        .where(LimitScope.code.in_(("any", "codex")))
+        .order_by(canonical_order, LimitScope.code, LimitScope.id)
     )
     return result.scalars().all()
 
@@ -249,7 +250,7 @@ async def update_limit_scope(
     session: AsyncSession = Depends(get_db_session),
 ):
     scope = await session.get(LimitScope, scope_id)
-    if scope is None:
+    if scope is None or scope.code not in {"any", "codex"}:
         raise HTTPException(status_code=404, detail="Limit scope not found")
     changes = req.model_dump(exclude_unset=True)
     if (

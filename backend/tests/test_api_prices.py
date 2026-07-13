@@ -1,11 +1,13 @@
 import pytest
 from unittest.mock import AsyncMock
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
+from app.models.lot import PriceMatrix
 
 
 @pytest.fixture
@@ -20,7 +22,7 @@ async def auth_client():
 async def test_update_and_get_prices(auth_client: AsyncClient, session: AsyncSession):
     tier = SubscriptionTier(name="Plus", is_active=True, is_sellable=True)
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope = LimitScope(code="any", name="Любой")
     session.add(scope)
@@ -44,7 +46,7 @@ async def test_price_update_triggers_immediate_lot_reconciliation(
     auth_client: AsyncClient, session: AsyncSession,
 ):
     tier = SubscriptionTier(name="Plus", is_active=True, is_sellable=True)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="any", name="Любой")
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -70,7 +72,7 @@ async def test_price_matrix_can_be_cleared(
     auth_client: AsyncClient, session: AsyncSession,
 ):
     tier = SubscriptionTier(name="Plus", is_active=True, is_sellable=True)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="any", name="Любой")
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -95,7 +97,7 @@ async def test_guaranteed_scope_requires_minimum_and_rejects_legacy_ceilings(
     auth_client: AsyncClient, session: AsyncSession,
 ):
     tier = SubscriptionTier(name="Plus", is_active=True, is_sellable=True)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="codex", name="Codex")
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -129,7 +131,7 @@ async def test_chat_guarantee_is_rejected_when_openai_does_not_publish_usage(
     auth_client: AsyncClient, session: AsyncSession,
 ):
     tier = SubscriptionTier(name="Plus", is_active=True, is_sellable=True)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="chat", name="ChatGPT")
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -145,7 +147,7 @@ async def test_chat_guarantee_is_rejected_when_openai_does_not_publish_usage(
     })
 
     assert response.status_code == 422
-    assert "ChatGPT limits are unavailable" in response.json()["detail"]
+    assert "limit scope is disabled or invalid" in response.json()["detail"]
 
 
 async def test_free_price_rejects_nonexistent_five_hour_ceiling(
@@ -154,7 +156,7 @@ async def test_free_price_rejects_nonexistent_five_hour_ceiling(
     tier = SubscriptionTier(
         code="free", name="Free", is_active=True, is_sellable=True,
     )
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="any", name="Любой")
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -187,7 +189,7 @@ async def test_full_matrix_save_preserves_temporarily_disabled_catalog_rows(
         is_sellable=catalog_state != "tier",
     )
     duration = Duration(
-        days=7,
+        minutes=7 * 24 * 60,
         is_enabled=catalog_state != "duration",
         sort_order=10,
     )
@@ -223,7 +225,7 @@ async def test_full_matrix_save_preserves_disabled_supported_scope(
         is_active=True,
         is_sellable=True,
     )
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(
         code=scope_code,
         name=scope_code.title(),
@@ -247,3 +249,59 @@ async def test_full_matrix_save_preserves_disabled_supported_scope(
     listed = (await auth_client.get("/api/prices")).json()
     assert len(listed) == 1
     assert listed[0]["limit_scope_id"] == scope.id
+
+
+async def test_full_matrix_save_preserves_hidden_legacy_scope_tombstone(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier = SubscriptionTier(
+        code="plus",
+        name="Plus",
+        is_active=True,
+        is_sellable=True,
+    )
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
+    canonical_scope = LimitScope(code="any", name="Любой")
+    legacy_scope = LimitScope(
+        code="chat",
+        name="ChatGPT",
+        is_enabled=False,
+    )
+    session.add_all([tier, duration, canonical_scope, legacy_scope])
+    await session.flush()
+    legacy_price = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=legacy_scope.id,
+        price=499,
+    )
+    session.add(legacy_price)
+    await session.commit()
+
+    response = await auth_client.put("/api/prices", json={
+        "items": [{
+            "tier_id": tier.id,
+            "duration_id": duration.id,
+            "limit_scope_id": canonical_scope.id,
+            "price": 599,
+        }],
+    })
+
+    assert response.status_code == 200
+    rows = (await session.execute(select(PriceMatrix))).scalars().all()
+    assert {(row.limit_scope_id, row.price) for row in rows} == {
+        (legacy_scope.id, 499),
+        (canonical_scope.id, 599),
+    }
+    # Legacy compatibility data stays recoverable in the database, but the
+    # active editor/API must never advertise the unsupported Chat guarantee.
+    assert (await auth_client.get("/api/prices")).json() == [{
+        "tier_id": tier.id,
+        "duration_id": duration.id,
+        "limit_scope_id": canonical_scope.id,
+        "min_limit_pct": None,
+        "max_5h_pct": None,
+        "max_weekly_pct": None,
+        "price": 599,
+    }]

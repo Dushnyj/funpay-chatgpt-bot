@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 
@@ -17,6 +19,16 @@ from app.services.kick_service import KickResult, KickService
 
 
 logger = logging.getLogger(__name__)
+
+_REFUND_REVOKE_LEASE = timedelta(minutes=5)
+
+
+@dataclass(frozen=True, slots=True)
+class _RefundRevokeClaim:
+    order_id: int
+    rental_id: int
+    account_id: int
+    started_at: datetime
 
 
 class LotNotFoundError(Exception):
@@ -94,58 +106,195 @@ class OrderProcessor:
         session: AsyncSession,
         order_id: str,
     ) -> Order:
-        order = await self._get_order_or_raise(session, order_id, for_update=True)
-        rental_result = await session.execute(
-            select(Rental).where(
-                Rental.order_id == order.id,
-                Rental.status.in_(["active", "expiry_pending"]),
-            ).with_for_update()
-        )
-        rental = rental_result.scalar_one_or_none()
-        if rental is None:
-            order.status = "refunded"
-            await session.flush()
+        order, claim = await self._claim_refund_revoke(session, order_id)
+        if claim is None:
             return order
 
-        # Remove the account from allocation immediately.  The final refund
-        # state is written only after logout-all succeeds.
-        account = await session.get(Account, rental.account_id)
+        # The durable claim and maintenance state were committed above.  No
+        # database row lock is held while browser/email network I/O runs.
+        try:
+            kick = await self._kick.kick(session, claim.account_id)
+        except Exception as exc:
+            await session.rollback()
+            kick = KickResult(success=False, error=str(exc))
+        else:
+            # KickService may read or refresh mailbox credentials through this
+            # session. Close that transaction before taking final row locks.
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+
+        return await self._finalize_refund_revoke(
+            session,
+            order_id=order_id,
+            claim=claim,
+            kick=kick,
+        )
+
+    async def _claim_refund_revoke(
+        self,
+        session: AsyncSession,
+        order_id: str,
+    ) -> tuple[Order, _RefundRevokeClaim | None]:
+        """Short Order -> Rental -> Account claim committed before kick I/O."""
+
+        order = await self._get_order_or_raise(
+            session, order_id, for_update=True,
+        )
+        if order.status == "refunded":
+            await session.commit()
+            return order, None
+
+        rental = (
+            await session.execute(
+                select(Rental)
+                .where(Rental.order_id == order.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if rental is None:
+            order.status = "refunded"
+            await session.commit()
+            return order, None
+        if rental.status not in {"active", "expiry_pending"}:
+            # A payment provider may report the refund after normal expiry or
+            # failed-delivery revocation. The session is already closed, so no
+            # second browser kick is needed; keep order/rental history
+            # monotonic and consistent for the admin panel.
+            previous_status = rental.status
+            order.status = "refunded"
+            rental.status = "refunded"
+            rental.replacement_target_account_id = None
+            rental.expiry_revoke_started_at = None
+            session.add(AuditLog(
+                event_type="late_refund_terminal_rental",
+                account_id=rental.account_id,
+                order_id=order.id,
+                rental_id=rental.id,
+                metadata_={"previous_status": previous_status},
+            ))
+            await session.commit()
+            return order, None
+
+        account = (
+            await session.execute(
+                select(Account)
+                .where(Account.id == rental.account_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        order.status = "refund_pending"
         if account is not None:
             account.status = "maintenance"
-        order.status = "refund_pending"
-        try:
-            kick = await self._kick.kick(session, rental.account_id)
-        except Exception as exc:
-            kick = KickResult(success=False, error=str(exc))
-        session.add(AuditLog(
-            event_type="refund_account_kick",
-            account_id=rental.account_id,
+
+        now = datetime.now(timezone.utc)
+        existing_claim = rental.expiry_revoke_started_at
+        if existing_claim is not None and existing_claim.tzinfo is None:
+            existing_claim = existing_claim.replace(tzinfo=timezone.utc)
+        if (
+            existing_claim is not None
+            and existing_claim > now - _REFUND_REVOKE_LEASE
+        ):
+            # Another refund/expiry worker owns the account-wide logout.  The
+            # pending state is durable and the scheduler will retry after that
+            # owner finalizes or its lease becomes stale.
+            await session.commit()
+            return order, None
+
+        # A crashed replacement may have left a stale promised target. The
+        # refund worker already owns Order -> Rental here, so it can safely
+        # release that old reservation before taking over the common lease.
+        rental.replacement_target_account_id = None
+        rental.expiry_revoke_started_at = now
+        claim = _RefundRevokeClaim(
             order_id=order.id,
             rental_id=rental.id,
-            chat_id=rental.buyer_funpay_chat_id,
+            account_id=rental.account_id,
+            started_at=now,
+        )
+        await session.commit()
+        return order, claim
+
+    async def _finalize_refund_revoke(
+        self,
+        session: AsyncSession,
+        *,
+        order_id: str,
+        claim: _RefundRevokeClaim,
+        kick: KickResult,
+    ) -> Order:
+        """Finalize only the exact durable claim after reacquiring row locks."""
+
+        order = await self._get_order_or_raise(
+            session, order_id, for_update=True,
+        )
+        rental = (
+            await session.execute(
+                select(Rental)
+                .where(Rental.id == claim.rental_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        stored_claim = rental.expiry_revoke_started_at if rental else None
+        if stored_claim is not None and stored_claim.tzinfo is None:
+            stored_claim = stored_claim.replace(tzinfo=timezone.utc)
+        claim_started_at = claim.started_at
+        if claim_started_at.tzinfo is None:
+            claim_started_at = claim_started_at.replace(tzinfo=timezone.utc)
+        owns_claim = stored_claim == claim_started_at
+        state_matches = bool(
+            owns_claim
+            and rental is not None
+            and rental.order_id == claim.order_id == order.id
+            and rental.account_id == claim.account_id
+            and rental.status in {"active", "expiry_pending"}
+            and order.status == "refund_pending"
+        )
+
+        session.add(AuditLog(
+            event_type="refund_account_kick",
+            account_id=claim.account_id,
+            order_id=order.id,
+            rental_id=rental.id if rental is not None else None,
+            chat_id=(rental.buyer_funpay_chat_id if rental is not None else None),
             metadata_={
                 "success": kick.success,
                 "deduplicated": kick.deduplicated,
                 "error": kick.error,
+                "claim_owned": owns_claim,
+                "state_matched": state_matches,
             },
         ))
-        if kick.success:
+        if owns_claim and rental is not None:
+            rental.expiry_revoke_started_at = None
+
+        if kick.success and state_matches:
             rental.status = "refunded"
             order.status = "refunded"
             await self._jobs.enqueue(
                 session,
-                account_id=rental.account_id,
+                account_id=claim.account_id,
                 priority="refresh_recover",
                 job_type="refresh_recover",
             )
-        else:
+        elif not kick.success:
             logger.warning(
                 "Refund %s remains pending: account %s revoke failed: %s",
                 order_id,
-                rental.account_id,
+                claim.account_id,
                 kick.error,
             )
-        await session.flush()
+        elif not state_matches:
+            logger.warning(
+                "Refund %s revoke completed after its claim/state changed; "
+                "leaving the current state untouched",
+                order_id,
+            )
+        await session.commit()
         return order
 
     async def _find_order(self, session: AsyncSession, order_id: str) -> Order | None:
@@ -166,6 +315,7 @@ class OrderProcessor:
                 select(Order)
                 .where(Order.funpay_order_id == order_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
             order = result.scalar_one_or_none()
         else:

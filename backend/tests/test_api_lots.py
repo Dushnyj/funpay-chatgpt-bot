@@ -45,7 +45,7 @@ async def auth_client():
 async def _seed_catalog(session: AsyncSession):
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope = LimitScope(code="any", name="Любой")
     session.add(scope)
@@ -134,7 +134,7 @@ async def test_create_manual_lot_rejects_disabled_limit_scope(
         ("tier_unsellable", "tariff is unavailable"),
         ("duration", "duration is disabled"),
         ("scope", "limit scope is disabled"),
-        ("chat", "guaranteed ChatGPT limits are unavailable"),
+        ("chat", "limit scope is disabled or invalid"),
         ("unknown_scope", "limit scope is disabled or invalid"),
     ],
 )

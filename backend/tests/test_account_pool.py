@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.account import Account, AccountLimits
+from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.rental import Rental, Order
 from app.services.account_pool import AccountPool, AccountCriteria
@@ -15,7 +15,7 @@ async def _seed_tier_ds(session: AsyncSession):
         code="plus", name="Plus", is_active=True, is_sellable=True,
     )
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope_any = LimitScope(code="any", name="Любой")
     session.add(scope_any)
@@ -53,8 +53,6 @@ async def _add_account(
     limits = AccountLimits(
         account_id=acc.id,
         refresh_token_encrypted="enc",
-        chat_5h_remaining_pct=chat_5h,
-        chat_weekly_remaining_pct=chat_weekly,
         codex_5h_remaining_pct=codex_5h,
         codex_weekly_remaining_pct=codex_weekly,
         measured_at=datetime.now(timezone.utc),
@@ -76,7 +74,7 @@ async def test_acquire_returns_account_matching_basic_criteria(session: AsyncSes
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=duration.days, scope="any",
+        tier_id=tier.id, duration_minutes=duration.minutes, scope="any",
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
@@ -92,11 +90,83 @@ async def test_acquire_returns_none_when_no_active_accounts(session: AsyncSessio
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=duration.days, scope="any",
+        tier_id=tier.id, duration_minutes=duration.minutes, scope="any",
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
     assert result is None
+
+
+@pytest.mark.parametrize("job_status", ["pending", "running"])
+async def test_acquire_excludes_account_with_active_validation_job(
+    session: AsyncSession,
+    job_status: str,
+):
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    job = AccountCheckJob(
+        account_id=account.id,
+        priority="limit_check",
+        job_type="limit_check",
+        status=job_status,
+        started_at=(
+            datetime.now(timezone.utc) if job_status == "running" else None
+        ),
+    )
+    session.add(job)
+    await session.flush()
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=duration.minutes,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    assert await AccountPool().acquire(session, criteria, 1) is None
+    job.status = "done"
+    await session.flush()
+    assert await AccountPool().acquire(session, criteria, 1) is not None
+
+
+async def test_acquire_fresh_recheck_skips_conflicted_candidate(
+    session: AsyncSession,
+    monkeypatch,
+):
+    """A post-lock conflict must retry instead of returning the stale row."""
+
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    first = await _add_account(session, tier, login="first")
+    second = await _add_account(session, tier, login="second")
+    deadline = datetime.now(timezone.utc) + timedelta(days=30)
+    first.subscription_expires_at = deadline
+    second.subscription_expires_at = deadline + timedelta(days=1)
+    await session.flush()
+    checked: list[int] = []
+
+    async def fresh_conflict(_session: AsyncSession, account_id: int) -> bool:
+        checked.append(account_id)
+        return account_id == first.id
+
+    monkeypatch.setattr(
+        "app.services.account_pool._has_fresh_allocation_conflict",
+        fresh_conflict,
+    )
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=duration.minutes,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    result = await AccountPool().acquire(session, criteria, 1)
+
+    assert result is not None
+    assert result.id == second.id
+    assert checked == [first.id, second.id]
 
 
 async def test_acquire_filters_out_expired_subscription(session: AsyncSession):
@@ -105,7 +175,7 @@ async def test_acquire_filters_out_expired_subscription(session: AsyncSession):
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=7, scope="any",
+        tier_id=tier.id, duration_minutes=7 * 24 * 60, scope="any",
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
@@ -127,7 +197,7 @@ async def test_operator_override_blocks_late_validation_status_race(
         session,
         AccountCriteria(
             tier_id=tier.id,
-            duration_days=duration.days,
+            duration_minutes=duration.minutes,
             scope="any",
             min_limit_pct=None,
             max_5h_pct=None,
@@ -147,7 +217,7 @@ async def test_acquire_allows_verified_free_plan_without_billing_expiry(
     account = await _add_account(session, tier, expires_in_days=None)
     criteria = AccountCriteria(
         tier_id=tier.id,
-        duration_days=duration.days,
+        duration_minutes=duration.minutes,
         scope="any",
         min_limit_pct=None,
         max_5h_pct=None,
@@ -167,7 +237,7 @@ async def test_acquire_filters_out_refresh_expired(session: AsyncSession):
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=7, scope="any",
+        tier_id=tier.id, duration_minutes=7 * 24 * 60, scope="any",
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
@@ -176,12 +246,12 @@ async def test_acquire_filters_out_refresh_expired(session: AsyncSession):
 
 async def test_acquire_scope_any_with_max_5h_threshold(session: AsyncSession):
     tier, duration, scope_any = await _seed_tier_ds(session)
-    await _add_account(session, tier, chat_5h=80, codex_5h=80)
-    acc2 = await _add_account(session, tier, login="acc2", chat_5h=20, codex_5h=25)
+    await _add_account(session, tier, codex_5h=80)
+    acc2 = await _add_account(session, tier, login="acc2", codex_5h=25)
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=7, scope="any",
+        tier_id=tier.id, duration_minutes=7 * 24 * 60, scope="any",
         min_limit_pct=None, max_5h_pct=30, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
@@ -202,7 +272,7 @@ async def test_acquire_scope_codex_with_min_limit(session: AsyncSession):
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=7, scope="codex",
+        tier_id=tier.id, duration_minutes=7 * 24 * 60, scope="codex",
         min_limit_pct=50, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
@@ -225,7 +295,7 @@ async def test_acquire_scope_codex_accepts_exact_primary_when_secondary_absent(
         session,
         AccountCriteria(
             tier_id=tier.id,
-            duration_days=duration.days,
+            duration_minutes=duration.minutes,
             scope="codex",
             min_limit_pct=90,
             max_5h_pct=None,
@@ -237,7 +307,11 @@ async def test_acquire_scope_codex_accepts_exact_primary_when_secondary_absent(
     assert result is not None and result.id == account.id
 
 
-async def test_acquire_respects_max_active_rentals(session: AsyncSession):
+@pytest.mark.parametrize("rental_status", ["active", "expiry_pending"])
+async def test_acquire_respects_occupying_rentals(
+    session: AsyncSession,
+    rental_status: str,
+):
     tier, duration, scope_any = await _seed_tier_ds(session)
     acc = await _add_account(session, tier, max_active_rentals=1)
 
@@ -254,17 +328,69 @@ async def test_acquire_respects_max_active_rentals(session: AsyncSession):
         tier_id=tier.id, duration_id=duration.id, limit_scope_id=scope_any.id,
         lang="ru", started_at=datetime.now(timezone.utc),
         expires_at=datetime.now(timezone.utc) + timedelta(days=7),
-        status="active",
+        status=rental_status,
     )
     session.add(rental)
     await session.flush()
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=7, scope="any",
+        tier_id=tier.id, duration_minutes=7 * 24 * 60, scope="any",
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
-    result = await pool.acquire(session, criteria, default_max_active_rentals=1)
+    result = await pool.acquire(session, criteria, default_max_active_rentals=99)
+    assert result is None
+
+
+async def test_acquire_excludes_durable_replacement_target(
+    session: AsyncSession,
+):
+    tier, duration, scope_any = await _seed_tier_ds(session)
+    old_account = await _add_account(session, tier, login="old-account")
+    reserved_target = await _add_account(
+        session, tier, login="reserved-target",
+    )
+    order = Order(
+        funpay_order_id="replacement-reservation",
+        funpay_chat_id="1",
+        buyer_funpay_id="1",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope_any.id,
+        price=100,
+        status="pending",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(Rental(
+        order_id=order.id,
+        account_id=old_account.id,
+        replacement_target_account_id=reserved_target.id,
+        buyer_funpay_id="1",
+        buyer_funpay_chat_id="1",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope_any.id,
+        lang="ru",
+        started_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+        status="active",
+    ))
+    await session.flush()
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_minutes=duration.minutes,
+            scope="any",
+            min_limit_pct=None,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
     assert result is None
 
 
@@ -275,12 +401,78 @@ async def test_acquire_fifo_orders_by_subscription_expires_asc(session: AsyncSes
 
     pool = AccountPool()
     criteria = AccountCriteria(
-        tier_id=tier.id, duration_days=7, scope="any",
+        tier_id=tier.id, duration_minutes=7 * 24 * 60, scope="any",
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=5)
     assert result is not None
     assert result.id == acc2.id
+
+
+async def test_short_rental_reserves_delivery_subscription_headroom(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    duration.minutes = 30
+    account = await _add_account(session, tier)
+    account.subscription_expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=60
+    )
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=30,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    assert await AccountPool().acquire(session, criteria, 1) is None
+    account.subscription_expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=72
+    )
+    assert await AccountPool().acquire(session, criteria, 1) is not None
+
+
+async def test_short_rental_requires_limits_fresher_than_half_its_term(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    duration.minutes = 30
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=30,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    limits.measured_at = datetime.now(timezone.utc) - timedelta(minutes=16)
+    assert await AccountPool().acquire(session, criteria, 1) is None
+    limits.measured_at = datetime.now(timezone.utc) - timedelta(minutes=14)
+    assert await AccountPool().acquire(session, criteria, 1) is not None
+
+
+async def test_replacement_uses_original_remaining_deadline_not_full_term(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier, expires_in_days=1)
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=duration.minutes,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+        required_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+    )
+
+    selected = await AccountPool().acquire(session, criteria, 1)
+    assert selected is not None and selected.id == account.id
 
 
 async def test_postgresql_query_uses_portable_case_and_skip_locked():
@@ -298,7 +490,7 @@ async def test_postgresql_query_uses_portable_case_and_skip_locked():
     session = _CaptureSession()
     criteria = AccountCriteria(
         tier_id=1,
-        duration_days=7,
+        duration_minutes=7 * 24 * 60,
         scope="chat",
         min_limit_pct=50,
         max_5h_pct=None,
@@ -322,7 +514,7 @@ async def test_acquire_excluding_does_not_mutate_excluded_account(session: Async
     candidate = await _add_account(session, tier, login="candidate")
     criteria = AccountCriteria(
         tier_id=tier.id,
-        duration_days=duration.days,
+        duration_minutes=duration.minutes,
         scope="any",
         min_limit_pct=None,
         max_5h_pct=None,
@@ -354,7 +546,7 @@ async def test_acquire_honours_operator_tier_switch(
         session,
         AccountCriteria(
             tier_id=tier.id,
-            duration_days=duration.days,
+            duration_minutes=duration.minutes,
             scope="any",
             min_limit_pct=None,
             max_5h_pct=None,
@@ -380,7 +572,7 @@ async def test_acquire_rejects_unverified_plan_window(
         session,
         AccountCriteria(
             tier_id=tier.id,
-            duration_days=duration.days,
+            duration_minutes=duration.minutes,
             scope="any",
             min_limit_pct=None,
             max_5h_pct=None,
@@ -408,7 +600,7 @@ async def test_any_ceilings_use_free_long_window_not_primary_position(
 
     criteria = AccountCriteria(
         tier_id=tier.id,
-        duration_days=duration.days,
+        duration_minutes=duration.minutes,
         scope="any",
         min_limit_pct=None,
         max_5h_pct=30,
@@ -439,12 +631,10 @@ async def test_any_ceilings_use_paid_five_hour_and_seven_day_semantics(
     limits.expected_long_window_seconds = 7 * 24 * 60 * 60
     # ChatGPT allowance is deliberately unknown in production and must not
     # contaminate an exact Codex-window semantics test.
-    limits.chat_5h_remaining_pct = None
-    limits.chat_weekly_remaining_pct = None
 
     allowed = AccountCriteria(
         tier_id=tier.id,
-        duration_days=duration.days,
+        duration_minutes=duration.minutes,
         scope="any",
         min_limit_pct=None,
         max_5h_pct=30,

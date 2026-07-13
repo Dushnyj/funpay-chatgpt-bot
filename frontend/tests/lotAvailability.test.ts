@@ -26,7 +26,7 @@ test('lot availability reports every disabled catalog component', () => {
   })
 })
 
-test('missing references and Chat scope fail closed', () => {
+test('missing references and removed legacy scope fail closed', () => {
   assert.deepEqual(getLotCatalogAvailability(lot, [], [], []), {
     available: false,
     reasons: [
@@ -40,7 +40,7 @@ test('missing references and Chat scope fail closed', () => {
     [{ id: 1, is_active: true, is_sellable: true }],
     [{ id: 2, is_enabled: true }],
     [{ id: 3, code: 'chat', is_enabled: true }],
-  ).reasons, ['лимит Chat недоступен'])
+  ).reasons, ['устаревший тип лимита недоступен'])
 })
 
 test('unknown enabled legacy scope is not available for sale', () => {

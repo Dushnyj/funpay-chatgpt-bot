@@ -6,10 +6,10 @@ import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Duration, LimitScope, Lot, LotCreate, Tier } from '../types/api'
-import { compareDurationsByDays } from '../utils/catalogEditor'
+import { compareDurationsByMinutes, formatDurationMinutes } from '../utils/catalogEditor'
 import { formatCurrency } from '../utils/format'
 import { getLotCatalogAvailability } from '../utils/lotAvailability'
-import { compareOfferScopes, isAvailableOfferScope } from '../utils/offerScopes'
+import { compareOfferScopes, isAvailableOfferScope, offerScopeDisplayCode } from '../utils/offerScopes'
 
 export default function Lots() {
   const lotsQuery = useLots()
@@ -50,7 +50,10 @@ export default function Lots() {
   }
 
   const tierName = (id: number) => tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
-  const durationDays = (id: number) => durations.find((duration) => duration.id === id)?.days
+  const durationLabel = (id: number) => {
+    const duration = durations.find((candidate) => candidate.id === id)
+    return duration ? formatDurationMinutes(duration.minutes) : 'неизвестный срок'
+  }
   const active = lots.filter((lot) => lot.status === 'active').length
   const unavailableCatalogLots = lots.filter(
     (lot) => !getLotCatalogAvailability(lot, tiers, durations, scopes).available,
@@ -168,10 +171,13 @@ export default function Lots() {
               <tbody>{filteredLots.map((lot) => {
                 const scopeItem = scopes.find((candidate) => candidate.id === lot.limit_scope_id)
                 const scope = scopeItem?.code.toLowerCase() ?? 'unknown'
+                const scopeLabel = offerScopeDisplayCode(scopeItem)
                 const availability = getLotCatalogAvailability(lot, tiers, durations, scopes)
                 const threshold = scope === 'any'
                   ? 'Без гарантии остатка лимита'
-                  : `${scope.toUpperCase()}: остаток в наблюдаемом окне ≥ ${lot.min_limit_pct ?? '—'}%`
+                  : scope === 'codex'
+                    ? `Codex: остаток в наблюдаемом окне ≥ ${lot.min_limit_pct ?? '—'}%`
+                    : 'Устаревшее условие недоступно'
                 const canToggle = lot.status === 'active' || (lot.status === 'paused' && availability.available)
                 const activationBlockReason = availability.reasons.join('; ')
                 const availabilityDescriptionId = `lot-${lot.id}-availability`
@@ -183,7 +189,7 @@ export default function Lots() {
                 return (
                   <tr key={lot.id}>
                     <td><div className="lot-title-cell"><strong>{lot.title_ru}</strong><small>{lot.auto_created ? 'Автоматический лот' : 'Ручной лот'} · ID {lot.id}</small></div></td>
-                    <td><strong>{tierName(lot.tier_id)}</strong><small className="table-subline">{durationDays(lot.duration_id) ?? '?'} дн. · {scope.toUpperCase()}</small>{!availability.available && <small id={availabilityDescriptionId} className="table-subline text-warning">{availability.reasons.join(' · ')}</small>}</td>
+                    <td><strong>{tierName(lot.tier_id)}</strong><small className="table-subline">{durationLabel(lot.duration_id)} · {scopeLabel}</small>{!availability.available && <small id={availabilityDescriptionId} className="table-subline text-warning">{availability.reasons.join(' · ')}</small>}</td>
                     <td>{threshold}</td>
                     <td className="table-number">{formatCurrency(lot.price)}</td>
                     <td>{lot.funpay_id ? <span className="mono-chip">#{lot.funpay_id}</span> : <span className="muted">Не опубликован</span>}</td>
@@ -220,7 +226,7 @@ function ManualLotDialog({
 }) {
   const createLot = useCreateLot()
   const availableTiers = tiers.filter((tier) => tier.is_active && tier.is_sellable !== false)
-  const availableDurations = durations.filter((duration) => duration.is_enabled).sort(compareDurationsByDays)
+  const availableDurations = durations.filter((duration) => duration.is_enabled).sort(compareDurationsByMinutes)
   const availableScopes = scopes
     .filter(isAvailableOfferScope)
     .sort(compareOfferScopes)
@@ -284,10 +290,10 @@ function ManualLotDialog({
         <div className="modal__header"><div><span className="eyebrow">Ручная витрина</span><h2 id="manual-lot-title">Новый лот</h2><p>Лот сохранится отдельно от автоматической матрицы цен.</p></div><button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button></div>
         <form className="form-stack" onSubmit={submit}>
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
-          <div className="form-alert form-alert--info"><Icon name="activity" /><span>Гарантию CHAT создать нельзя: OpenAI не отдаёт достоверный остаток сообщений ChatGPT. Для обычного доступа используйте ANY, для измеримой гарантии — CODEX.</span></div>
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>ANY выдаёт доступ без обещания остатка. CODEX гарантирует минимальный остаток единого измеримого лимита по фактическим окнам OpenAI.</span></div>
           <div className="form-grid form-grid--3">
             <label className="field"><span className="field__label">Тариф</span><select data-autofocus value={form.tierId} onChange={(event) => setForm((current) => ({ ...current, tierId: event.target.value }))} required disabled={availableTiers.length === 0}>{availableTiers.length === 0 && <option value="">Нет тарифов, разрешённых к продаже</option>}{availableTiers.map((tier) => <option key={tier.id} value={tier.id}>{tier.name}</option>)}</select></label>
-            <label className="field"><span className="field__label">Срок</span><select value={form.durationId} onChange={(event) => setForm((current) => ({ ...current, durationId: event.target.value }))} required disabled={availableDurations.length === 0}>{availableDurations.length === 0 && <option value="">Нет включённых сроков</option>}{availableDurations.map((duration) => <option key={duration.id} value={duration.id}>{duration.days} дн.</option>)}</select></label>
+            <label className="field"><span className="field__label">Срок</span><select value={form.durationId} onChange={(event) => setForm((current) => ({ ...current, durationId: event.target.value }))} required disabled={availableDurations.length === 0}>{availableDurations.length === 0 && <option value="">Нет включённых сроков</option>}{availableDurations.map((duration) => <option key={duration.id} value={duration.id}>{formatDurationMinutes(duration.minutes)}</option>)}</select></label>
             <label className="field"><span className="field__label">Условие лимита</span><select value={form.scopeId} onChange={(event) => setForm((current) => ({ ...current, scopeId: event.target.value }))} required disabled={availableScopes.length === 0}>{availableScopes.length === 0 && <option value="">Нет включённых типов лимита</option>}{availableScopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}</select></label>
           </div>
           <div className="form-grid form-grid--3">

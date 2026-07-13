@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.audit import AuditLog
-from app.models.catalog import SubscriptionTier
+from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
 from app.refresh_worker import RefreshRecoveryWorker
 from app.services.account_validation import (
@@ -57,6 +58,76 @@ async def test_process_next_returns_false_when_no_jobs(session: AsyncSession):
     worker = RefreshRecoveryWorker(check_delay_seconds=0)
     result = await worker.process_next(session)
     assert result is False
+
+
+async def test_pending_job_waits_while_account_is_replacement_target(
+    session: AsyncSession,
+):
+    target, job = await _add_account_with_job(session)
+    tier = await session.get(SubscriptionTier, target.tier_id)
+    duration = Duration(minutes=60, is_enabled=True, sort_order=10)
+    scope = LimitScope(code="any", name="Any")
+    old_account = Account(
+        login="old-account@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        tier_id=tier.id,
+        status="maintenance",
+    )
+    session.add_all([duration, scope, old_account])
+    await session.flush()
+    now = datetime.now(timezone.utc)
+    order = Order(
+        funpay_order_id="worker-reservation-order",
+        funpay_chat_id="worker-reservation-chat",
+        buyer_funpay_id="worker-reservation-buyer",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    rental = Rental(
+        order_id=order.id,
+        account_id=old_account.id,
+        replacement_target_account_id=target.id,
+        buyer_funpay_id="worker-reservation-buyer",
+        buyer_funpay_chat_id="worker-reservation-chat",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        lang="ru",
+        started_at=now,
+        expires_at=now + timedelta(hours=1),
+        status="active",
+        expiry_revoke_started_at=now,
+        credentials_delivery_status="sent",
+        credentials_delivery_template="welcome",
+        credentials_delivery_attempts=1,
+    )
+    session.add(rental)
+    await session.commit()
+    worker = RefreshRecoveryWorker(check_delay_seconds=0)
+
+    with patch(
+        "app.refresh_worker.validate_account", new_callable=AsyncMock,
+    ) as validate:
+        assert await worker.process_next(session) is False
+        validate.assert_not_awaited()
+    await session.refresh(job)
+    assert job.status == "pending"
+
+    rental.replacement_target_account_id = None
+    rental.expiry_revoke_started_at = None
+    await session.commit()
+    with patch(
+        "app.refresh_worker.validate_account",
+        new=AsyncMock(return_value=ValidationOutcome.OK),
+    ) as validate:
+        assert await worker.process_next(session) is True
+        validate.assert_awaited_once_with(session, target.id)
 
 
 async def test_process_next_marks_failed_on_validation_error(session: AsyncSession):

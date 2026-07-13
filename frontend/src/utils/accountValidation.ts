@@ -41,24 +41,13 @@ export interface CompactUsageWindow {
   resetsAt: string | null
 }
 
-export interface CompactAccountUsage {
-  chat: CompactUsageWindow[]
-  codex: CompactUsageWindow[]
-}
-
 /**
- * Возвращает только фактически опубликованные лимиты. Для Codex точные окна
+ * Возвращает единый измеримый лимит Codex. Точные provider-окна
  * primary/secondary имеют приоритет над legacy-полями 5h/weekly, чтобы UI не
- * подписывал 30-дневное окно Free как недельное.
+ * подписывал 30-дневное окно Free как недельное и не смешивал Codex с Chat.
  */
-export function compactAccountUsage(limits: AccountLimits | null | undefined): CompactAccountUsage {
-  if (!limits) return { chat: [], codex: [] }
-
-  const chat = [
-    usageWindow('chat-5h', 5 * 3_600, limits.chat_5h_remaining_pct, null),
-    usageWindow('chat-7d', 7 * 86_400, limits.chat_weekly_remaining_pct, null),
-  ].filter(isUsageWindow)
-
+export function compactCodexUsage(limits: AccountLimits | null | undefined): CompactUsageWindow[] {
+  if (!limits) return []
   const exactCodex = [
     usageWindow(
       'codex-primary',
@@ -81,13 +70,22 @@ export function compactAccountUsage(limits: AccountLimits | null | undefined): C
         usageWindow('codex-7d', 7 * 86_400, limits.codex_weekly_remaining_pct, null),
       ].filter(isUsageWindow)
 
-  return { chat, codex }
+  return codex.sort((left, right) => left.windowSeconds - right.windowSeconds || left.key.localeCompare(right.key))
 }
 
 export function formatUsageWindow(seconds: number) {
   if (seconds % 86_400 === 0) {
     const days = seconds / 86_400
-    return `${days} ${days === 1 ? 'день' : days >= 2 && days <= 4 ? 'дня' : 'дней'}`
+    const lastTwo = Math.abs(days) % 100
+    const last = lastTwo % 10
+    const unit = lastTwo >= 11 && lastTwo <= 14
+      ? 'дней'
+      : last === 1
+        ? 'день'
+        : last >= 2 && last <= 4
+          ? 'дня'
+          : 'дней'
+    return `${days} ${unit}`
   }
   if (seconds % 3_600 === 0) return `${seconds / 3_600} ч`
   if (seconds % 60 === 0) return `${seconds / 60} мин`
@@ -96,14 +94,11 @@ export function formatUsageWindow(seconds: number) {
 
 export function rentalCapacityLabel(
   activeRentals: number | null | undefined,
-  accountMaximum: number | null | undefined,
-  defaultMaximum: number | null | undefined,
 ) {
   const used = Number.isInteger(activeRentals) && (activeRentals ?? -1) >= 0
     ? activeRentals
     : null
-  const maximum = accountMaximum ?? defaultMaximum ?? null
-  return `${used ?? '—'} / ${maximum ?? '—'}`
+  return `${used ?? '—'} / 1`
 }
 
 function usageWindow(

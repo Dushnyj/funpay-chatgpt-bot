@@ -16,7 +16,7 @@ from app.services.lot_sync import (
 async def _make_lot(session: AsyncSession) -> Lot:
     tier = SubscriptionTier(name="Plus", is_active=True)
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope = LimitScope(code="any", name="Любой")
     session.add(scope)

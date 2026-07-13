@@ -1,6 +1,14 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -9,6 +17,12 @@ from app.types.encrypted import FernetEncrypted
 
 class Account(Base):
     __tablename__ = "accounts"
+    __table_args__ = (
+        CheckConstraint(
+            "max_active_rentals IS NULL OR max_active_rentals = 1",
+            name="single_active_rental",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     login: Mapped[str] = mapped_column(unique=True)
@@ -53,8 +67,6 @@ class AccountLimits(Base):
     access_token_encrypted: Mapped[str | None] = mapped_column(FernetEncrypted, default=None)
     access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     account_id_openai: Mapped[str | None] = mapped_column(default=None)
-    chat_5h_remaining_pct: Mapped[int | None] = mapped_column(default=None)
-    chat_weekly_remaining_pct: Mapped[int | None] = mapped_column(default=None)
     codex_5h_remaining_pct: Mapped[int | None] = mapped_column(default=None)
     codex_weekly_remaining_pct: Mapped[int | None] = mapped_column(default=None)
     # Exact window observations from /wham/usage. The legacy 5h/weekly columns

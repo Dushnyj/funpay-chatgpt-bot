@@ -6,7 +6,7 @@ import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpCode, TotpExport } from '../types/api'
-import { compactAccountUsage, formatUsageWindow, isValidationInProgress, rentalCapacityLabel, validationState } from '../utils/accountValidation'
+import { compactCodexUsage, formatUsageWindow, isValidationInProgress, rentalCapacityLabel, validationState } from '../utils/accountValidation'
 import { formatDateTime } from '../utils/format'
 
 export default function Accounts() {
@@ -230,39 +230,38 @@ export default function Accounts() {
         ) : (
           <TableShell>
             <table className="data-table accounts-table accounts-table--operator">
-              <thead><tr><th>Аккаунт</th><th>План</th><th>Лимиты Chat / Codex</th><th>Подписка</th><th>Аренды</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
+              <thead><tr><th>Аккаунт</th><th>План</th><th>Лимит Codex</th><th>Подписка</th><th>Аренды</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
               <tbody>
                 {filteredAccounts.map((account) => {
                   const activeRentals = account.active_rentals_count
-                  const maximumRentals = account.max_active_rentals ?? settingsQuery.data?.default_max_active_rentals
+                  const accountOccupied = (activeRentals ?? 0) > 0 || account.replacement_reserved
                   const totpHint = 'Получить текущий одноразовый код или открыть setup key'
-                  const hasActiveRentals = activeRentals != null && activeRentals > 0
                   return (
                     <tr key={account.id}>
                     <td data-label="Аккаунт">
                       <strong className="account-login" title={account.login}>{account.login}</strong>
                     </td>
                     <td data-label="План"><span className={`soft-badge account-plan ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName(account.tier_id)}</span></td>
-                    <td data-label="Лимиты Chat / Codex"><CompactLimits account={account} /></td>
+                    <td data-label="Лимит Codex"><CompactLimits account={account} /></td>
                     <td data-label="Подписка"><span className="account-subscription">{isFreePlan(account, tiers) ? 'Без срока' : formatDateTime(account.subscription_expires_at)}</span></td>
-                    <td data-label="Аренды"><span className="rental-capacity" title={activeRentals == null ? 'Фактическое число аренд ещё не загружено' : `${activeRentals} активных аренд из ${maximumRentals ?? 'неизвестного максимума'}`}>{rentalCapacityLabel(activeRentals, account.max_active_rentals, settingsQuery.data?.default_max_active_rentals)}</span></td>
+                    <td data-label="Аренды"><span className="rental-capacity" title={activeRentals == null ? 'Фактическое число аренд ещё не загружено; безопасный максимум — 1' : `Фактически продано: ${activeRentals}; безопасный максимум: 1`}>{rentalCapacityLabel(activeRentals)}</span></td>
                     <td data-label="Проверка"><ValidationStatus account={account} /></td>
                     <td data-label="Действия">
                       <div className="row-actions account-actions">
                         {isDeviceAuthEligible(account) && (
-                          <button type="button" className="icon-button account-icon-action account-icon-action--primary" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Войти в ${account.login} через браузер`} title="Ручная проверка через браузер">
+                          <button type="button" className="icon-button account-icon-action account-icon-action--primary" onClick={() => startDeviceAuth(account)} disabled={accountOccupied || deviceAuthTarget === account.id} aria-label={`Войти в ${account.login} через браузер`} title={accountOccupied ? 'Нельзя запускать вход, пока аккаунт занят арендой или заменой' : 'Ручная проверка через браузер'}>
                             {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}
                           </button>
                         )}
                         {isOutlookAccount(account) && (
                           <span className="action-help" title={graphConfigured ? undefined : 'Microsoft Graph не настроен на сервере'} tabIndex={graphConfigured ? undefined : 0} aria-label={graphConfigured ? undefined : 'Почта OAuth недоступна: Microsoft Graph не настроен'}>
-                            <button type="button" className={`icon-button account-icon-action ${account.email_oauth_connected ? 'account-icon-action--success' : 'account-icon-action--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook для ${account.login} через OAuth`} title={graphConfigured ? `${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook через OAuth` : 'Почта OAuth недоступна: Microsoft Graph не настроен'}>
+                            <button type="button" className={`icon-button account-icon-action ${account.email_oauth_connected ? 'account-icon-action--success' : 'account-icon-action--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || accountOccupied || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook для ${account.login} через OAuth`} title={!graphConfigured ? 'Почта OAuth недоступна: Microsoft Graph не настроен' : accountOccupied ? 'Нельзя менять OAuth почты во время активной аренды' : `${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook через OAuth`}>
                               {emailOAuthTarget === account.id ? <span className={`spinner ${account.email_oauth_connected ? '' : 'spinner--light'}`} /> : <Icon name={account.email_oauth_connected ? 'check' : 'shield'} size={15} />}
                             </button>
                           </span>
                         )}
                         {!isValidationInProgress(account) && (
-                          <button type="button" className="icon-button account-icon-action" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Повторить автоматическую проверку">
+                          <button type="button" className="icon-button account-icon-action" onClick={() => recheck(account)} disabled={accountOccupied || recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title={accountOccupied ? 'Нельзя перезапускать проверку во время активной аренды' : 'Повторить автоматическую проверку'}>
                             {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
                           </button>
                         )}
@@ -271,14 +270,16 @@ export default function Accounts() {
                             {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" size={15} />}
                           </button>
                         </span>
-                        <button type="button" className="icon-button account-icon-action" onClick={() => setCredentialTarget(account)} aria-label={`Изменить данные входа ${account.login}`} title="Изменить логин, пароль, TOTP и почту">
-                          <Icon name="eye" size={15} />
-                        </button>
+                        <span className="action-help" title={accountOccupied ? 'Нельзя менять данные входа, пока аккаунт занят арендой или заменой' : undefined} tabIndex={accountOccupied ? 0 : undefined}>
+                          <button type="button" className="icon-button account-icon-action" onClick={() => setCredentialTarget(account)} disabled={accountOccupied} aria-label={`Изменить данные входа ${account.login}`} title={accountOccupied ? 'Данные входа защищены на время аренды или замены' : 'Изменить логин, пароль, TOTP и почту'}>
+                            <Icon name="eye" size={15} />
+                          </button>
+                        </span>
                         <button type="button" className="icon-button account-icon-action" onClick={() => setEditTarget(account)} aria-label={`Изменить параметры ${account.login}`} title="Изменить срок подписки, ёмкость и статус">
                           <Icon name="settings" size={15} />
                         </button>
-                        <span className="action-help" title={hasActiveRentals ? 'Сначала завершите активные аренды' : undefined} tabIndex={hasActiveRentals ? 0 : undefined} aria-label={hasActiveRentals ? `Удаление ${account.login} недоступно: есть активные аренды` : undefined}>
-                          <button type="button" className="icon-button account-icon-action account-icon-action--danger" onClick={() => setDeleteTarget(account)} disabled={hasActiveRentals} aria-label={`Удалить ${account.login}`} title={hasActiveRentals ? 'Удаление недоступно: есть активные аренды' : 'Удалить аккаунт'}>
+                        <span className="action-help" title={accountOccupied ? 'Сначала завершите аренду или замену' : undefined} tabIndex={accountOccupied ? 0 : undefined} aria-label={accountOccupied ? `Удаление ${account.login} недоступно: аккаунт занят арендой или заменой` : undefined}>
+                          <button type="button" className="icon-button account-icon-action account-icon-action--danger" onClick={() => setDeleteTarget(account)} disabled={accountOccupied} aria-label={`Удалить ${account.login}`} title={accountOccupied ? 'Удаление недоступно: аккаунт занят арендой или заменой' : 'Удалить аккаунт'}>
                             <Icon name="trash" size={15} />
                           </button>
                         </span>
@@ -334,14 +335,13 @@ function normalizeVerificationUrl(value: string) {
 
 function CompactLimits({ account }: { account: Account }) {
   const limits = account.limits
-  const usage = compactAccountUsage(limits)
+  const windows = compactCodexUsage(limits)
   const stale = areLimitsStale(limits)
   const windowStatus = limits?.plan_window_status ?? 'unknown'
 
   return (
     <div className={`compact-limits ${stale ? 'compact-limits--stale' : ''}`}>
-      <CompactLimitGroup product="Chat" windows={usage.chat} />
-      <CompactLimitGroup product="Codex" windows={usage.codex} />
+      <CompactLimitGroup windows={windows} />
       {windowStatus === 'mismatch' && <small className="compact-limits__alert compact-limits__alert--danger" title="Аккаунт исключён из автоматической выдачи">Окно тарифа не совпало</small>}
       {windowStatus === 'unknown' && <small className="compact-limits__alert" title="До свежего замера аккаунт не должен участвовать в автоматической выдаче">Окно не проверено</small>}
       {stale && <small className="compact-limits__alert" title={limits?.measured_at ? `Последний замер: ${formatDateTime(limits.measured_at)}` : 'Свежего замера ещё нет'}>Лимиты устарели</small>}
@@ -349,19 +349,16 @@ function CompactLimits({ account }: { account: Account }) {
   )
 }
 
-function CompactLimitGroup({ product, windows }: { product: 'Chat' | 'Codex'; windows: ReturnType<typeof compactAccountUsage>['chat'] }) {
+function CompactLimitGroup({ windows }: { windows: ReturnType<typeof compactCodexUsage> }) {
   return (
     <div className="compact-limit-group">
-      <strong>{product}</strong>
       <span>
         {windows.length === 0
           ? <small>—</small>
-          : windows.map((window) => (
-              <small key={window.key}>
-                {formatUsageWindow(window.windowSeconds)} — {window.remainingPct}%
-                {window.resetsAt ? ` · сброс ${formatCompactDateTime(window.resetsAt)}` : ''}
-              </small>
-            ))}
+          : windows.map((window) => {
+              const label = `${formatUsageWindow(window.windowSeconds)} — ${window.remainingPct}%${window.resetsAt ? ` · сброс ${formatCompactDateTime(window.resetsAt)}` : ''}`
+              return <small key={window.key} title={label}>{label}</small>
+            })}
       </span>
     </div>
   )
@@ -587,9 +584,10 @@ function RepairCredentialsDialog({ account, onClose, onSaved }: { account: Accou
 function EditAccountDialog({ account, onClose, onSaved }: { account: Account; onClose: () => void; onSaved: () => void }) {
   const updateAccount = useUpdateAccount()
   const [error, setError] = useState('')
+  const accountOccupied = (account.active_rentals_count ?? 0) > 0 || account.replacement_reserved
   const [form, setForm] = useState({
     expiresAt: toDateTimeLocal(account.subscription_expires_at),
-    maxRentals: account.max_active_rentals == null ? '' : String(account.max_active_rentals),
+    maxRentals: account.max_active_rentals == null ? '' : '1',
     operatorStatus: (account.operator_status_override ?? '') as '' | 'maintenance' | 'disabled',
     notes: account.notes ?? '',
   })
@@ -598,8 +596,8 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
     event.preventDefault()
     setError('')
     const maxRentals = form.maxRentals === '' ? null : Number(form.maxRentals)
-    if (maxRentals !== null && (!Number.isInteger(maxRentals) || maxRentals < 1 || maxRentals > 100)) {
-      setError('Лимит одновременных аренд должен быть от 1 до 100 или пустым для системного значения.')
+    if (maxRentals !== null && maxRentals !== 1) {
+      setError('Безопасный лимит — только 1 активная аренда на аккаунт или системное значение.')
       return
     }
     const expiresAt = form.expiresAt ? new Date(form.expiresAt) : null
@@ -609,12 +607,14 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
     }
 
     try {
-      const safeStatus = form.operatorStatus
+      const safeStatus = accountOccupied ? '' : form.operatorStatus
       await updateAccount.mutateAsync({
         id: account.id,
-        subscription_expires_at: expiresAt?.toISOString() ?? null,
-        max_active_rentals: maxRentals,
-        ...(safeStatus ? { status: safeStatus } : {}),
+        ...(!accountOccupied ? {
+          subscription_expires_at: expiresAt?.toISOString() ?? null,
+          max_active_rentals: maxRentals,
+          ...(safeStatus ? { status: safeStatus } : {}),
+        } : {}),
         notes: form.notes.trim() || null,
       })
       onSaved()
@@ -630,10 +630,11 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
         <form className="form-stack" onSubmit={submit}>
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
           <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для платного тарифа дата окончания служит проверенным fallback, если OpenAI не вернул её сам. Для Free оставьте поле пустым.</span></div>
+          {accountOccupied && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Аккаунт занят арендой или зарезервирован для замены. До освобождения можно сохранить только заметку; дата подписки, ёмкость и приостановка защищены.</span></div>}
           <label className="field"><span className="field__label">Подписка активна до</span><input data-autofocus type="datetime-local" value={form.expiresAt} onChange={(event) => setForm((current) => ({ ...current, expiresAt: event.target.value }))} /><span className="field__hint">Пустое значение означает, что ручной fallback не задан.</span></label>
           <div className="form-grid">
-            <label className="field"><span className="field__label">Одновременных аренд</span><input type="number" min="1" max="100" value={form.maxRentals} onChange={(event) => setForm((current) => ({ ...current, maxRentals: event.target.value }))} placeholder="По умолчанию" /></label>
-            <label className="field"><span className="field__label">Ручная приостановка</span><select value={form.operatorStatus} onChange={(event) => setForm((current) => ({ ...current, operatorStatus: event.target.value as '' | 'maintenance' | 'disabled' }))}><option value="">Не менять текущий статус</option><option value="maintenance">Перевести на обслуживание</option><option value="disabled">Отключить аккаунт</option></select><span className="field__hint">Сейчас: {accountStatusLabel(account.status)}. Возврат в работу выполняется только повторной проверкой аккаунта.</span></label>
+            <label className="field"><span className="field__label">Лимит активных аренд</span><select value={form.maxRentals} disabled={accountOccupied} onChange={(event) => setForm((current) => ({ ...current, maxRentals: event.target.value }))}><option value="">Системный лимит — 1</option><option value="1">Явный лимит — 1</option></select><span className="field__hint">Аккаунт нельзя одновременно выдать нескольким покупателям: завершение аренды закрывает его общую сессию.</span></label>
+            <label className="field"><span className="field__label">Ручная приостановка</span><select value={form.operatorStatus} disabled={accountOccupied} onChange={(event) => setForm((current) => ({ ...current, operatorStatus: event.target.value as '' | 'maintenance' | 'disabled' }))}><option value="">Не менять текущий статус</option><option value="maintenance">Перевести на обслуживание</option><option value="disabled">Отключить аккаунт</option></select><span className="field__hint">{accountOccupied ? 'Недоступно, пока аккаунт занят арендой или заменой.' : `Сейчас: ${accountStatusLabel(account.status)}. Возврат в работу выполняется только повторной проверкой аккаунта.`}</span></label>
           </div>
           <label className="field"><span className="field__label">Заметка оператора</span><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} maxLength={4000} placeholder="Причина ручной даты, обслуживание или другой контекст" /></label>
           <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={updateAccount.isPending}>{updateAccount.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <><Icon name="check" />Сохранить</>}</button></div>

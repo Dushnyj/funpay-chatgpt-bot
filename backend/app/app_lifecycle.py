@@ -14,7 +14,7 @@ from app.integrations.funpay.types import SaleStatus
 from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.lot import Lot
-from app.models.rental import Order, Rental
+from app.models.rental import OCCUPYING_RENTAL_STATUSES, Order, Rental
 from app.models.settings import SellerSettings
 from app.scheduler import ScheduledTask, Scheduler
 from app.services.bump import BumpService
@@ -28,6 +28,7 @@ from app.services.rental_service import (
     CREDENTIAL_DELIVERY_MAX_ATTEMPTS,
     RentalService,
 )
+from app.services.delivery_policy import CREDENTIAL_DELIVERY_POLL_SECONDS
 from app.services.rental_expiry import RentalExpiryService
 
 logger = logging.getLogger(__name__)
@@ -83,8 +84,10 @@ class AppLifecycle:
         self._lot_interval_seconds = 10 * 60
         self._bump_interval_seconds = 4 * 60 * 60
         self._refresh_interval_seconds = 60
-        self._pending_order_interval_seconds = 60
+        self._pending_order_interval_seconds = CREDENTIAL_DELIVERY_POLL_SECONDS
         self._refresh_concurrency = 3
+        self._revoke_concurrency = 4
+        self._revoke_semaphore = asyncio.Semaphore(self._revoke_concurrency)
         self._refresh_max_attempts = 3
         self._refresh_retry_delay_seconds = 5 * 60
         self._expiry = RentalExpiryService()
@@ -287,9 +290,60 @@ class AppLifecycle:
 
     async def _task_expire_overdue(self) -> None:
         """Помечать истёкшие аренды как expired."""
+        gateway = self._gateway
         async with async_session_factory() as session:
-            await self._expiry.expire_overdue(session, self._gateway)
+            candidates = await self._expiry.prepare_overdue_batch(session)
             await session.commit()
+
+        async def expire_one(candidate: tuple[int, int]) -> None:
+            rental_id, order_id = candidate
+            async with self._revoke_semaphore:
+                try:
+                    # AsyncSession is stateful and not concurrency-safe. Every
+                    # claim/revoke/finalize pipeline owns a dedicated session.
+                    async with async_session_factory() as session:
+                        await self._expiry.expire_candidate(
+                            session,
+                            gateway,
+                            rental_id=rental_id,
+                            order_id=order_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Rental %s expiry revoke failed", rental_id,
+                    )
+
+        await asyncio.gather(*(expire_one(item) for item in candidates))
+
+        if gateway is None:
+            return
+        async with async_session_factory() as session:
+            notification_candidates = (
+                await self._expiry.pending_notification_candidates(session)
+            )
+            await session.commit()
+
+        notification_semaphore = asyncio.Semaphore(self._revoke_concurrency)
+
+        async def notify_one(candidate: tuple[int, int]) -> None:
+            rental_id, order_id = candidate
+            async with notification_semaphore:
+                try:
+                    async with async_session_factory() as session:
+                        await self._expiry.notify_expiration_candidate(
+                            session,
+                            gateway,
+                            rental_id=rental_id,
+                            order_id=order_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Rental %s expiry notification failed", rental_id,
+                    )
+
+        await asyncio.gather(
+            *(notify_one(item) for item in notification_candidates)
+        )
 
     async def _task_limits_check(self) -> None:
         """Замер лимитов для аккаунтов с устаревшим measured_at."""
@@ -297,14 +351,25 @@ class AppLifecycle:
             cutoff = datetime.now(timezone.utc) - timedelta(
                 seconds=self._limits_interval_seconds,
             )
+            reserved_targets = select(
+                Rental.replacement_target_account_id
+            ).where(Rental.replacement_target_account_id.is_not(None))
+            occupied_accounts = select(Rental.account_id).where(
+                Rental.status.in_(OCCUPYING_RENTAL_STATUSES)
+            )
             result = await session.execute(
-                select(AccountLimits).where(
+                select(AccountLimits)
+                .join(Account, Account.id == AccountLimits.account_id)
+                .where(
                     AccountLimits.refresh_status == "ok",
+                    AccountLimits.account_id.not_in(reserved_targets),
+                    AccountLimits.account_id.not_in(occupied_accounts),
                     or_(
                         AccountLimits.measured_at.is_(None),
                         AccountLimits.measured_at < cutoff,
                     ),
                 )
+                .with_for_update(of=Account, skip_locked=True)
             )
             for limits in result.scalars().all():
                 await self._jobs.enqueue(
@@ -321,15 +386,24 @@ class AppLifecycle:
             cutoff = datetime.now(timezone.utc) - timedelta(
                 seconds=self._validation_interval_seconds,
             )
+            reserved_targets = select(
+                Rental.replacement_target_account_id
+            ).where(Rental.replacement_target_account_id.is_not(None))
+            occupied_accounts = select(Rental.account_id).where(
+                Rental.status.in_(OCCUPYING_RENTAL_STATUSES)
+            )
             result = await session.execute(
                 select(Account.id).where(
                     Account.status == "active",
                     Account.operator_status_override.is_(None),
+                    Account.id.not_in(reserved_targets),
+                    Account.id.not_in(occupied_accounts),
                     or_(
                         Account.chatgpt_last_check_at.is_(None),
                         Account.chatgpt_last_check_at <= cutoff,
                     ),
                 )
+                .with_for_update(of=Account, skip_locked=True)
             )
             for account_id in result.scalars().all():
                 await self._jobs.enqueue(
@@ -662,9 +736,26 @@ class AppLifecycle:
             result = await session.execute(
                 select(Order.funpay_order_id).where(Order.status == "refund_pending")
             )
-            for order_id in result.scalars().all():
-                await self._refunds.process_sale_refunded(session, order_id)
+            order_ids = list(result.scalars().all())
             await session.commit()
+
+        async def revoke_one(order_id: str) -> None:
+            async with self._revoke_semaphore:
+                try:
+                    # OrderProcessor commits its durable claim before Kick I/O
+                    # and finalizes it in this same independently-owned
+                    # session. A slow account cannot hold the rest of the
+                    # refund queue behind it.
+                    async with async_session_factory() as session:
+                        await self._refunds.process_sale_refunded(
+                            session, order_id,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Refund %s revoke retry failed", order_id,
+                    )
+
+        await asyncio.gather(*(revoke_one(order_id) for order_id in order_ids))
 
     async def retry_rental_delivery(self, rental_id: int) -> None:
         """Explicit operator retry after resolving a manual delivery failure."""
@@ -674,11 +765,13 @@ class AppLifecycle:
             if gateway is None:
                 raise FunPayUnavailableError("FunPay is not connected")
             async with async_session_factory() as session:
+                # Snapshot only: never hold a row lock across remote FunPay
+                # I/O. The authoritative mutation below uses the global
+                # Order -> Rental lock order shared with refund/delivery.
                 rental = (
                     await session.execute(
                         select(Rental)
                         .where(Rental.id == rental_id)
-                        .with_for_update()
                     )
                 ).scalar_one_or_none()
                 if rental is None:
@@ -698,13 +791,6 @@ class AppLifecycle:
                     ):
                         raise ValueError("Credential delivery is already running")
 
-                previous_attempts = rental.credentials_delivery_attempts
-                previous_error = rental.credentials_delivery_last_error
-                rental.credentials_delivery_status = "failed"
-                rental.credentials_delivery_attempts = 0
-                rental.credentials_delivery_started_at = None
-                rental.credentials_delivery_next_attempt_at = None
-                rental.credentials_delivery_last_error = None
                 order = await session.get(Order, rental.order_id)
                 if order is None or order.status not in {"pending", "completed"}:
                     raise ValueError("Order is no longer fulfillable")
@@ -719,6 +805,54 @@ class AppLifecycle:
                     raise ValueError(
                         f"Order is not fulfillable on FunPay ({remote.status.value})"
                     )
+
+                order = (
+                    await session.execute(
+                        select(Order)
+                        .where(Order.id == order.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                rental = (
+                    await session.execute(
+                        select(Rental)
+                        .where(Rental.id == rental_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                if order.status not in {"pending", "completed"}:
+                    raise ValueError("Order is no longer fulfillable")
+                if rental.order_id != order.id or rental.status != "active":
+                    raise ValueError("Only an active rental can be delivered")
+                if rental.credentials_delivery_status == "sent":
+                    return
+                if rental.credentials_delivery_status == "sending":
+                    started_at = rental.credentials_delivery_started_at
+                    if started_at is not None and started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    if (
+                        started_at is not None
+                        and started_at
+                        > datetime.now(timezone.utc) - CREDENTIAL_DELIVERY_LEASE
+                    ):
+                        raise ValueError("Credential delivery is already running")
+
+                previous_attempts = rental.credentials_delivery_attempts
+                previous_error = rental.credentials_delivery_last_error
+                rental.credentials_delivery_status = "failed"
+                rental.credentials_delivery_attempts = (
+                    min(
+                        previous_attempts,
+                        CREDENTIAL_DELIVERY_MAX_ATTEMPTS - 1,
+                    )
+                    if previous_attempts > 0
+                    else 0
+                )
+                rental.credentials_delivery_started_at = None
+                rental.credentials_delivery_next_attempt_at = None
+                rental.credentials_delivery_last_error = None
                 _clear_order_retry(order)
                 session.add(
                     AuditLog(

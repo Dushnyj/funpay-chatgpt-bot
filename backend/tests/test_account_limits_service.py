@@ -1,6 +1,7 @@
 import base64
 import json
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -8,7 +9,89 @@ import pytest
 # в Base.metadata до того, как фикстура test_engine создаст таблицы.
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
-from app.services.account_limits import MeasureResult, measure_account_limits
+from app.integrations.openai.types import UsageInfo
+from app.services.account_limits import (
+    MeasureResult,
+    _acquire_access_token,
+    _remaining_for_window,
+    measure_account_limits,
+)
+
+
+@pytest.mark.parametrize(
+    ("usage", "window_seconds", "expected"),
+    [
+        (
+            UsageInfo(
+                primary_remaining_pct=73,
+                primary_window_seconds=7 * 24 * 60 * 60,
+            ),
+            7 * 24 * 60 * 60,
+            73,
+        ),
+        (
+            UsageInfo(
+                primary_remaining_pct=70,
+                primary_window_seconds=7 * 24 * 60 * 60,
+                secondary_remaining_pct=60,
+                secondary_window_seconds=5 * 60 * 60,
+            ),
+            5 * 60 * 60,
+            60,
+        ),
+        (
+            UsageInfo(
+                primary_remaining_pct=70,
+                primary_window_seconds=7 * 24 * 60 * 60,
+                secondary_remaining_pct=60,
+                secondary_window_seconds=5 * 60 * 60,
+            ),
+            7 * 24 * 60 * 60,
+            70,
+        ),
+    ],
+)
+def test_legacy_usage_aliases_are_resolved_by_duration_not_position(
+    usage: UsageInfo,
+    window_seconds: int,
+    expected: int,
+):
+    assert _remaining_for_window(usage, window_seconds) == expected
+
+
+@pytest.mark.asyncio
+async def test_stale_401_reuses_token_rotated_by_previous_worker(session):
+    account = Account(
+        login="refresh-race@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        status="active",
+    )
+    session.add(account)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="already-rotated-refresh",
+        access_token_encrypted="already-rotated-access",
+        access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        refresh_status="ok",
+    ))
+    await session.commit()
+
+    with patch(
+        "app.services.account_limits.refresh_access_token",
+        new=AsyncMock(),
+    ) as refresh:
+        _limits, access_token = await _acquire_access_token(
+            session,
+            account.id,
+            force=True,
+            stale_access_token="token-that-received-401",
+        )
+
+    assert access_token == "already-rotated-access"
+    refresh.assert_not_awaited()
+    assert not session.in_transaction()
 
 
 @pytest.mark.asyncio
@@ -95,9 +178,7 @@ async def test_measure_and_update_success(session, httpx_mock):
     reloaded = await session.get(AccountLimits, acc.id)
     assert reloaded.access_token_encrypted == "fresh-access"
     assert reloaded.refresh_token_encrypted == "fresh-refresh"
-    assert reloaded.chat_5h_remaining_pct is None
     assert reloaded.codex_5h_remaining_pct == 80
-    assert reloaded.chat_weekly_remaining_pct is None
     assert reloaded.codex_weekly_remaining_pct == 50
     assert reloaded.codex_primary_remaining_pct == 80
     assert reloaded.codex_primary_window_seconds == 18000

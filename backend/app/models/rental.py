@@ -1,9 +1,23 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+
+
+# ``expiry_pending`` still owns the account until the account-wide logout is
+# confirmed. Every pool/capacity view must use this shared definition so an
+# account cannot be issued or deleted while revocation is in progress.
+OCCUPYING_RENTAL_STATUSES: tuple[str, str] = ("active", "expiry_pending")
 
 
 class Order(Base):
@@ -39,6 +53,21 @@ class Rental(Base):
     # Одна аренда на заказ: повторная выдача по тому же заказу не создаёт дубль
     __table_args__ = (
         UniqueConstraint("order_id", name="uq_rental_order"),
+        UniqueConstraint(
+            "replacement_target_account_id",
+            name="uq_rentals_replacement_target_account_id",
+        ),
+        Index(
+            "uq_rentals_one_occupying_account",
+            "account_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('active', 'expiry_pending')"
+            ),
+            sqlite_where=text(
+                "status IN ('active', 'expiry_pending')"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -56,11 +85,21 @@ class Rental(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(16), default="active")
+    expiry_revoke_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Durable reservation made before the old account is logged out. The
+    # unique constraint prevents one candidate from being promised to two
+    # concurrent replacements; AccountPool also excludes all such targets.
+    replacement_target_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id"), default=None
+    )
+    expiry_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     replaced_by_rental_id: Mapped[int | None] = mapped_column(default=None)
     replacement_count: Mapped[int] = mapped_column(default=0)
     last_code_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    issued_chat_5h_pct: Mapped[int | None] = mapped_column(default=None)
-    issued_chat_weekly_pct: Mapped[int | None] = mapped_column(default=None)
     issued_codex_5h_pct: Mapped[int | None] = mapped_column(default=None)
     issued_codex_weekly_pct: Mapped[int | None] = mapped_column(default=None)
     issued_codex_primary_pct: Mapped[int | None] = mapped_column(default=None)

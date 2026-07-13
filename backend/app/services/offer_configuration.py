@@ -77,20 +77,11 @@ async def validate_offer_configurations(
             )
         if (
             scope is None
-            or scope.code not in {"any", "chat", "codex"}
+            or scope.code not in {"any", "codex"}
             or (require_enabled_scope and not scope.is_enabled)
         ):
             raise OfferConfigurationError(
                 f"Price row {index}: limit scope is disabled or invalid"
-            )
-        if scope.code == "chat":
-            # There is no stable OpenAI endpoint that reports the remaining
-            # ChatGPT message allowance.  The account measurement service
-            # deliberately stores those fields as NULL, so a guaranteed CHAT
-            # offer could never be fulfilled truthfully.
-            raise OfferConfigurationError(
-                f"Price row {index}: guaranteed ChatGPT limits are unavailable; "
-                "use any or codex scope"
             )
         if scope.code == "any" and item.min_limit_pct is not None:
             raise OfferConfigurationError(
@@ -105,7 +96,7 @@ async def validate_offer_configurations(
                 f"Price row {index}: Free has no observed 5-hour window; "
                 "clear max_5h_pct"
             )
-        if scope.code in {"chat", "codex"}:
+        if scope.code == "codex":
             if item.min_limit_pct is None:
                 raise OfferConfigurationError(
                     f"Price row {index}: guaranteed scope requires a minimum limit"

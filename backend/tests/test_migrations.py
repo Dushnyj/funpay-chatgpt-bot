@@ -1,6 +1,7 @@
 import asyncio
 
 from alembic import command
+import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -63,7 +64,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
-    assert version == "20260713_0014"
+    assert version == "20260713_0015"
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
@@ -259,6 +260,305 @@ async def test_0014_normalizes_catalog_sort_mirrors(tmp_path, monkeypatch):
     }
 
 
+async def test_0015_preserves_duration_ids_and_clamps_rental_capacity(
+    tmp_path, monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'duration-0015.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0014")
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tier_id = (
+            await connection.execute(
+                text("SELECT id FROM subscription_tiers WHERE code = 'plus'")
+            )
+        ).scalar_one()
+        await connection.execute(text(
+            "INSERT INTO durations (id, days, is_enabled, sort_order) "
+            "VALUES (42, 7, 1, 7)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO limit_scopes (id, code, name, is_enabled, sort_order) "
+            "VALUES (42, 'any', 'Any', 1, 10), "
+            "(43, 'chat', 'Chat', 0, 20)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO price_matrix "
+            "(id, tier_id, duration_id, limit_scope_id, price, config_key) "
+            "VALUES (42, :tier_id, 42, 42, 100, 'duration-fk')"
+        ), {"tier_id": tier_id})
+        await connection.execute(text(
+            "INSERT INTO accounts "
+            "(id, login, password_encrypted, totp_secret_encrypted, tier_id, "
+            "max_active_rentals, status) VALUES "
+            "(42, 'capacity@example.test', 'password', 'totp', :tier_id, 7, "
+            "'maintenance')"
+        ), {"tier_id": tier_id})
+        await connection.execute(text(
+            "INSERT INTO seller_settings "
+            "(id, funpay_session_valid, check_interval_minutes, "
+            "limits_check_interval_minutes, refresh_recover_concurrency, "
+            "refresh_max_attempts, refresh_retry_delay_minutes, "
+            "check_delay_seconds, bump_interval_hours, auto_bump_enabled, "
+            "default_max_active_rentals, funpay_commission_percent, "
+            "limits_warn_threshold_pct) VALUES "
+            "(1, 0, 1440, 5, 3, 3, 5, 45, 4, 1, 9, 15, 20)"
+        ))
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260713_0015")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        duration = (
+            await connection.execute(
+                text("SELECT id, minutes, sort_order FROM durations WHERE id=42")
+            )
+        ).one()
+        price_duration_id = (
+            await connection.execute(
+                text("SELECT duration_id FROM price_matrix WHERE id=42")
+            )
+        ).scalar_one()
+        capacities = (
+            await connection.execute(text(
+                "SELECT a.max_active_rentals, s.default_max_active_rentals "
+                "FROM accounts a CROSS JOIN seller_settings s "
+                "WHERE a.id=42 AND s.id=1"
+            ))
+        ).one()
+        scope_codes = set((await connection.execute(
+            text("SELECT code FROM limit_scopes")
+        )).scalars())
+        columns = await connection.run_sync(lambda sync_connection: {
+            table: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns(table)
+            }
+            for table in ("durations", "account_limits", "rentals")
+        })
+        duration_unique_names = await connection.run_sync(
+            lambda sync_connection: {
+                constraint["name"]
+                for constraint in inspect(sync_connection)
+                .get_unique_constraints("durations")
+            }
+        )
+        rental_indexes = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).get_indexes(
+                "rentals"
+            )
+        )
+        rental_unique_names = await connection.run_sync(
+            lambda sync_connection: {
+                constraint["name"]
+                for constraint in inspect(sync_connection)
+                .get_unique_constraints("rentals")
+            }
+        )
+        rental_foreign_keys = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).get_foreign_keys(
+                "rentals"
+            )
+        )
+    await engine.dispose()
+
+    assert tuple(duration) == (42, 7 * 24 * 60, 7 * 24 * 60)
+    assert price_duration_id == 42
+    assert tuple(capacities) == (1, 1)
+    assert "chat" not in scope_codes
+    assert "days" not in columns["durations"]
+    assert "uq_durations_minutes" in duration_unique_names
+    assert any(
+        index["name"] == "uq_rentals_one_occupying_account"
+        and index["unique"]
+        for index in rental_indexes
+    )
+    assert "chat_5h_remaining_pct" not in columns["account_limits"]
+    assert "issued_chat_5h_pct" not in columns["rentals"]
+    assert "replacement_target_account_id" in columns["rentals"]
+    assert (
+        "uq_rentals_replacement_target_account_id"
+        in rental_unique_names
+    )
+    assert any(
+        foreign_key["constrained_columns"]
+        == ["replacement_target_account_id"]
+        and foreign_key["referred_table"] == "accounts"
+        for foreign_key in rental_foreign_keys
+    )
+
+
+async def test_0015_keeps_disabled_chat_tombstone_for_historical_refs(
+    tmp_path, monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'chat-history-0015.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0014")
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tier_id = (
+            await connection.execute(
+                text("SELECT id FROM subscription_tiers WHERE code = 'plus'")
+            )
+        ).scalar_one()
+        await connection.execute(text(
+            "INSERT INTO durations (id, days, is_enabled, sort_order) "
+            "VALUES (51, 1, 1, 1)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO limit_scopes (id, code, name, is_enabled, sort_order) "
+            "VALUES (51, 'chat', 'Chat', 1, 20)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO price_matrix "
+            "(id, tier_id, duration_id, limit_scope_id, price, config_key) "
+            "VALUES (51, :tier_id, 51, 51, 100, 'chat-history')"
+        ), {"tier_id": tier_id})
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260713_0015")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        scope = (
+            await connection.execute(text(
+                "SELECT is_enabled, sort_order FROM limit_scopes "
+                "WHERE code='chat'"
+            ))
+        ).one()
+        price_scope = (
+            await connection.execute(
+                text("SELECT limit_scope_id FROM price_matrix WHERE id=51")
+            )
+        ).scalar_one()
+    await engine.dispose()
+    assert tuple(scope) == (0, 100)
+    assert price_scope == 51
+
+
+async def test_0015_aborts_when_chat_has_live_order(tmp_path, monkeypatch):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'chat-live-0015.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0014")
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tier_id = (
+            await connection.execute(
+                text("SELECT id FROM subscription_tiers WHERE code = 'plus'")
+            )
+        ).scalar_one()
+        await connection.execute(text(
+            "INSERT INTO durations (id, days, is_enabled, sort_order) "
+            "VALUES (61, 1, 1, 1)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO limit_scopes (id, code, name, is_enabled, sort_order) "
+            "VALUES (61, 'chat', 'Chat', 1, 20)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO orders "
+            "(id, funpay_order_id, funpay_chat_id, buyer_funpay_id, "
+            "buyer_locale, tier_id, duration_id, limit_scope_id, price, "
+            "status, created_at) VALUES "
+            "(61, 'live-chat-order', '100', '200', 'ru', :tier_id, 61, 61, "
+            "100, 'pending', CURRENT_TIMESTAMP)"
+        ), {"tier_id": tier_id})
+    await engine.dispose()
+
+    with pytest.raises(RuntimeError, match="live buyer state.*orders=1"):
+        await asyncio.to_thread(command.upgrade, config, "20260713_0015")
+
+
+async def test_0015_aborts_when_account_has_two_occupying_rentals(
+    tmp_path, monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'shared-live-0015.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0014")
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tier_id = (
+            await connection.execute(
+                text("SELECT id FROM subscription_tiers WHERE code = 'plus'")
+            )
+        ).scalar_one()
+        await connection.execute(text(
+            "INSERT INTO durations (id, days, is_enabled, sort_order) "
+            "VALUES (71, 1, 1, 1)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO limit_scopes (id, code, name, is_enabled, sort_order) "
+            "VALUES (71, 'any', 'Any', 1, 10)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO accounts "
+            "(id, login, password_encrypted, totp_secret_encrypted, tier_id, "
+            "status) VALUES (71, 'shared@example.test', 'password', 'totp', "
+            ":tier_id, 'active')"
+        ), {"tier_id": tier_id})
+        for index in (1, 2):
+            await connection.execute(text(
+                "INSERT INTO orders "
+                "(id, funpay_order_id, funpay_chat_id, buyer_funpay_id, "
+                "buyer_locale, tier_id, duration_id, limit_scope_id, price, "
+                "status, created_at) VALUES "
+                "(:id, :remote, :chat, :buyer, 'ru', :tier_id, 71, 71, 100, "
+                "'completed', CURRENT_TIMESTAMP)"
+            ), {
+                "id": 70 + index,
+                "remote": f"shared-{index}",
+                "chat": str(index),
+                "buyer": str(index),
+                "tier_id": tier_id,
+            })
+            await connection.execute(text(
+                "INSERT INTO rentals "
+                "(id, order_id, account_id, buyer_funpay_id, "
+                "buyer_funpay_chat_id, tier_id, duration_id, limit_scope_id, "
+                "lang, started_at, expires_at, status, replacement_count, "
+                "credentials_delivery_status, credentials_delivery_template, "
+                "credentials_delivery_attempts) VALUES "
+                "(:id, :id, 71, :buyer, :chat, :tier_id, 71, 71, 'ru', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, :status, 0, 'sent', "
+                "'welcome', 1)"
+            ), {
+                "id": 70 + index,
+                "buyer": str(index),
+                "chat": str(index),
+                "tier_id": tier_id,
+                "status": "active" if index == 1 else "expiry_pending",
+            })
+    await engine.dispose()
+
+    with pytest.raises(RuntimeError, match="multiple live rentals"):
+        await asyncio.to_thread(command.upgrade, config, "20260713_0015")
+
+
+async def test_0015_downgrade_rejects_sub_day_duration(tmp_path, monkeypatch):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'subday-0015.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0015")
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        await connection.execute(text(
+            "INSERT INTO durations (minutes, is_enabled, sort_order) "
+            "VALUES (30, 1, 30)"
+        ))
+    await engine.dispose()
+
+    with pytest.raises(RuntimeError, match="sub-day values"):
+        await asyncio.to_thread(command.downgrade, config, "20260713_0014")
+
+
 async def test_lot_template_upgrade_preserves_legacy_draft_disabled(
     tmp_path, monkeypatch,
 ):
@@ -431,7 +731,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260713_0014"
+    assert version == "20260713_0015"
     await engine.dispose()
 
 
@@ -520,7 +820,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260713_0014"
+    assert version == "20260713_0015"
     await engine.dispose()
 
 

@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.session import async_session_factory
@@ -27,12 +28,17 @@ from app.services.account_validation import (
     ValidationStage,
     _save_tokens_and_measure,
 )
+from app.services.account_occupancy import account_is_busy
 
 
 _DEVICE_SESSION_TTL = timedelta(minutes=15)
 _BACKGROUND_RETRY_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
+
+
+class AccountBusyError(RuntimeError):
+    """A buyer owns, or a replacement claim reserves, this account."""
 
 
 @dataclass(slots=True)
@@ -73,8 +79,27 @@ class AccountDeviceAuthManager:
         session: AsyncSession,
         account: Account,
     ) -> DeviceAuthSession:
+        account_id = account.id
+        # Device-code creation is remote I/O and can be slow. Release the
+        # preflight transaction, then serialize the state transition again.
+        if session.in_transaction():
+            await session.commit()
         code = await request_device_code()
         now = datetime.now(timezone.utc)
+        account = (
+            await session.execute(
+                select(Account)
+                .where(Account.id == account_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if account is None:
+            await session.rollback()
+            raise KeyError(account_id)
+        if await account_is_busy(session, account_id):
+            await session.rollback()
+            raise AccountBusyError(account_id)
         async with self._lock:
             job = await self._queue.enqueue_exclusive(
                 session,

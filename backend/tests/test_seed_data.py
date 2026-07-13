@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import pytest
 from sqlalchemy import func, select
 
@@ -13,11 +16,28 @@ from app.services.seed_data import (
     DEFAULT_LIMIT_SCOPES,
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_TIERS,
-    LEGACY_LIMIT_MESSAGE_TEMPLATES,
+    PRE_AGENTIC_MESSAGE_TEMPLATES,
     seed_catalog,
     seed_lot_templates,
     seed_message_templates,
 )
+
+
+def test_pre_agentic_message_templates_match_shipped_production_snapshot():
+    """Keep the exact previous production defaults usable as upgrade fingerprints."""
+
+    snapshot = json.dumps(
+        PRE_AGENTIC_MESSAGE_TEMPLATES,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    # SHA-256 of DEFAULT_MESSAGE_TEMPLATES from the production revision that
+    # immediately preceded the agentic-only limit and duration migration.
+    assert hashlib.sha256(snapshot).hexdigest() == (
+        "efc5533fc0022c16a2eb711209726e172ba29a53956355dec99d38b9392c8815"
+    )
 
 
 @pytest.mark.asyncio
@@ -80,10 +100,23 @@ async def test_seed_lot_templates_is_idempotent_and_preserves_content(session):
 
 @pytest.mark.asyncio
 async def test_seed_upgrades_only_exact_legacy_limit_defaults(session):
+    # Literal historical fingerprint: importing the production constant here
+    # would let an accidental edit change both sides and hide a real upgrade
+    # regression for existing databases.
+    old_welcome_ru = (
+        "✅ Заказ выполнен. ChatGPT {tier} на {days} дн.:\n\n"
+        "Логин: {login}\n"
+        "Пароль: {password}\n"
+        "Подписка активна до: {expires_at}\n\n"
+        "📊 Лимиты: Чат 5ч — {chat_5h}% / неделя — {chat_weekly}%\n"
+        "            Codex 5ч — {codex_5h}% / неделя — {codex_weekly}%\n\n"
+        "⚠️ Лимиты общие для аккаунта, обновляются динамически.\n\n"
+        "📱 Для входа: !код | Помощь: !помощь | Замена: !замена"
+    )
     legacy_welcome = MessageTemplate(
         key="welcome",
         lang="ru",
-        content=LEGACY_LIMIT_MESSAGE_TEMPLATES["welcome"]["ru"],
+        content=old_welcome_ru,
     )
     customized_subscription = MessageTemplate(
         key="subscription",
@@ -99,6 +132,7 @@ async def test_seed_upgrades_only_exact_legacy_limit_defaults(session):
 
     assert legacy_welcome.content == DEFAULT_MESSAGE_TEMPLATES["welcome"]["ru"]
     assert "{codex_primary_window}" in legacy_welcome.content
+    assert "{access_expires_at}" not in legacy_welcome.content
     assert customized_subscription.content == "Мой шаблон: {tier}"
 
 
@@ -116,18 +150,17 @@ async def test_seed_catalog_is_complete_idempotent_and_preserves_existing(sessio
     durations = (await session.execute(select(Duration))).scalars().all()
     scopes = (await session.execute(select(LimitScope))).scalars().all()
     assert {tier.name for tier in tiers} == {name for name, _ in DEFAULT_TIERS}
-    assert {duration.days for duration in durations} == set(DEFAULT_DURATIONS)
-    assert all(duration.sort_order == duration.days for duration in durations)
+    assert {duration.minutes for duration in durations} == set(DEFAULT_DURATIONS)
+    assert all(duration.sort_order == duration.minutes for duration in durations)
     assert {scope.code for scope in scopes} == {
         code for code, _ in DEFAULT_LIMIT_SCOPES
     }
     scopes_by_code = {scope.code: scope for scope in scopes}
     assert scopes_by_code["any"].is_enabled is True
-    assert scopes_by_code["chat"].is_enabled is False
     assert scopes_by_code["codex"].is_enabled is True
     assert [
         scope.code for scope in sorted(scopes, key=lambda scope: scope.sort_order)
-    ] == ["any", "chat", "codex"]
+    ] == ["any", "codex"]
     plus = next(tier for tier in tiers if tier.name == "Plus")
     assert plus.description == "operator value"
     assert plus.is_active is False
@@ -174,23 +207,27 @@ async def test_seed_catalog_preserves_limit_scope_availability_override(session)
     await session.refresh(codex)
 
     assert codex.is_enabled is False
-    assert codex.sort_order == 30
+    assert codex.sort_order == 20
 
 
 @pytest.mark.asyncio
 async def test_seed_catalog_does_not_restore_missing_duration(session):
     await seed_catalog(session)
     duration = (
-        await session.execute(select(Duration).where(Duration.days == 3))
+        await session.execute(
+            select(Duration).where(Duration.minutes == 3 * 24 * 60)
+        )
     ).scalar_one()
     await session.delete(duration)
-    custom = Duration(days=8, is_enabled=True, sort_order=999)
+    custom = Duration(minutes=8 * 24 * 60, is_enabled=True, sort_order=999)
     session.add(custom)
     await session.commit()
 
     await seed_catalog(session)
 
     durations = (await session.execute(select(Duration))).scalars().all()
-    assert 3 not in {item.days for item in durations}
-    custom = next(item for item in durations if item.days == 8)
-    assert custom.sort_order == 8
+    assert 3 * 24 * 60 not in {item.minutes for item in durations}
+    custom = next(
+        item for item in durations if item.minutes == 8 * 24 * 60
+    )
+    assert custom.sort_order == 8 * 24 * 60

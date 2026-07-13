@@ -6,9 +6,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.account import Account, AccountLimits
+from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.catalog import SubscriptionTier
-from app.models.rental import Rental
+from app.models.rental import OCCUPYING_RENTAL_STATUSES, Rental
+from app.services.account_occupancy import account_is_busy
+from app.services.delivery_policy import DELIVERY_ALLOCATION_HEADROOM
 from app.services.limit_eligibility import (
     apply_limit_scope_filters,
     observed_codex_primary,
@@ -17,6 +19,16 @@ from app.services.limit_eligibility import (
 
 
 _LIMITS_FRESH_THRESHOLD = timedelta(hours=1)
+def limits_freshness_for_duration(duration_minutes: int) -> timedelta:
+    """Short rentals require proportionally fresher measured usage."""
+
+    return min(
+        _LIMITS_FRESH_THRESHOLD,
+        max(
+            timedelta(minutes=5),
+            timedelta(minutes=duration_minutes / 2),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -24,11 +36,14 @@ class AccountCriteria:
     """Критерии выбора аккаунта для выдачи под заказ."""
 
     tier_id: int
-    duration_days: int
-    scope: str  # any | chat | codex
+    duration_minutes: int
+    scope: str  # any | codex
     min_limit_pct: int | None
     max_5h_pct: int | None
     max_weekly_pct: int | None
+    # Replacement keeps the original rental deadline rather than requiring a
+    # fresh full catalog term. When omitted, allocation reserves retry headroom.
+    required_expires_at: datetime | None = None
 
 
 class AccountPool:
@@ -36,8 +51,8 @@ class AccountPool:
 
     base_filter: status=active, tier, подписка >= duration, лимиты свежие, refresh ok,
                  активных аренд < эффективного лимита.
-    scope=any: потолок (если задан) — все 4 замера ≤ порогов. FIFO по подписке.
-    scope=chat/codex: гарантия — оба окна типа ≥ min_limit_pct. Наибольший запас.
+    scope=any: optional ceilings apply to measured agentic windows. FIFO by expiry.
+    scope=codex: every observed agentic window must meet the guarantee.
     """
 
     async def acquire(
@@ -59,17 +74,34 @@ class AccountPool:
         exclude_account_id: int | None,
     ) -> Account | None:
         now = datetime.now(timezone.utc)
-        fresh_cutoff = now - _LIMITS_FRESH_THRESHOLD
-        required_expires_at = now + timedelta(days=criteria.duration_days)
+        freshness = limits_freshness_for_duration(criteria.duration_minutes)
+        fresh_cutoff = now - freshness
+        required_expires_at = criteria.required_expires_at
+        if required_expires_at is None:
+            required_expires_at = (
+                now
+                + timedelta(minutes=criteria.duration_minutes)
+                + DELIVERY_ALLOCATION_HEADROOM
+            )
+        elif required_expires_at.tzinfo is None:
+            required_expires_at = required_expires_at.replace(
+                tzinfo=timezone.utc
+            )
 
         active_rentals = (
             select(
                 Rental.account_id,
                 func.count(Rental.id).label("cnt"),
             )
-            .where(Rental.status == "active")
+            .where(Rental.status.in_(OCCUPYING_RENTAL_STATUSES))
             .group_by(Rental.account_id)
             .subquery()
+        )
+        reserved_replacement_targets = select(
+            Rental.replacement_target_account_id
+        ).where(Rental.replacement_target_account_id.is_not(None))
+        active_checks = select(AccountCheckJob.account_id).where(
+            AccountCheckJob.status.in_(["pending", "running"])
         )
 
         stmt = (
@@ -93,10 +125,17 @@ class AccountPool:
                 AccountLimits.measured_at >= fresh_cutoff,
                 AccountLimits.refresh_status == "ok",
                 AccountLimits.plan_window_status == "ok",
-                func.coalesce(
-                    Account.max_active_rentals, default_max_active_rentals
-                )
-                > func.coalesce(active_rentals.c.cnt, 0),
+                # OpenAI logout is account-wide, so independent renters can
+                # never be isolated safely on one credential set.
+                func.coalesce(active_rentals.c.cnt, 0) < 1,
+                # Replacement reserves its exact target durably before the
+                # old account is logged out. Neither a normal sale nor another
+                # replacement may allocate that promised target meanwhile.
+                Account.id.not_in(reserved_replacement_targets),
+                # Refresh/validation workers publish ``running`` while holding
+                # the same Account lock. Do not allocate credentials that a
+                # live worker can still invalidate before delivery.
+                Account.id.not_in(active_checks),
             )
         )
         if exclude_account_id is not None:
@@ -111,13 +150,6 @@ class AccountPool:
         )
         if criteria.scope == "any":
             stmt = stmt.order_by(Account.subscription_expires_at.asc())
-        elif criteria.scope == "chat":
-            stmt = stmt.order_by(
-                _lower_limit(
-                    AccountLimits.chat_5h_remaining_pct,
-                    AccountLimits.chat_weekly_remaining_pct,
-                ).desc()
-            )
         else:  # codex (unknown scopes were made unsellable above)
             stmt = stmt.order_by(
                 _lower_optional_limit(
@@ -129,9 +161,33 @@ class AccountPool:
         # The row lock is held by the caller's transaction until it creates the
         # Rental and commits. Concurrent workers skip the selected account
         # instead of issuing the same final slot twice.
-        stmt = stmt.limit(1).with_for_update(of=Account, skip_locked=True)
-        result = await session.execute(stmt)
-        return result.scalar_one_or_none()
+        #
+        # PostgreSQL READ COMMITTED takes one snapshot per statement. A job or
+        # rental can be committed after the cross-table predicates above were
+        # evaluated but immediately before ``LockRows`` acquires Account. The
+        # Account tuple itself is not updated in that race, so EvalPlanQual
+        # cannot make those subqueries fresh. Recheck in a second statement
+        # after owning Account and retry another candidate on conflict.
+        rejected_account_ids: set[int] = set()
+        while True:
+            candidate_stmt = stmt
+            if rejected_account_ids:
+                candidate_stmt = candidate_stmt.where(
+                    Account.id.not_in(rejected_account_ids)
+                )
+            candidate_stmt = candidate_stmt.limit(1).with_for_update(
+                of=Account,
+                skip_locked=True,
+            )
+            account = (
+                await session.execute(candidate_stmt)
+            ).scalar_one_or_none()
+            if account is None:
+                return None
+            if await _has_fresh_allocation_conflict(session, account.id):
+                rejected_account_ids.add(account.id)
+                continue
+            return account
 
     async def acquire_excluding(
         self,
@@ -149,11 +205,6 @@ class AccountPool:
         )
 
 
-def _lower_limit(left, right):
-    """Portable scalar minimum (SQLite and PostgreSQL)."""
-    return case((left <= right, left), else_=right)
-
-
 def _lower_optional_limit(primary, secondary):
     """Minimum of observed Codex windows, allowing absent secondary data."""
     return case(
@@ -161,3 +212,23 @@ def _lower_optional_limit(primary, secondary):
         (primary <= secondary, primary),
         else_=secondary,
     )
+
+
+async def _has_fresh_allocation_conflict(
+    session: AsyncSession,
+    account_id: int,
+) -> bool:
+    """Recheck mutable cross-table blockers after Account is locked."""
+
+    if await account_is_busy(session, account_id):
+        return True
+    return (
+        await session.scalar(
+            select(AccountCheckJob.id)
+            .where(
+                AccountCheckJob.account_id == account_id,
+                AccountCheckJob.status.in_(["pending", "running"]),
+            )
+            .limit(1)
+        )
+    ) is not None

@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
@@ -14,6 +15,7 @@ from app.config import get_settings
 from app.integrations.email.outlook_web_provider import is_outlook_address
 from app.models.account import Account, EmailOAuthCredential
 from app.models.audit import AuditLog
+from app.services.account_occupancy import account_is_busy
 from app.services.email_oauth import (
     EmailOAuthConfigurationError,
     EmailOAuthExchangeError,
@@ -57,13 +59,28 @@ async def start_microsoft_email_oauth(
     response: Response,
     session: AsyncSession = Depends(get_db_session),
 ):
-    account = await session.get(Account, account_id)
+    account = (
+        await session.execute(
+            select(Account)
+            .where(Account.id == account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     if not account.email or not is_outlook_address(account.email):
         raise HTTPException(
             status_code=400,
             detail="Account email must be a personal Outlook/Hotmail address",
+        )
+    if await account_is_busy(session, account.id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Mailbox OAuth cannot be changed while an active or "
+                "expiring rental occupies the account"
+            ),
         )
     try:
         config = MicrosoftGraphOAuthConfig.from_settings(get_settings())
@@ -127,6 +144,11 @@ async def microsoft_email_oauth_callback(
         or account.email.strip().casefold() != pending.expected_email
     ):
         return _accounts_redirect("failed", "account_changed")
+    # The provider exchange is external I/O. Keep only immutable identity
+    # snapshots and release the read transaction before waiting on Microsoft.
+    expected_account_id = pending.account_id
+    expected_email = pending.expected_email
+    await session.commit()
 
     try:
         config = MicrosoftGraphOAuthConfig.from_settings(get_settings())
@@ -139,6 +161,25 @@ async def microsoft_email_oauth_callback(
         return _accounts_redirect("failed", "configuration_missing")
     except EmailOAuthExchangeError as exc:
         return _accounts_redirect("failed", exc.reason)
+
+    # Serialize with credential edits and allocation after external I/O, then
+    # re-check the exact mailbox and occupancy before attaching the token.
+    account = (
+        await session.execute(
+            select(Account)
+            .where(Account.id == expected_account_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        account is None
+        or not account.email
+        or account.email.strip().casefold() != expected_email
+    ):
+        return _accounts_redirect("failed", "account_changed")
+    if await account_is_busy(session, account.id):
+        return _accounts_redirect("failed", "account_in_use")
 
     now = datetime.now(timezone.utc)
     credential = await session.get(EmailOAuthCredential, account.id)

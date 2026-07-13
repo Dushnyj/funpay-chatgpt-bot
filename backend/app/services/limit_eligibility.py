@@ -95,28 +95,10 @@ def apply_limit_scope_filters(
                 # eligibility condition. Plans without an observed 5-hour
                 # window (notably Free) must not satisfy it through NULL.
                 codex_short <= max_short_pct,
-                or_(
-                    AccountLimits.chat_5h_remaining_pct.is_(None),
-                    AccountLimits.chat_5h_remaining_pct <= max_short_pct,
-                ),
             )
         if max_long_pct is not None:
             statement = statement.where(
                 codex_long <= max_long_pct,
-                or_(
-                    AccountLimits.chat_weekly_remaining_pct.is_(None),
-                    AccountLimits.chat_weekly_remaining_pct <= max_long_pct,
-                ),
-            )
-        return statement
-
-    if scope == "chat":
-        if min_limit_pct is not None:
-            # Chat guarantees are offered only when both Chat windows were
-            # actually measured. NULL therefore correctly fails the predicate.
-            statement = statement.where(
-                AccountLimits.chat_5h_remaining_pct >= min_limit_pct,
-                AccountLimits.chat_weekly_remaining_pct >= min_limit_pct,
             )
         return statement
 

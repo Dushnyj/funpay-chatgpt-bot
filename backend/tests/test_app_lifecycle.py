@@ -115,6 +115,83 @@ async def test_manual_delivery_retry_rechecks_remote_refund(monkeypatch):
     lifecycle._rentals.fulfill_order.assert_not_awaited()
 
 
+async def test_manual_retry_preserves_nonzero_disclosure_attempts(monkeypatch):
+    import app.app_lifecycle as lifecycle_module
+    from app.integrations.funpay.types import OrderInfo, SaleStatus
+    from app.models.rental import Rental
+
+    order = Order(
+        id=18,
+        funpay_order_id="paid-manual-retry",
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        buyer_locale="ru",
+        price=100,
+        status="completed",
+    )
+    rental = Rental(
+        id=24,
+        order_id=order.id,
+        account_id=31,
+        buyer_funpay_id="200",
+        buyer_funpay_chat_id="100",
+        tier_id=1,
+        duration_id=1,
+        limit_scope_id=1,
+        lang="ru",
+        started_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        status="active",
+        credentials_delivery_status="manual",
+        credentials_delivery_template="welcome",
+        credentials_delivery_attempts=4,
+        credentials_delivery_last_error="ambiguous prior send",
+    )
+
+    def result(value):
+        wrapped = MagicMock()
+        wrapped.scalar_one_or_none.return_value = value
+        wrapped.scalar_one.return_value = value
+        return wrapped
+
+    session = MagicMock()
+    session.execute = AsyncMock(
+        side_effect=[result(rental), result(order), result(rental)]
+    )
+
+    async def get(model, _key):
+        return order if model is Order else None
+
+    session.get = AsyncMock(side_effect=get)
+    session.commit = AsyncMock()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = AsyncMock()
+    lifecycle._gateway.get_order.return_value = OrderInfo(
+        order_id=order.funpay_order_id,
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Offer",
+        price=100,
+    )
+    lifecycle._rentals.fulfill_order = AsyncMock(return_value=rental)
+
+    await lifecycle.retry_rental_delivery(rental.id)
+
+    assert rental.credentials_delivery_attempts == 4
+    lifecycle._rentals.fulfill_order.assert_awaited_once()
+
+
 async def test_register_periodic_tasks():
     lc = AppLifecycle(golden_key="", category_id=0)
     await lc.start()
@@ -852,7 +929,7 @@ async def test_sync_manual_lot_uses_runtime_gateway_and_separate_session(
         is_active=True,
         is_sellable=True,
     )
-    duration = Duration(days=7, is_enabled=True, sort_order=1)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=1)
     scope = LimitScope(code="any", name="Any", is_enabled=True)
     session.add_all([tier, duration, scope])
     await session.flush()
@@ -914,7 +991,7 @@ async def test_reconcile_pauses_invalid_manual_lot_without_global_node(
         is_active=True,
         is_sellable=True,
     )
-    duration = Duration(days=7, is_enabled=True, sort_order=1)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=1)
     scope = LimitScope(code="any", name="Any", is_enabled=True)
     session.add_all([invalid_tier, valid_tier, duration, scope])
     await session.flush()
@@ -982,3 +1059,131 @@ async def test_reconcile_pauses_invalid_manual_lot_without_global_node(
     assert valid_auto_lot.title_en == "Do not change"
     assert valid_auto_lot.description_ru == "Сохранить"
     assert valid_auto_lot.description_en == "Keep"
+
+
+async def test_expiry_revoke_batch_does_not_head_of_line_block(monkeypatch):
+    import asyncio
+    import app.app_lifecycle as lifecycle_module
+
+    sessions: list[object] = []
+
+    class Session:
+        async def commit(self):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.session = Session()
+            sessions.append(self.session)
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lifecycle_module, "async_session_factory", lambda: Context(),
+    )
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_finalized = asyncio.Event()
+    worker_sessions: dict[int, object] = {}
+
+    class Expiry:
+        async def prepare_overdue_batch(self, _session):
+            return [(1, 101), (2, 102)]
+
+        async def expire_candidate(
+            self, session, _gateway, *, rental_id, order_id,
+        ):
+            assert order_id == rental_id + 100
+            worker_sessions[rental_id] = session
+            if rental_id == 1:
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_finalized.set()
+
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._expiry = Expiry()
+
+    task = asyncio.create_task(lifecycle._task_expire_overdue())
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    await asyncio.wait_for(second_finalized.wait(), timeout=1)
+
+    assert not task.done()
+    assert worker_sessions[1] is not worker_sessions[2]
+    assert worker_sessions[1] is not sessions[0]
+
+    release_first.set()
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_refund_revoke_batch_does_not_head_of_line_block(monkeypatch):
+    import asyncio
+    import app.app_lifecycle as lifecycle_module
+
+    sessions: list[object] = []
+
+    class ScalarResult:
+        class Scalars:
+            @staticmethod
+            def all():
+                return ["slow-refund", "fast-refund"]
+
+        @staticmethod
+        def scalars():
+            return ScalarResult.Scalars()
+
+    class Session:
+        async def execute(self, _statement):
+            return ScalarResult()
+
+        async def commit(self):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.session = Session()
+            sessions.append(self.session)
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lifecycle_module, "async_session_factory", lambda: Context(),
+    )
+
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    fast_finalized = asyncio.Event()
+    worker_sessions: dict[str, object] = {}
+
+    async def process_refund(session, order_id):
+        worker_sessions[order_id] = session
+        if order_id == "slow-refund":
+            slow_started.set()
+            await release_slow.wait()
+        else:
+            fast_finalized.set()
+
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._refunds.process_sale_refunded = AsyncMock(
+        side_effect=process_refund,
+    )
+
+    task = asyncio.create_task(lifecycle._task_refund_revoke())
+    await asyncio.wait_for(slow_started.wait(), timeout=1)
+    await asyncio.wait_for(fast_finalized.wait(), timeout=1)
+
+    assert not task.done()
+    assert worker_sessions["slow-refund"] is not worker_sessions["fast-refund"]
+    assert worker_sessions["slow-refund"] is not sessions[0]
+
+    release_slow.set()
+    await asyncio.wait_for(task, timeout=1)

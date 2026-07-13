@@ -78,69 +78,77 @@ async def test_delete_tier(auth_client: AsyncClient, session: AsyncSession):
     assert resp.status_code == 405
 
 
-async def test_list_durations_sorted_strictly_by_days(
+async def test_list_durations_sorted_strictly_by_minutes(
     auth_client: AsyncClient,
     session: AsyncSession,
 ):
     session.add_all([
-        Duration(days=8, is_enabled=True, sort_order=1),
-        Duration(days=3, is_enabled=True, sort_order=999),
-        Duration(days=5, is_enabled=True, sort_order=0),
+        Duration(minutes=8 * 24 * 60, is_enabled=True, sort_order=1),
+        Duration(minutes=3 * 24 * 60, is_enabled=True, sort_order=999),
+        Duration(minutes=5 * 24 * 60, is_enabled=True, sort_order=0),
     ])
     await session.commit()
 
     resp = await auth_client.get("/api/durations")
 
     assert resp.status_code == 200
-    assert [item["days"] for item in resp.json()] == [3, 5, 8]
+    assert [item["minutes"] for item in resp.json()] == [
+        3 * 24 * 60,
+        5 * 24 * 60,
+        8 * 24 * 60,
+    ]
 
 
-async def test_create_custom_duration_uses_days_as_internal_sort_order(
+async def test_create_custom_duration_uses_minutes_as_internal_sort_order(
     auth_client: AsyncClient,
 ):
-    resp = await auth_client.post("/api/durations", json={"days": 8})
+    resp = await auth_client.post("/api/durations", json={"minutes": 90})
 
     assert resp.status_code == 201
     assert resp.json() == {
         "id": resp.json()["id"],
-        "days": 8,
+        "minutes": 90,
         "is_enabled": True,
-        "sort_order": 8,
+        "sort_order": 90,
     }
 
 
-async def test_create_custom_duration_accepts_boundary_days_and_options(
+async def test_create_custom_duration_accepts_boundary_minutes_and_options(
     auth_client: AsyncClient,
 ):
     first = await auth_client.post(
         "/api/durations",
-        json={"days": 1, "is_enabled": False},
+        json={"minutes": 30, "is_enabled": False},
     )
-    last = await auth_client.post("/api/durations", json={"days": 30})
+    last = await auth_client.post(
+        "/api/durations", json={"minutes": 30 * 24 * 60}
+    )
 
     assert first.status_code == 201
-    assert first.json()["days"] == 1
+    assert first.json()["minutes"] == 30
     assert first.json()["is_enabled"] is False
-    assert first.json()["sort_order"] == 1
+    assert first.json()["sort_order"] == 30
     assert last.status_code == 201
-    assert last.json()["days"] == 30
+    assert last.json()["minutes"] == 30 * 24 * 60
 
 
 async def test_create_custom_duration_duplicate_returns_conflict(
     auth_client: AsyncClient,
     session: AsyncSession,
 ):
-    session.add(Duration(days=8, is_enabled=False, sort_order=80))
+    session.add(Duration(minutes=8 * 24 * 60, is_enabled=False, sort_order=80))
     await session.commit()
 
     resp = await auth_client.post(
         "/api/durations",
-        json={"days": 8, "is_enabled": True},
+        json={"minutes": 8 * 24 * 60, "is_enabled": True},
     )
 
     assert resp.status_code == 409
     durations = (
-        await session.execute(select(Duration).where(Duration.days == 8))
+        await session.execute(
+            select(Duration).where(Duration.minutes == 8 * 24 * 60)
+        )
     ).scalars().all()
     assert len(durations) == 1
     assert durations[0].is_enabled is False
@@ -151,14 +159,15 @@ async def test_create_custom_duration_duplicate_returns_conflict(
     "payload",
     [
         {},
-        {"days": 0},
-        {"days": -1},
-        {"days": 31},
-        {"days": 8.0},
-        {"days": "8"},
-        {"days": True},
-        {"days": 8, "sort_order": 10},
-        {"days": 8, "unknown": "field"},
+        {"minutes": 0},
+        {"minutes": 29},
+        {"minutes": 43_201},
+        {"minutes": 45},
+        {"minutes": 30.0},
+        {"minutes": "30"},
+        {"minutes": True},
+        {"minutes": 30, "sort_order": 10},
+        {"minutes": 30, "unknown": "field"},
     ],
 )
 async def test_create_custom_duration_rejects_invalid_payload(
@@ -177,7 +186,7 @@ async def test_update_duration_availability(
 ):
     lifecycle = type("Lifecycle", (), {"reconcile_lots": AsyncMock(return_value=[])})()
     monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
-    duration = Duration(days=7, is_enabled=True, sort_order=7)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=7)
     session.add(duration)
     await session.commit()
 
@@ -189,7 +198,7 @@ async def test_update_duration_availability(
     assert resp.status_code == 200
     assert resp.json() == {
         "id": duration.id,
-        "days": 7,
+        "minutes": 7 * 24 * 60,
         "is_enabled": False,
         "sort_order": 7,
     }
@@ -203,7 +212,7 @@ async def test_update_duration_rejects_sort_order(
 ):
     lifecycle = type("Lifecycle", (), {"reconcile_lots": AsyncMock(return_value=[])})()
     monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     await session.commit()
 
@@ -221,7 +230,7 @@ async def test_update_duration_rejects_sort_order(
     [
         {},
         {"is_enabled": None},
-        {"days": 14, "is_enabled": False},
+        {"minutes": 14 * 24 * 60, "is_enabled": False},
         {"sort_order": 25},
     ],
 )
@@ -230,7 +239,7 @@ async def test_update_duration_rejects_unsafe_payloads(
     session: AsyncSession,
     payload: dict,
 ):
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     await session.commit()
 
@@ -238,7 +247,7 @@ async def test_update_duration_rejects_unsafe_payloads(
 
     assert resp.status_code == 422
     await session.refresh(duration)
-    assert duration.days == 7
+    assert duration.minutes == 7 * 24 * 60
     assert duration.is_enabled is True
 
 
@@ -246,7 +255,7 @@ async def test_update_durations_batch_rejects_unknown_id_atomically(
     auth_client: AsyncClient,
     session: AsyncSession,
 ):
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     await session.commit()
 
@@ -270,7 +279,7 @@ async def test_update_durations_batch_rejects_sort_order(
 ):
     lifecycle = type("Lifecycle", (), {"reconcile_lots": AsyncMock(return_value=[])})()
     monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     await session.commit()
 
@@ -287,7 +296,7 @@ async def test_delete_unused_duration(
     auth_client: AsyncClient,
     session: AsyncSession,
 ):
-    duration = Duration(days=8, is_enabled=True, sort_order=8)
+    duration = Duration(minutes=8 * 24 * 60, is_enabled=True, sort_order=8)
     session.add(duration)
     await session.commit()
 
@@ -307,7 +316,7 @@ async def test_delete_duration_reports_every_reference_without_cascade(
         is_active=True,
         is_sellable=True,
     )
-    duration = Duration(days=8, is_enabled=True, sort_order=8)
+    duration = Duration(minutes=8 * 24 * 60, is_enabled=True, sort_order=8)
     scope = LimitScope(code="any", name="Any", is_enabled=True, sort_order=10)
     account = Account(
         login="duration-delete@example.com",
@@ -384,7 +393,7 @@ async def test_delete_duration_handles_concurrent_reference_race(
     session: AsyncSession,
     monkeypatch,
 ):
-    duration = Duration(days=8, is_enabled=True, sort_order=8)
+    duration = Duration(minutes=8 * 24 * 60, is_enabled=True, sort_order=8)
     session.add(duration)
     await session.commit()
     commit = AsyncMock(
@@ -427,12 +436,7 @@ async def test_limit_scopes_use_fixed_canonical_order(
     response = await auth_client.get("/api/limit-scopes")
 
     assert response.status_code == 200
-    assert [item["code"] for item in response.json()] == [
-        "any",
-        "chat",
-        "codex",
-        "legacy",
-    ]
+    assert [item["code"] for item in response.json()] == ["any", "codex"]
 
 
 async def test_update_limit_scope(
@@ -499,7 +503,7 @@ async def test_unchanged_availability_skips_reconciliation(
 ):
     lifecycle = type("Lifecycle", (), {"reconcile_lots": AsyncMock(return_value=[])})()
     monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(
         code="codex",
         name="Codex",
@@ -546,7 +550,7 @@ async def test_update_limit_scope_rejects_enabling_unmeasurable_chat(
         json={"is_enabled": True},
     )
 
-    assert resp.status_code == 422
+    assert resp.status_code == 404
     await session.refresh(scope)
     assert scope.is_enabled is False
 
@@ -569,7 +573,7 @@ async def test_update_limit_scope_rejects_enabling_unknown_legacy_scope(
         json={"is_enabled": True},
     )
 
-    assert resp.status_code == 422
+    assert resp.status_code == 404
     await session.refresh(scope)
     assert scope.is_enabled is False
 

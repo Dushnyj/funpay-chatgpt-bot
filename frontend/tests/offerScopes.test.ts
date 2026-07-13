@@ -15,6 +15,6 @@ test('offer scopes keep canonical system order and place unknown codes last', ()
 
   assert.deepEqual(
     scopes.sort(compareOfferScopes).map((scope) => `${scope.code.toLowerCase()}:${scope.id}`),
-    ['any:2', 'chat:3', 'codex:4', 'codex:5', 'alpha:7', 'legacy-z:8'],
+    ['any:2', 'codex:4', 'codex:5', 'alpha:7', 'chat:3', 'legacy-z:8'],
   )
 })

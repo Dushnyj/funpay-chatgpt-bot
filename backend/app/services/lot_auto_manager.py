@@ -7,22 +7,23 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
-from app.models.account import Account, AccountLimits
+from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.lot import Lot, PriceMatrix
 from app.models.audit import AuditLog
-from app.models.rental import Rental
-from app.models.settings import SellerSettings
+from app.models.rental import OCCUPYING_RENTAL_STATUSES, Rental
 from app.services.limit_eligibility import apply_limit_scope_filters
+from app.services.durations import format_duration, format_legacy_days
+from app.services.account_pool import (
+    DELIVERY_ALLOCATION_HEADROOM,
+    limits_freshness_for_duration,
+)
 from app.services.lot_sync import LotSyncService
 from app.services.lot_templates import (
     LotTemplateRenderError,
     render_lot_template,
     resolve_lot_template,
 )
-
-
-_LIMITS_FRESH_THRESHOLD = timedelta(hours=1)
 
 
 @dataclass(frozen=True)
@@ -256,11 +257,13 @@ class LotAutoManager:
         ):
             return False
 
-        settings = await session.get(SellerSettings, 1)
-        default_max = settings.default_max_active_rentals if settings else 1
         now = datetime.now(timezone.utc)
-        fresh_cutoff = now - _LIMITS_FRESH_THRESHOLD
-        required_expires_at = now + timedelta(days=duration.days)
+        fresh_cutoff = now - limits_freshness_for_duration(duration.minutes)
+        required_expires_at = (
+            now
+            + timedelta(minutes=duration.minutes)
+            + DELIVERY_ALLOCATION_HEADROOM
+        )
         expiry_condition = Account.subscription_expires_at >= required_expires_at
         if tier.code == "free":
             expiry_condition = or_(
@@ -269,9 +272,17 @@ class LotAutoManager:
             )
         active_rentals = (
             select(Rental.account_id, func.count(Rental.id).label("cnt"))
-            .where(Rental.status == "active")
+            .where(Rental.status.in_(OCCUPYING_RENTAL_STATUSES))
             .group_by(Rental.account_id)
             .subquery()
+        )
+        reserved_for_replacement = (
+            select(Rental.id)
+            .where(Rental.replacement_target_account_id == Account.id)
+            .exists()
+        )
+        active_checks = select(AccountCheckJob.account_id).where(
+            AccountCheckJob.status.in_(("pending", "running"))
         )
 
         stmt = (
@@ -286,8 +297,9 @@ class LotAutoManager:
                 AccountLimits.measured_at >= fresh_cutoff,
                 AccountLimits.refresh_status == "ok",
                 AccountLimits.plan_window_status == "ok",
-                func.coalesce(Account.max_active_rentals, default_max)
-                > func.coalesce(active_rentals.c.cnt, 0),
+                func.coalesce(active_rentals.c.cnt, 0) < 1,
+                ~reserved_for_replacement,
+                Account.id.not_in(active_checks),
             )
         )
         stmt = apply_limit_scope_filters(
@@ -378,9 +390,22 @@ class LotAutoManager:
             tier_id=matrix.tier_id,
             limit_scope_id=matrix.limit_scope_id,
         )
+        if duration.minutes % (24 * 60) != 0 and template is not None:
+            contents = (
+                template.title_template_ru,
+                template.title_template_en,
+                template.description_template_ru,
+                template.description_template_en,
+            )
+            if any("{days}" in content for content in contents):
+                raise LotTemplateRenderError(
+                    "Sub-day rentals require {duration}; update the custom "
+                    "template that still uses deprecated {days}"
+                )
         shared = {
             "plan": tier.name,
-            "days": duration.days,
+            "duration_minutes": duration.minutes,
+            "days": format_legacy_days(duration.minutes),
             "long_window_days": 30 if tier.code == "free" else 7,
             "min_limit": (
                 f"{matrix.min_limit_pct}%"
@@ -400,6 +425,7 @@ class LotAutoManager:
             lang="ru",
             variables={
                 **shared,
+                "duration": format_duration(duration.minutes, "ru"),
                 "condition": self._condition(
                     scope, matrix, "ru", compact=True,
                 ),
@@ -410,6 +436,7 @@ class LotAutoManager:
             lang="en",
             variables={
                 **shared,
+                "duration": format_duration(duration.minutes, "en"),
                 "condition": self._condition(
                     scope, matrix, "en", compact=True,
                 ),
@@ -428,14 +455,6 @@ class LotAutoManager:
                 f"остаток во всех наблюдаемых окнах Codex не ниже {minimum}%"
                 if lang == "ru"
                 else f"at least {minimum}% remaining in every observed Codex window"
-            )
-        if code == "chat" and minimum is not None:
-            if compact:
-                return f"ChatGPT ≥ {minimum}%"
-            return (
-                f"остаток ChatGPT не ниже {minimum}%"
-                if lang == "ru"
-                else f"at least {minimum}% ChatGPT allowance remaining"
             )
         ceilings = [
             value for value in (matrix.max_5h_pct, matrix.max_weekly_pct)

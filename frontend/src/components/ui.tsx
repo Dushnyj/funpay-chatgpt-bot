@@ -1,5 +1,6 @@
 import { useEffect, useRef, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
+import { statusPresentation } from '../utils/statusPresentation'
 import { Icon, type IconName } from './Icon'
 
 const FOCUSABLE = [
@@ -134,15 +135,13 @@ export function PageHeader({
 }
 
 export function StatusBadge({ value, label }: { value: string; label?: string }) {
-  const normalized = value.toLowerCase().replaceAll(' ', '_')
-  const positive = ['active', 'connected', 'completed', 'ok', 'healthy'].includes(normalized)
-  const warning = ['pending', 'pending_validation', 'detecting', 'paused', 'maintenance', 'unknown'].includes(normalized)
-  const tone = positive ? 'success' : warning ? 'warning' : 'danger'
+  const presentation = statusPresentation(value)
+  const tone = presentation.tone
   const dot = tone === 'success' ? 'status-dot--success' : tone === 'warning' ? 'status-dot--warning' : 'status-dot--danger'
   return (
     <span className={`status-badge status-badge--${tone}`}>
       <span className={`status-dot ${dot}`} />
-      {label ?? humanizeStatus(value)}
+      {label ?? presentation.label}
     </span>
   )
 }
@@ -192,28 +191,4 @@ export function ErrorState({ message = 'Не удалось загрузить �
 
 export function TableShell({ children }: { children: ReactNode }) {
   return <div className="table-shell">{children}</div>
-}
-
-function humanizeStatus(value: string) {
-  const labels: Record<string, string> = {
-    active: 'Активен',
-    banned: 'Заблокирован',
-    completed: 'Завершён',
-    connected: 'Подключён',
-    deleted: 'Удалён',
-    disabled: 'Отключён',
-    disconnected: 'Не подключён',
-    error: 'Ошибка',
-    expired: 'Истёк',
-    failed: 'Ошибка',
-    maintenance: 'Обслуживание',
-    paused: 'Приостановлен',
-    pending: 'Ожидает',
-    pending_validation: 'Проверяется',
-    refunded: 'Возврат',
-    replaced: 'Заменён',
-    revoked: 'Отозван',
-    unknown: 'Неизвестно',
-  }
-  return labels[value] ?? value.replaceAll('_', ' ')
 }

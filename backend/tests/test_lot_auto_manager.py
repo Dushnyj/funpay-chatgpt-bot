@@ -5,10 +5,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import FakeChatGateway
-from app.models.account import Account, AccountLimits
+from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.lot import Lot, LotTemplate, PriceMatrix
+from app.models.rental import Order, Rental
 from app.services.lot_auto_manager import LotAutoManager
 
 
@@ -17,7 +18,7 @@ async def _seed_catalog(session: AsyncSession):
         code="plus", name="Plus", is_active=True, is_sellable=True,
     )
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope_any = LimitScope(code="any", name="Любой")
     session.add(scope_any)
@@ -50,7 +51,6 @@ async def _add_account_with_limits(
     await session.flush()
     session.add(AccountLimits(
         account_id=acc.id, refresh_token_encrypted="enc",
-        chat_5h_remaining_pct=80, chat_weekly_remaining_pct=70,
         codex_5h_remaining_pct=60, codex_weekly_remaining_pct=50,
         codex_primary_remaining_pct=codex_primary,
         codex_primary_window_seconds=codex_window_seconds,
@@ -186,7 +186,7 @@ async def test_successful_first_create_is_durable_when_second_remote_call_fails(
 ):
     tier, duration, scope = await _seed_catalog(session)
     await _add_account_with_limits(session, tier.id)
-    second_duration = Duration(days=3, is_enabled=True, sort_order=5)
+    second_duration = Duration(minutes=3 * 24 * 60, is_enabled=True, sort_order=5)
     session.add(second_duration)
     await session.flush()
     session.add_all([
@@ -390,10 +390,41 @@ async def test_activates_lot_when_capacity_returns(session: AsyncSession):
     assert gateway.saved_offers[200].active is True
 
 
-async def test_full_account_capacity_pauses_lot(session: AsyncSession):
+@pytest.mark.parametrize("rental_status", ["active", "expiry_pending"])
+async def test_full_account_capacity_pauses_lot(
+    session: AsyncSession,
+    rental_status: str,
+):
     tier, duration, scope = await _seed_catalog(session)
     account = await _add_account_with_limits(session, tier.id)
-    account.max_active_rentals = 0
+    order = Order(
+        funpay_order_id="capacity-order",
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(
+        Rental(
+            order_id=order.id,
+            account_id=account.id,
+            buyer_funpay_id="200",
+            buyer_funpay_chat_id="100",
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            lang="ru",
+            started_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+            status=rental_status,
+            credentials_delivery_status="sent",
+        )
+    )
     matrix = PriceMatrix(
         tier_id=tier.id, duration_id=duration.id, limit_scope_id=scope.id,
         price=599,
@@ -412,6 +443,123 @@ async def test_full_account_capacity_pauses_lot(session: AsyncSession):
     actions = await LotAutoManager(55).run(session, FakeChatGateway())
 
     assert any(action.action == "pause" for action in actions)
+
+
+async def test_replacement_reservation_consumes_old_and_target_capacity(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    old_account = await _add_account_with_limits(session, tier.id, n=1)
+    target_account = await _add_account_with_limits(session, tier.id, n=2)
+    order = Order(
+        funpay_order_id="reserved-capacity-order",
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        status="completed",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(
+        Rental(
+            order_id=order.id,
+            account_id=old_account.id,
+            replacement_target_account_id=target_account.id,
+            buyer_funpay_id="200",
+            buyer_funpay_chat_id="100",
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            lang="ru",
+            started_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+            status="active",
+            credentials_delivery_status="sent",
+        )
+    )
+    matrix = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=True,
+        funpay_id="310",
+    )
+    session.add(lot)
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert any(action.action == "pause" for action in actions)
+    await session.refresh(lot)
+    assert lot.status == "paused"
+    assert lot.paused_reason == "auto_no_account"
+
+
+@pytest.mark.parametrize("job_status", ["pending", "running"])
+async def test_active_account_check_job_consumes_lot_capacity(
+    session: AsyncSession,
+    job_status: str,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    account = await _add_account_with_limits(session, tier.id)
+    session.add(
+        AccountCheckJob(
+            account_id=account.id,
+            priority="limit_check",
+            job_type="limit_check",
+            status=job_status,
+            started_at=(
+                datetime.now(timezone.utc) if job_status == "running" else None
+            ),
+        )
+    )
+    matrix = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=True,
+        funpay_id="311",
+    )
+    session.add(lot)
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert any(action.action == "pause" for action in actions)
+    await session.refresh(lot)
+    assert lot.status == "paused"
+    assert lot.paused_reason == "auto_no_account"
 
 
 async def test_price_change_is_synced_to_existing_offer(session: AsyncSession):
@@ -708,8 +856,6 @@ async def test_any_capacity_ceilings_follow_short_and_long_semantics(
     )
     # There is no trustworthy ChatGPT usage endpoint; exact-window capacity
     # here is intentionally based only on observed Codex data.
-    limits.chat_5h_remaining_pct = None
-    limits.chat_weekly_remaining_pct = None
     session.add(
         PriceMatrix(
             tier_id=tier.id,

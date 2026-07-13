@@ -6,6 +6,8 @@ from sqlalchemy import case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountCheckJob
+from app.models.rental import OCCUPYING_RENTAL_STATUSES, Rental
+from app.services.account_occupancy import account_is_busy
 
 
 _PRIORITY_ORDER = {"new": 0, "refresh_recover": 0, "manual": 1, "scheduled": 2, "limit_check": 3}
@@ -67,11 +69,20 @@ class CheckJobQueue:
         session: AsyncSession,
         job_types: tuple[str, ...],
     ) -> AccountCheckJob | None:
-        result = await session.execute(
+        reserved_targets = select(Rental.replacement_target_account_id).where(
+            Rental.replacement_target_account_id.is_not(None)
+        )
+        occupied_accounts = select(Rental.account_id).where(
+            Rental.status.in_(OCCUPYING_RENTAL_STATUSES)
+        )
+        base_stmt = (
             select(AccountCheckJob)
+            .join(Account, Account.id == AccountCheckJob.account_id)
             .where(
                 AccountCheckJob.status == "pending",
                 AccountCheckJob.job_type.in_(job_types),
+                Account.id.not_in(reserved_targets),
+                Account.id.not_in(occupied_accounts),
             )
             .order_by(
                 case(
@@ -83,10 +94,47 @@ class CheckJobQueue:
                 ),
                 AccountCheckJob.created_at.asc(),
             )
-            .limit(1)
-            .with_for_update(skip_locked=True)
         )
-        return result.scalar_one_or_none()
+        rejected_account_ids: set[int] = set()
+        while True:
+            stmt = base_stmt
+            if rejected_account_ids:
+                stmt = stmt.where(Account.id.not_in(rejected_account_ids))
+            candidate = (
+                await session.execute(
+                    stmt.limit(1).with_for_update(
+                        # Account is the global allocator/mutator
+                        # serialization row. Always lock it before Job.
+                        of=Account,
+                        skip_locked=True,
+                    )
+                )
+            ).scalar_one_or_none()
+            if candidate is None:
+                return None
+
+            # The first statement's Rental subqueries may have used a snapshot
+            # taken just before a concurrent allocation committed. Account is
+            # ours now, so a fresh statement sees that commit and prevents the
+            # validation from starting on an occupied/reserved account. Lock
+            # Job second to keep the global Account -> Job order.
+            job = (
+                await session.execute(
+                    select(AccountCheckJob)
+                    .where(AccountCheckJob.id == candidate.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if (
+                job is None
+                or job.status != "pending"
+                or job.job_type not in job_types
+                or await account_is_busy(session, candidate.account_id)
+            ):
+                rejected_account_ids.add(candidate.account_id)
+                continue
+            return job
 
     async def recover_stale_running(
         self,

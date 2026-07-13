@@ -32,6 +32,11 @@ const DEFAULT_SETTINGS: SettingsType = {
   limits_warn_threshold_pct: 20,
 }
 
+const withSafeRentalCapacity = (settings: SettingsType): SettingsType => ({
+  ...settings,
+  default_max_active_rentals: 1,
+})
+
 export default function Settings() {
   const settingsQuery = useSettings()
   const metricsQuery = useMetrics()
@@ -58,7 +63,7 @@ export default function Settings() {
   const missingSettings = settingsQuery.error instanceof ApiError && settingsQuery.error.status === 404
 
   useEffect(() => {
-    if (settingsQuery.data && !dirty) setDraft(settingsQuery.data)
+    if (settingsQuery.data && !dirty) setDraft(withSafeRentalCapacity(settingsQuery.data))
   }, [settingsQuery.data, dirty])
 
   useEffect(() => {
@@ -86,7 +91,7 @@ export default function Settings() {
       return
     }
     if (
-      draft.default_max_active_rentals < 1
+      draft.default_max_active_rentals !== 1
       || draft.funpay_commission_percent < 0
       || draft.funpay_commission_percent > 100
       || draft.check_interval_minutes < 1
@@ -96,7 +101,7 @@ export default function Settings() {
       || draft.limits_warn_threshold_pct < 0
       || draft.limits_warn_threshold_pct > 100
     ) {
-      setError('Проверьте основные интервалы и лимит аренд; проценты должны быть от 0 до 100.')
+      setError('Проверьте основные интервалы; безопасная ёмкость — 1 активная аренда на аккаунт, проценты должны быть от 0 до 100.')
       return
     }
     if (
@@ -113,8 +118,8 @@ export default function Settings() {
       return
     }
     try {
-      const canonical = await update.mutateAsync(draft)
-      setDraft(canonical)
+      const canonical = await update.mutateAsync(withSafeRentalCapacity(draft))
+      setDraft(withSafeRentalCapacity(canonical))
       setDirty(false)
       setSuccess('Настройки сохранены.')
     } catch (cause) {
@@ -123,7 +128,7 @@ export default function Settings() {
   }
 
   const discard = () => {
-    setDraft(settingsQuery.data ?? DEFAULT_SETTINGS)
+    setDraft(withSafeRentalCapacity(settingsQuery.data ?? DEFAULT_SETTINGS))
     setDirty(false)
     setError('')
     setSuccess('')
@@ -270,10 +275,10 @@ export default function Settings() {
       </section>
 
       <section className="settings-section">
-        <div className="settings-section__intro"><div className="settings-section__icon"><Icon name="prices" /></div><div><h2>Продажи и ёмкость</h2><p>Общие ограничения пула и расчёт чистой выручки.</p></div></div>
+        <div className="settings-section__intro"><div className="settings-section__icon"><Icon name="prices" /></div><div><h2>Продажи и ёмкость</h2><p>Безопасная выдача аккаунтов и расчёт чистой выручки.</p></div></div>
         <div className="settings-card">
           <div className="form-grid form-grid--3">
-            <NumberField label="Аренд на аккаунт" suffix="шт" min={1} value={draft.default_max_active_rentals} onChange={(value) => change('default_max_active_rentals', value)} hint="Если у аккаунта нет override" />
+            <label className="field"><span className="field__label">Активных аренд на аккаунт</span><span className="number-with-suffix"><input type="number" min="1" max="1" value="1" readOnly aria-readonly="true" /><span>шт</span></span><span className="field__hint">Аккаунт выдаётся только одному покупателю до окончания аренды.</span></label>
             <NumberField label="Комиссия FunPay" suffix="%" min={0} max={100} value={draft.funpay_commission_percent} onChange={(value) => change('funpay_commission_percent', value)} hint="Для расчёта netto" />
             <NumberField label="Порог предупреждения" suffix="%" min={0} max={100} value={draft.limits_warn_threshold_pct} onChange={(value) => change('limits_warn_threshold_pct', value)} hint="Уведомление о низком остатке" />
           </div>

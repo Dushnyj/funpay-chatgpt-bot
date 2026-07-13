@@ -6,6 +6,7 @@ from app.models.lot import LotTemplate
 from app.models.message import MessageTemplate
 from app.services.lot_templates import (
     DEFAULT_LOT_TEMPLATES,
+    LEGACY_DAY_LOT_TEMPLATES,
     validate_lot_template_values,
 )
 from app.services.subscription_plans import SYSTEM_SUBSCRIPTION_PLANS
@@ -14,16 +15,15 @@ from app.services.subscription_plans import SYSTEM_SUBSCRIPTION_PLANS
 DEFAULT_TIERS: tuple[tuple[str, str], ...] = tuple(
     (plan.name, plan.description) for plan in SYSTEM_SUBSCRIPTION_PLANS
 )
-DEFAULT_DURATIONS: tuple[int, ...] = (1, 3, 5, 7, 15, 30)
+DEFAULT_DURATIONS: tuple[int, ...] = tuple(
+    days * 24 * 60 for days in (1, 3, 5, 7, 15, 30)
+)
 DEFAULT_LIMIT_SCOPES: tuple[tuple[str, str], ...] = (
     ("any", "Без гарантии лимита"),
-    ("chat", "Chat"),
     ("codex", "Codex"),
 )
 DEFAULT_LIMIT_SCOPE_AVAILABILITY: dict[str, bool] = {
     "any": True,
-    # OpenAI does not expose a trustworthy remaining Chat message allowance.
-    "chat": False,
     "codex": True,
 }
 
@@ -96,7 +96,7 @@ LEGACY_LIMIT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
-DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+PRE_AGENTIC_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
     "welcome": {
         "ru": (
             "✅ Заказ выполнен. ChatGPT {tier} на {days} дн.:\n\n"
@@ -278,6 +278,181 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
+# Active defaults describe the single measured agentic pool and use a
+# display-ready duration so sub-day rentals remain truthful in every locale.
+DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+    **PRE_AGENTIC_MESSAGE_TEMPLATES,
+    "code_success": {
+        "ru": (
+            "🔑 Ваш код: {code}\n"
+            "⏱ Код обновляется каждые 30 секунд — используйте его сразу.\n"
+            "Доступ активен ещё: {expires_in}"
+        ),
+        "en": (
+            "🔑 Your code: {code}\n"
+            "⏱ The code refreshes every 30 seconds — use it immediately.\n"
+            "Access remains active for: {expires_in}"
+        ),
+    },
+    "code_expiring": {
+        "ru": (
+            "⏳ До окончания доступа осталось меньше минуты. "
+            "Новый код входа уже не выдаётся."
+        ),
+        "en": (
+            "⏳ Less than one minute remains. A new login code can no "
+            "longer be issued."
+        ),
+    },
+    "account_unavailable": {
+        "ru": (
+            "⚠️ Аккаунт временно недоступен. Используйте !замена или "
+            "!продавец."
+        ),
+        "en": (
+            "⚠️ The account is temporarily unavailable. Use !replace or "
+            "!seller."
+        ),
+    },
+    "delivery_pending": {
+        "ru": (
+            "⏳ Данные аккаунта ещё доставляются. Повторите команду после "
+            "сообщения об успешной выдаче."
+        ),
+        "en": (
+            "⏳ Account credentials are still being delivered. Retry after "
+            "the successful delivery message."
+        ),
+    },
+    "replace_expiring": {
+        "ru": (
+            "⏳ До окончания доступа меньше 2 минут. "
+            "Безопасная замена аккаунта уже невозможна."
+        ),
+        "en": (
+            "⏳ Less than 2 minutes of access remain. "
+            "A safe account replacement is no longer possible."
+        ),
+    },
+    "welcome": {
+        "ru": (
+            "✅ Заказ выполнен. ChatGPT {tier} на {duration}:\n\n"
+            "Логин: {login}\n"
+            "Пароль: {password}\n"
+            "Тариф аккаунта до: {expires_at}\n"
+            "Отсчёт доступа начнётся после доставки; точное окончание — "
+            "!подписка.\n\n"
+            "📊 Лимит Codex (общий для Work, Workspace Agents и Excel; "
+            "обычный Chat не расходует его):\n"
+            "• Основное окно: {codex_primary_limit}; {codex_primary_window}; "
+            "сброс {codex_primary_reset}\n"
+            "• Дополнительное окно: {codex_secondary_limit}; "
+            "{codex_secondary_window}; сброс {codex_secondary_reset}\n\n"
+            "📱 Для входа: !код | Помощь: !помощь | Замена: !замена"
+        ),
+        "en": (
+            "✅ Order completed. ChatGPT {tier} for {duration}:\n\n"
+            "Login: {login}\n"
+            "Password: {password}\n"
+            "Account plan until: {expires_at}\n"
+            "Access starts after delivery; use !sub for the exact end time.\n\n"
+            "📊 Shared agentic allowance:\n"
+            "• Primary window: {codex_primary_limit}; {codex_primary_window}; "
+            "resets {codex_primary_reset}\n"
+            "• Secondary window: {codex_secondary_limit}; "
+            "{codex_secondary_window}; resets {codex_secondary_reset}\n\n"
+            "⚠️ This allowance is shared by Codex, Work, Workspace Agents and Excel.\n\n"
+            "📱 To log in: !code | Help: !help | Replace: !replace"
+        ),
+    },
+    "subscription": {
+        "ru": (
+            "📊 ChatGPT {tier}\n"
+            "Тариф аккаунта до: {expires_at}\n"
+            "Доступ до: {access_expires_at}\n"
+            "Осталось: {expires_in}\n\n"
+            "Лимит Codex (общий для Work, Workspace Agents и Excel; "
+            "обычный Chat не расходует его):\n"
+            "• Основное окно: {codex_primary_limit}; {codex_primary_window}; "
+            "сброс {codex_primary_reset}\n"
+            "• Дополнительное окно: {codex_secondary_limit}; "
+            "{codex_secondary_window}; сброс {codex_secondary_reset}"
+        ),
+        "en": (
+            "📊 ChatGPT {tier}\n"
+            "Account plan until: {expires_at}\n"
+            "Access until: {access_expires_at}\n"
+            "Remaining: {expires_in}\n\n"
+            "Shared agentic allowance:\n"
+            "• Primary window: {codex_primary_limit}; {codex_primary_window}; "
+            "resets {codex_primary_reset}\n"
+            "• Secondary window: {codex_secondary_limit}; "
+            "{codex_secondary_window}; resets {codex_secondary_reset}"
+        ),
+    },
+    "subscription_limits_unavailable": {
+        "ru": (
+            "📊 ChatGPT {tier}\n"
+            "Тариф аккаунта до: {expires_at}\n"
+            "Доступ до: {access_expires_at}\n"
+            "Осталось: {expires_in}\n\n"
+            "⚠️ Лимиты сейчас не удалось обновить, поэтому устаревшие "
+            "значения не показываются. Повторите команду позже или вызовите "
+            "!продавец."
+        ),
+        "en": (
+            "📊 ChatGPT {tier}\n"
+            "Account plan until: {expires_at}\n"
+            "Access until: {access_expires_at}\n"
+            "Remaining: {expires_in}\n\n"
+            "⚠️ Limits could not be refreshed, so stale values are hidden. "
+            "Try again later or use !seller."
+        ),
+    },
+    "replace_success": {
+        "ru": (
+            "🔄 Замена выполнена. Новые данные:\n\n"
+            "Логин: {login}\n"
+            "Пароль: {password}\n"
+            "ChatGPT {tier}, доступ ещё на {duration}.\n"
+            "Тариф аккаунта до: {expires_at}\n"
+            "Доступ до: {access_expires_at}\n\n"
+            "📊 Лимит Codex (общий для Work, Workspace Agents и Excel; "
+            "обычный Chat не расходует его):\n"
+            "• Основное окно: {codex_primary_limit}; {codex_primary_window}; "
+            "сброс {codex_primary_reset}\n"
+            "• Дополнительное окно: {codex_secondary_limit}; "
+            "{codex_secondary_window}; сброс {codex_secondary_reset}\n\n"
+            "📱 Для кода входа: !код"
+        ),
+        "en": (
+            "🔄 Replacement done. New credentials:\n\n"
+            "Login: {login}\n"
+            "Password: {password}\n"
+            "ChatGPT {tier}, access for another {duration}.\n"
+            "Account plan until: {expires_at}\n"
+            "Access until: {access_expires_at}\n\n"
+            "📊 Shared agentic allowance:\n"
+            "• Primary window: {codex_primary_limit}; {codex_primary_window}; "
+            "resets {codex_primary_reset}\n"
+            "• Secondary window: {codex_secondary_limit}; "
+            "{codex_secondary_window}; resets {codex_secondary_reset}\n\n"
+            "📱 For login code: !code"
+        ),
+    },
+    "expiry": {
+        "ru": (
+            "⏰ Ваш доступ ({tier}, {duration}) закончился.\n"
+            "Для продления — новый заказ."
+        ),
+        "en": (
+            "⏰ Your access ({tier}, {duration}) has expired.\n"
+            "To extend — new order."
+        ),
+    },
+}
+
+
 async def seed_catalog(
     session: AsyncSession,
     *,
@@ -328,17 +503,23 @@ async def seed_catalog(
         # existed before startup, so a deliberately emptied catalog stays empty.
         initialize_durations = not existing_durations
     if initialize_durations and not existing_durations:
-        for days in DEFAULT_DURATIONS:
-            session.add(Duration(days=days, is_enabled=True, sort_order=days))
+        for minutes in DEFAULT_DURATIONS:
+            session.add(
+                Duration(
+                    minutes=minutes,
+                    is_enabled=True,
+                    sort_order=minutes,
+                )
+            )
     else:
         for duration in existing_durations:
-            duration.sort_order = duration.days
+            duration.sort_order = duration.minutes
 
     existing_scopes = (
         (await session.execute(select(LimitScope))).scalars().all()
     )
     scopes_by_code = {scope.code: scope for scope in existing_scopes}
-    canonical_scope_order = {"any": 10, "chat": 20, "codex": 30}
+    canonical_scope_order = {"any": 10, "codex": 20}
     for code, name in DEFAULT_LIMIT_SCOPES:
         scope = scopes_by_code.get(code)
         if scope is None:
@@ -352,6 +533,12 @@ async def seed_catalog(
             )
         else:
             scope.sort_order = canonical_scope_order[code]
+    # Any pre-migration or manually inserted non-canonical scope is never
+    # eligible for a new offer. Historical rows remain readable through FKs.
+    for scope in existing_scopes:
+        if scope.code not in canonical_scope_order:
+            scope.is_enabled = False
+            scope.sort_order = 100
 
     if commit:
         await session.commit()
@@ -380,8 +567,15 @@ async def seed_message_templates(
             if existing is None:
                 session.add(MessageTemplate(key=key, lang=lang, content=content))
                 continue
-            legacy_content = LEGACY_LIMIT_MESSAGE_TEMPLATES.get(key, {}).get(lang)
-            if legacy_content is not None and existing.content == legacy_content:
+            upgrade_sources = {
+                value
+                for value in (
+                    LEGACY_LIMIT_MESSAGE_TEMPLATES.get(key, {}).get(lang),
+                    PRE_AGENTIC_MESSAGE_TEMPLATES.get(key, {}).get(lang),
+                )
+                if value is not None
+            }
+            if existing.content in upgrade_sources:
                 existing.content = content
     if commit:
         await session.commit()
@@ -411,6 +605,19 @@ async def seed_lot_templates(
             existing.name = default.name
             existing.system_managed = True
             existing.is_enabled = True
+            legacy = LEGACY_DAY_LOT_TEMPLATES.get(key)
+            if legacy is not None and all(
+                (
+                    existing.title_template_ru == legacy.title_ru,
+                    existing.title_template_en == legacy.title_en,
+                    existing.description_template_ru == legacy.description_ru,
+                    existing.description_template_en == legacy.description_en,
+                )
+            ):
+                existing.title_template_ru = default.title_ru
+                existing.title_template_en = default.title_en
+                existing.description_template_ru = default.description_ru
+                existing.description_template_en = default.description_en
             continue
         session.add(
             LotTemplate(

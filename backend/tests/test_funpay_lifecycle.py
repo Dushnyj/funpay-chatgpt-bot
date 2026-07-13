@@ -18,7 +18,7 @@ async def _seed_lot(session: AsyncSession) -> int:
         code="plus", name="Plus", is_active=True, is_sellable=True,
     )
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope = LimitScope(code="any", name="Любой")
     session.add(scope)
@@ -191,7 +191,7 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
         is_sellable=True,
     )
     session.add(tier)
-    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
     scope = LimitScope(code="any", name="Любой")
     session.add(scope)
@@ -210,8 +210,6 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
     session.add(AccountLimits(
         account_id=acc.id,
         refresh_token_encrypted="enc",
-        chat_5h_remaining_pct=80,
-        chat_weekly_remaining_pct=70,
         codex_5h_remaining_pct=60,
         codex_weekly_remaining_pct=50,
         measured_at=datetime.now(timezone.utc),

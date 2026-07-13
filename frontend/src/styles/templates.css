@@ -532,6 +532,12 @@
   flex: 0 0 auto;
 }
 
+.templates-validation.is-warning {
+  border-color: #fedf89;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
 .templates-lot-settings {
   min-height: 38px;
   display: flex;

@@ -11,7 +11,7 @@ from app.models.lot import BumpLog, Lot, PriceMatrix
 @pytest.mark.asyncio
 async def test_create_lot_with_all_threshold_fields(session):
     tier = SubscriptionTier(name="Plus", is_active=True)
-    dur = Duration(days=7, is_enabled=True, sort_order=1)
+    dur = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=1)
     scope = LimitScope(code="codex", name="Codex")
     session.add_all([tier, dur, scope])
     await session.flush()
@@ -44,7 +44,7 @@ async def test_create_lot_with_all_threshold_fields(session):
 @pytest.mark.asyncio
 async def test_price_matrix_unique_constraint(session):
     tier = SubscriptionTier(name="Plus", is_active=True)
-    dur = Duration(days=7, is_enabled=True)
+    dur = Duration(minutes=7 * 24 * 60, is_enabled=True)
     scope_any = LimitScope(code="any", name="Любой")
     session.add_all([tier, dur, scope_any])
     await session.flush()
@@ -68,7 +68,7 @@ async def test_price_matrix_unique_constraint(session):
 @pytest.mark.asyncio
 async def test_bump_log_created(session):
     tier = SubscriptionTier(name="Plus", is_active=True)
-    dur = Duration(days=7, is_enabled=True)
+    dur = Duration(minutes=7 * 24 * 60, is_enabled=True)
     scope = LimitScope(code="any", name="Любой")
     session.add_all([tier, dur, scope])
     await session.flush()
