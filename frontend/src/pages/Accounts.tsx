@@ -6,6 +6,7 @@ import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpExport } from '../types/api'
+import { isValidationInProgress, validationState } from '../utils/accountValidation'
 import { formatDate, formatDateTime } from '../utils/format'
 
 export default function Accounts() {
@@ -326,21 +327,6 @@ function normalizeVerificationUrl(value: string) {
   return url.toString()
 }
 
-function isValidationInProgress(account: Account) {
-  const jobStatus = account.validation_job?.status
-  if (jobStatus) return jobStatus === 'pending'
-    || jobStatus === 'running'
-    || jobStatus === 'processing'
-  return account.status === 'pending_validation'
-}
-
-function validationState(account: Account) {
-  if (account.operator_status_override) return account.operator_status_override
-  if (account.validation_job?.status === 'failed' || account.status === 'validation_failed') return 'validation_failed'
-  if (isValidationInProgress(account)) return 'detecting'
-  return account.status
-}
-
 function PlanDetection({ account, tierName, expectedLongWindowSeconds }: { account: Account; tierName: string; expectedLongWindowSeconds: number | null }) {
   const details = [
     account.plan_raw_type ? `raw: ${account.plan_raw_type}` : null,
@@ -465,6 +451,7 @@ function formatConfidence(value: number) {
 function ValidationStatus({ account }: { account: Account }) {
   const job = account.validation_job
   const state = validationState(account)
+  const nonBlockingFailure = state === 'active' && job?.status === 'failed'
   const label = state === 'detecting'
     ? 'Определяется'
     : state === 'validation_failed'
@@ -474,10 +461,15 @@ function ValidationStatus({ account }: { account: Account }) {
   return (
     <div className="validation-state">
       <StatusBadge value={state} label={label} />
-      {job?.stage && <small>Этап: {humanizeValidationStage(job.stage)}</small>}
+      {job?.stage && !nonBlockingFailure && <small>Этап: {humanizeValidationStage(job.stage)}</small>}
       {state === 'validation_failed' && (job?.error_detail || job?.error_code) && (
         <small className="validation-state__error" title={job.error_detail ?? job.error_code ?? undefined}>
           {job.error_detail ?? humanizeValidationError(job.error_code ?? '')}
+        </small>
+      )}
+      {nonBlockingFailure && (
+        <small className="validation-state__warning" title={job.error_detail ?? job.error_code ?? undefined}>
+          Последняя фоновая проверка не завершилась: {job.error_detail ?? humanizeValidationError(job.error_code ?? '')}. Аккаунт остаётся активным по свежим токенам и лимитам.
         </small>
       )}
     </div>

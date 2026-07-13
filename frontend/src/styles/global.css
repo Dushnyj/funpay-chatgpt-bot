@@ -208,6 +208,7 @@ h3 { margin: 0; font-size: 15px; }
 .plan-window-contract--mismatch > small { color: var(--danger); }
 .plan-window-contract--unknown > small { color: var(--warning); }
 .validation-state__error { display: -webkit-box; overflow: hidden; color: var(--danger) !important; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.validation-state__warning { display: -webkit-box; overflow: hidden; color: var(--warning) !important; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .button--compact { min-height: 31px; padding: 0 9px; font-size: 10px; }
 .table-number { font-variant-numeric: tabular-nums; white-space: nowrap; font-weight: 650; }
 .table-subline { display: block; margin-top: 3px; color: #98a2b3; font-size: 10px; }
