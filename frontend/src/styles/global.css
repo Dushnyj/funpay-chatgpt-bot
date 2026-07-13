@@ -771,6 +771,10 @@ h3 { margin: 0; font-size: 15px; }
 .totp-setup-export { display: grid; gap: 13px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
 .totp-setup-export .qr-code { margin: 2px auto; }
 
+@media (min-width: 921px) and (max-width: 1240px) {
+  .accounts-table--operator .account-login { overflow-wrap: anywhere; text-overflow: clip; white-space: normal; }
+}
+
 @media (max-width: 920px) {
   .accounts-table--operator { min-width: 0; }
   .accounts-table--operator td:nth-child(3) { grid-column: 1 / -1; }
