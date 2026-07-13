@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import (
+    DurationCreate,
     DurationOut,
     DurationPatch,
     DurationUpdate,
@@ -94,6 +95,35 @@ async def list_durations(session: AsyncSession = Depends(get_db_session)):
         select(Duration).order_by(Duration.sort_order, Duration.days, Duration.id)
     )
     return result.scalars().all()
+
+
+@router.post("/durations", response_model=DurationOut, status_code=201)
+async def create_duration(
+    req: DurationCreate,
+    session: AsyncSession = Depends(get_db_session),
+):
+    sort_order = req.sort_order
+    if sort_order is None:
+        highest_order = (
+            await session.execute(select(func.max(Duration.sort_order)))
+        ).scalar_one_or_none()
+        sort_order = min((highest_order or 0) + 10, 10_000)
+    duration = Duration(
+        days=req.days,
+        is_enabled=req.is_enabled,
+        sort_order=sort_order,
+    )
+    session.add(duration)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Duration with this number of days already exists",
+        ) from exc
+    await session.refresh(duration)
+    return duration
 
 
 @router.patch("/durations/batch", response_model=list[DurationOut])

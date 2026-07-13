@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './client'
 import type {
   Duration,
+  DurationCreate,
   DurationUpdate,
   LimitScope,
   LimitScopeUpdate,
@@ -46,6 +47,20 @@ export function useUpdateTier() {
 
 export function useDurations() {
   return useQuery({ queryKey: ['durations'], queryFn: () => api.get<Duration[]>('/durations') })
+}
+
+export function useCreateDuration() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: DurationCreate) => api.post<Duration>('/durations', body),
+    onSuccess: (created) => {
+      qc.setQueryData<Duration[]>(['durations'], (current) =>
+        [...(current?.filter((duration) => duration.id !== created.id) ?? []), created]
+          .sort((left, right) => left.sort_order - right.sort_order || left.days - right.days || left.id - right.id),
+      )
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['durations'] }),
+  })
 }
 
 export function useUpdateDuration() {

@@ -807,7 +807,7 @@ CSV: `login,pass,totp,tier_id,expires_at`. Все → `status=pending_validation
 
 **Тарифы (SubscriptionTier):** CRUD.
 
-**Сроки (Duration):** чекбоксы (1-30), sort_order.
+**Сроки (Duration):** список уникальных периодов от 1 до 30 дней, создание пользовательских сроков, включение/выключение, sort_order.
 
 **Лимиты (LimitScope):** any/chat/codex — включение/выключение использования в лотах.
 
@@ -832,7 +832,7 @@ POST   /api/auth/login
 GET    /api/metrics
 GET    /api/accounts | POST | POST /bulk | POST /{id}/check | PATCH /{id} | DELETE /{id}
 GET    /api/tiers | POST | PATCH | DELETE
-GET    /api/durations | PATCH
+GET    /api/durations | POST | PATCH
 GET    /api/limit-scopes | PATCH
 GET    /api/prices | PUT (matrix update)
 GET    /api/templates | PUT                         шаблоны лотов (LotTemplate)

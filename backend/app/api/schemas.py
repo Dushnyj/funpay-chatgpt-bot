@@ -65,6 +65,14 @@ class DurationOut(_Base):
     sort_order: int
 
 
+class DurationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    days: int = Field(strict=True, ge=1, le=30)
+    is_enabled: bool = True
+    sort_order: int | None = Field(default=None, ge=0, le=10_000)
+
+
 class DurationUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

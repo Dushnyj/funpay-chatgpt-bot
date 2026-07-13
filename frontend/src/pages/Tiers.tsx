@@ -3,6 +3,7 @@ import {
   useDurations,
   useLimitScopes,
   useTiers,
+  useCreateDuration,
   useUpdateDuration,
   useUpdateLimitScope,
   useUpdateTier,
@@ -26,7 +27,7 @@ import type {
   Tier,
   TierUpdate,
 } from '../types/api'
-import { durationUnit, parseCatalogSortOrder } from '../utils/catalogEditor'
+import { durationUnit, parseCatalogSortOrder, validateDurationDays } from '../utils/catalogEditor'
 import { isSupportedOfferScopeCode } from '../utils/offerScopes'
 
 type CatalogTab = 'tiers' | 'durations' | 'scopes'
@@ -143,6 +144,7 @@ function DurationsTab() {
   const query = useDurations()
   const updateDuration = useUpdateDuration()
   const [editing, setEditing] = useState<Duration | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
 
   if (query.isLoading) return <LoadingState label="Загружаем сроки аренды" />
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
@@ -151,8 +153,8 @@ function DurationsTab() {
 
   return (
     <section className="panel panel--flush">
-      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен.</p></div><span className="soft-badge soft-badge--editable"><Icon name="settings" size={14} />Доступно редактирование</span></div>
-      {durations.length === 0 ? <EmptyState icon="clock" title="Сроки не инициализированы" description="Backend должен создать набор сроков от 1 до 30 дней при первоначальном запуске." /> : (
+      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен.</p></div><div className="catalog-toolbar-actions"><span className="soft-badge soft-badge--editable"><Icon name="settings" size={14} />Доступно редактирование</span><button type="button" className="button button--secondary" onClick={() => setCreateOpen(true)} title="Добавить пользовательский срок аренды"><Icon name="plus" size={16} />Добавить срок</button></div></div>
+      {durations.length === 0 ? <EmptyState icon="clock" title="Сроки не настроены" description="Добавьте первый период аренды от 1 до 30 дней." action={<button type="button" className="button button--primary" onClick={() => setCreateOpen(true)}><Icon name="plus" />Добавить срок</button>} /> : (
         <div className="duration-grid">{durations.map((duration) => (
           <article className={`duration-card ${duration.is_enabled ? 'duration-card--active' : ''}`} key={duration.id}>
             <span>{duration.days}</span>
@@ -169,7 +171,7 @@ function DurationsTab() {
       {editing && (
         <CatalogSettingsDialog
           title={`Срок ${editing.days} ${durationUnit(editing.days)}`}
-          description="Период задан системой. Можно изменить его доступность и положение в списках."
+          description="Количество дней зафиксировано после создания. Можно изменить доступность и положение в списках."
           enabled={editing.is_enabled}
           sortOrder={editing.sort_order}
           isPending={updateDuration.isPending}
@@ -180,7 +182,82 @@ function DurationsTab() {
           }}
         />
       )}
+      {createOpen && <CreateDurationDialog durations={durations} onClose={() => setCreateOpen(false)} />}
     </section>
+  )
+}
+
+function CreateDurationDialog({ durations, onClose }: { durations: Duration[]; onClose: () => void }) {
+  const createDuration = useCreateDuration()
+  const suggestedSortOrder = Math.min(
+    10_000,
+    Math.max(0, ...durations.map((duration) => duration.sort_order)) + 10,
+  )
+  const [daysInput, setDaysInput] = useState('')
+  const [enabled, setEnabled] = useState(true)
+  const [sortOrderInput, setSortOrderInput] = useState(String(suggestedSortOrder))
+  const [attempted, setAttempted] = useState(false)
+  const [serverError, setServerError] = useState('')
+  const daysValidation = validateDurationDays(daysInput, durations.map((duration) => duration.days))
+  const parsedSortOrder = parseCatalogSortOrder(sortOrderInput)
+  const daysError = attempted && daysValidation.error
+  const orderError = attempted && parsedSortOrder === null
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setAttempted(true)
+    setServerError('')
+    if (daysValidation.days === null || parsedSortOrder === null) return
+    try {
+      await createDuration.mutateAsync({
+        days: daysValidation.days,
+        is_enabled: enabled,
+        sort_order: parsedSortOrder,
+      })
+      onClose()
+    } catch (cause) {
+      setServerError(cause instanceof ApiError
+        ? cause.status === 409
+          ? `Срок ${daysValidation.days} ${durationUnit(daysValidation.days)} уже существует. Обновите список и выберите другое значение.`
+          : cause.message
+        : 'Не удалось создать срок аренды')
+    }
+  }
+
+  return (
+    <ModalOverlay onClose={onClose} canClose={!createDuration.isPending}>
+      <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="create-duration-title" aria-describedby="create-duration-description" onSubmit={submit}>
+        <div className="modal__header">
+          <div><span className="eyebrow">Справочник сроков</span><h2 id="create-duration-title">Новый срок аренды</h2><p id="create-duration-description">После создания количество дней изменить нельзя. Доступность и порядок можно настроить позже.</p></div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" title="Закрыть" disabled={createDuration.isPending}><Icon name="close" /></button>
+        </div>
+        {serverError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{serverError}</span></div>}
+        <div className="catalog-create-fields">
+          <label className="field" htmlFor="create-duration-days">
+            <span className="field__label">Количество дней</span>
+            <input id="create-duration-days" data-autofocus type="number" min="1" max="30" step="1" inputMode="numeric" value={daysInput} onChange={(event) => { setDaysInput(event.target.value); setServerError('') }} onBlur={() => setAttempted(true)} disabled={createDuration.isPending} aria-invalid={Boolean(daysError)} aria-describedby="create-duration-days-hint" placeholder="Например, 8" />
+            <small id="create-duration-days-hint" className={`field__hint ${daysError ? 'text-danger' : ''}`}>{daysError || 'Целое уникальное значение от 1 до 30.'}</small>
+          </label>
+          <label className="field" htmlFor="create-duration-order">
+            <span className="field__label">Порядок отображения</span>
+            <input id="create-duration-order" type="number" min="0" max="10000" step="1" inputMode="numeric" value={sortOrderInput} onChange={(event) => setSortOrderInput(event.target.value)} disabled={createDuration.isPending} aria-invalid={Boolean(orderError)} aria-describedby="create-duration-order-hint" />
+            <small id="create-duration-order-hint" className={`field__hint ${orderError ? 'text-danger' : ''}`}>{orderError ? 'Введите целое число от 0 до 10 000.' : 'Меньшее число показывается раньше.'}</small>
+          </label>
+        </div>
+        <div className="catalog-toggle-row catalog-create-toggle">
+          <div><strong>Включить сразу</strong><small>Срок появится в создании цен и новых лотов.</small></div>
+          <label className="switch-control">
+            <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} disabled={createDuration.isPending} aria-label="Включить новый срок сразу" />
+            <span aria-hidden="true" />
+            <strong>{enabled ? 'Включён' : 'Выключен'}</strong>
+          </label>
+        </div>
+        <div className="modal__actions">
+          <button type="button" className="button button--secondary" onClick={onClose} disabled={createDuration.isPending}>Отмена</button>
+          <button type="submit" className="button button--primary" disabled={createDuration.isPending}>{createDuration.isPending ? 'Создаём…' : 'Создать срок'}</button>
+        </div>
+      </form>
+    </ModalOverlay>
   )
 }
 

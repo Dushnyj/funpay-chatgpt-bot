@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
@@ -76,6 +77,84 @@ async def test_list_durations(auth_client: AsyncClient, session: AsyncSession):
     resp = await auth_client.get("/api/durations")
     assert resp.status_code == 200
     assert isinstance(resp.json(), list)
+
+
+async def test_create_custom_duration_appends_after_existing_order(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    session.add(Duration(days=7, is_enabled=True, sort_order=30))
+    await session.commit()
+
+    resp = await auth_client.post("/api/durations", json={"days": 8})
+
+    assert resp.status_code == 201
+    assert resp.json() == {
+        "id": resp.json()["id"],
+        "days": 8,
+        "is_enabled": True,
+        "sort_order": 40,
+    }
+
+
+async def test_create_custom_duration_accepts_boundary_days_and_options(
+    auth_client: AsyncClient,
+):
+    first = await auth_client.post(
+        "/api/durations",
+        json={"days": 1, "is_enabled": False, "sort_order": 25},
+    )
+    last = await auth_client.post("/api/durations", json={"days": 30})
+
+    assert first.status_code == 201
+    assert first.json()["days"] == 1
+    assert first.json()["is_enabled"] is False
+    assert first.json()["sort_order"] == 25
+    assert last.status_code == 201
+    assert last.json()["days"] == 30
+
+
+async def test_create_custom_duration_duplicate_returns_conflict(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    session.add(Duration(days=8, is_enabled=False, sort_order=80))
+    await session.commit()
+
+    resp = await auth_client.post(
+        "/api/durations",
+        json={"days": 8, "is_enabled": True, "sort_order": 10},
+    )
+
+    assert resp.status_code == 409
+    durations = (
+        await session.execute(select(Duration).where(Duration.days == 8))
+    ).scalars().all()
+    assert len(durations) == 1
+    assert durations[0].is_enabled is False
+    assert durations[0].sort_order == 80
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"days": 0},
+        {"days": -1},
+        {"days": 31},
+        {"days": 8.0},
+        {"days": "8"},
+        {"days": True},
+        {"days": 8, "unknown": "field"},
+    ],
+)
+async def test_create_custom_duration_rejects_invalid_payload(
+    auth_client: AsyncClient,
+    payload: dict,
+):
+    resp = await auth_client.post("/api/durations", json=payload)
+
+    assert resp.status_code == 422
 
 
 async def test_update_duration_availability_and_order(

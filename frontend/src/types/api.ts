@@ -32,6 +32,12 @@ export interface Duration {
   sort_order: number
 }
 
+export interface DurationCreate {
+  days: number
+  is_enabled?: boolean
+  sort_order?: number
+}
+
 export interface DurationUpdate {
   is_enabled?: boolean
   sort_order?: number
