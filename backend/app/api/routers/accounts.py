@@ -20,7 +20,12 @@ from app.api.schemas import (
     ValidationJobOut,
 )
 from app.check_job_queue import ActiveJobConflict, CheckJobQueue
-from app.models.account import Account, AccountCheckJob, AccountLimits
+from app.models.account import (
+    Account,
+    AccountCheckJob,
+    AccountLimits,
+    EmailOAuthCredential,
+)
 from app.models.audit import AuditLog
 from app.models.rental import Rental
 from app.services.account_device_auth import account_device_auth_manager
@@ -74,9 +79,43 @@ def _validation_job_out(job: AccountCheckJob | None) -> ValidationJobOut | None:
     )
 
 
-def _account_out(account: Account, job: AccountCheckJob | None = None) -> AccountOut:
+def _account_out(
+    account: Account,
+    job: AccountCheckJob | None = None,
+    email_oauth: EmailOAuthCredential | None = None,
+) -> AccountOut:
     base = AccountOut.model_validate(account)
-    return base.model_copy(update={"validation_job": _validation_job_out(job)})
+    return base.model_copy(
+        update={
+            "validation_job": _validation_job_out(job),
+            "email_oauth_connected": (
+                email_oauth is not None and email_oauth.status == "connected"
+            ),
+            "email_oauth_provider": (
+                email_oauth.provider if email_oauth is not None else None
+            ),
+            "email_oauth_status": (
+                email_oauth.status if email_oauth is not None else None
+            ),
+        }
+    )
+
+
+def _account_with_limits(
+    account: Account,
+    limits: AccountLimits | None,
+    job: AccountCheckJob | None = None,
+    email_oauth: EmailOAuthCredential | None = None,
+) -> AccountWithLimits:
+    base = _account_out(account, job, email_oauth)
+    return AccountWithLimits(
+        **base.model_dump(),
+        limits=(
+            AccountLimitsOut.model_validate(limits)
+            if limits is not None
+            else None
+        ),
+    )
 
 
 async def _latest_jobs(
@@ -95,12 +134,47 @@ async def _latest_jobs(
     return latest
 
 
-@router.get("", response_model=list[AccountOut])
+async def _limits_by_account(
+    session: AsyncSession, account_ids: list[int],
+) -> dict[int, AccountLimits]:
+    if not account_ids:
+        return {}
+    result = await session.execute(
+        select(AccountLimits).where(AccountLimits.account_id.in_(account_ids))
+    )
+    return {limits.account_id: limits for limits in result.scalars()}
+
+
+async def _email_oauth_by_account(
+    session: AsyncSession, account_ids: list[int],
+) -> dict[int, EmailOAuthCredential]:
+    if not account_ids:
+        return {}
+    result = await session.execute(
+        select(EmailOAuthCredential).where(
+            EmailOAuthCredential.account_id.in_(account_ids)
+        )
+    )
+    return {credential.account_id: credential for credential in result.scalars()}
+
+
+@router.get("", response_model=list[AccountWithLimits])
 async def list_accounts(session: AsyncSession = Depends(get_db_session)):
     result = await session.execute(select(Account).order_by(Account.id))
     accounts = list(result.scalars().all())
-    jobs = await _latest_jobs(session, [account.id for account in accounts])
-    return [_account_out(account, jobs.get(account.id)) for account in accounts]
+    account_ids = [account.id for account in accounts]
+    jobs = await _latest_jobs(session, account_ids)
+    limits = await _limits_by_account(session, account_ids)
+    email_oauth = await _email_oauth_by_account(session, account_ids)
+    return [
+        _account_with_limits(
+            account,
+            limits.get(account.id),
+            jobs.get(account.id),
+            email_oauth.get(account.id),
+        )
+        for account in accounts
+    ]
 
 
 @router.post("", response_model=AccountOut, status_code=201)
@@ -166,10 +240,9 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
         raise HTTPException(status_code=404, detail="Account not found")
     limits = await session.get(AccountLimits, account_id)
     jobs = await _latest_jobs(session, [account.id])
-    base = _account_out(account, jobs.get(account.id))
-    return AccountWithLimits(
-        **base.model_dump(),
-        limits=AccountLimitsOut.model_validate(limits) if limits is not None else None,
+    email_oauth = await session.get(EmailOAuthCredential, account.id)
+    return _account_with_limits(
+        account, limits, jobs.get(account.id), email_oauth
     )
 
 
@@ -205,7 +278,8 @@ async def recheck_account(
     await session.commit()
     await session.refresh(account)
     await session.refresh(job)
-    return _account_out(account, job)
+    email_oauth = await session.get(EmailOAuthCredential, account.id)
+    return _account_out(account, job, email_oauth)
 
 
 @router.post(
@@ -263,12 +337,13 @@ async def get_device_auth_status(
     except KeyError:
         raise HTTPException(status_code=404, detail="Device authorization not found")
     jobs = await _latest_jobs(session, [account.id])
+    email_oauth = await session.get(EmailOAuthCredential, account.id)
     return DeviceAuthStatusOut(
         status=auth_session.status,
         error_code=auth_session.error_code,
         error_detail=auth_session.error_detail,
         account=(
-            _account_out(account, jobs.get(account.id))
+            _account_out(account, jobs.get(account.id), email_oauth)
             if auth_session.status == "completed"
             else None
         ),
@@ -285,7 +360,8 @@ async def update_account(account_id: int, req: AccountUpdate, session: AsyncSess
     await session.commit()
     await session.refresh(account)
     jobs = await _latest_jobs(session, [account.id])
-    return _account_out(account, jobs.get(account.id))
+    email_oauth = await session.get(EmailOAuthCredential, account.id)
+    return _account_out(account, jobs.get(account.id), email_oauth)
 
 
 @router.delete("/{account_id}", status_code=204)

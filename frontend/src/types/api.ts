@@ -40,6 +40,12 @@ export interface AccountLimits {
   chat_weekly_remaining_pct: number | null
   codex_5h_remaining_pct: number | null
   codex_weekly_remaining_pct: number | null
+  codex_primary_remaining_pct: number | null
+  codex_primary_window_seconds: number | null
+  codex_primary_resets_at: string | null
+  codex_secondary_remaining_pct: number | null
+  codex_secondary_window_seconds: number | null
+  codex_secondary_resets_at: string | null
   refresh_status: string
   measured_at: string | null
 }
@@ -57,7 +63,16 @@ export interface Account {
   plan_source?: string | null
   plan_confidence?: number | null
   plan_detected_at?: string | null
+  email_oauth_connected?: boolean
+  email_oauth_provider?: string | null
+  email_oauth_status?: string | null
   validation_job?: AccountValidationJob | null
+  limits?: AccountLimits | null
+}
+
+export interface EmailOAuthStart {
+  authorization_url: string
+  expires_at: string
 }
 
 export interface AccountValidationJob {

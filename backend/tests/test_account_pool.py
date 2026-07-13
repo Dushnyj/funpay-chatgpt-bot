@@ -157,8 +157,14 @@ async def test_acquire_scope_any_with_max_5h_threshold(session: AsyncSession):
 
 async def test_acquire_scope_codex_with_min_limit(session: AsyncSession):
     tier, duration, scope_any = await _seed_tier_ds(session)
-    await _add_account(session, tier, codex_5h=40, codex_weekly=30)
-    acc2 = await _add_account(session, tier, login="acc2", codex_5h=70, codex_weekly=60)
+    first = await _add_account(session, tier, codex_5h=40, codex_weekly=30)
+    second = await _add_account(session, tier, login="acc2", codex_5h=70, codex_weekly=60)
+    first_limits = await session.get(AccountLimits, first.id)
+    second_limits = await session.get(AccountLimits, second.id)
+    first_limits.codex_primary_remaining_pct = 40
+    first_limits.codex_secondary_remaining_pct = 30
+    second_limits.codex_primary_remaining_pct = 70
+    second_limits.codex_secondary_remaining_pct = 60
 
     pool = AccountPool()
     criteria = AccountCriteria(
@@ -167,7 +173,34 @@ async def test_acquire_scope_codex_with_min_limit(session: AsyncSession):
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
     assert result is not None
-    assert result.id == acc2.id
+    assert result.id == second.id
+
+
+async def test_acquire_scope_codex_accepts_exact_primary_when_secondary_absent(
+    session: AsyncSession,
+):
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_primary_remaining_pct = 95
+    limits.codex_primary_window_seconds = 2_592_000
+    limits.codex_secondary_remaining_pct = None
+    limits.codex_secondary_window_seconds = None
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_days=duration.days,
+            scope="codex",
+            min_limit_pct=90,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
+    assert result is not None and result.id == account.id
 
 
 async def test_acquire_respects_max_active_rentals(session: AsyncSession):

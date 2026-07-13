@@ -14,6 +14,8 @@ class EmailErrorCode(str, enum.Enum):
     NO_CODE = "email_code_not_found"
     UNSUPPORTED = "email_provider_unsupported"
     CONNECTION_FAILED = "email_connection_failed"
+    SECURITY_CHALLENGE = "email_security_challenge"
+    TIMEOUT = "email_timeout"
 
 
 class EmailProviderError(RuntimeError):

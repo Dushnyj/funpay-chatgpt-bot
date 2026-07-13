@@ -13,7 +13,10 @@ OPENAI_ISSUER = "https://auth.openai.com"
 OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USER_AGENT = "codex-cli/1.0.0"
 
-# Пространства имён claims в id_token OpenAI
+# Пространства имён claims в JWT OpenAI.  Older tokens used ``plan_type`` in
+# the auth namespace and kept the account ID in a separate namespace.  Current
+# access tokens use ``chatgpt_plan_type`` and ``chatgpt_account_id`` in the auth
+# namespace, while the profile namespace carries the email address.
 _AUTH_NS = "https://api.openai.com/auth"
 _PROFILE_NS = "https://api.openai.com/profile"
 _ACCOUNT_NS = "https://api.openai.com/account"
@@ -28,9 +31,11 @@ class IdTokenClaims:
 
 
 def parse_id_token(token: str) -> IdTokenClaims:
-    """Парсит JWT id_token без проверки подписи — извлекает claims.
+    """Парсит OpenAI JWT без проверки подписи — извлекает claims.
 
-    Подпись не проверяем: токен получен напрямую от auth.openai.com по TLS,
+    Имя функции оставлено для обратной совместимости, но парсер понимает как
+    id_token старого формата, так и текущий access_token. Подпись не проверяем:
+    токен получен напрямую от auth.openai.com по TLS,
     доверяем каналу. Проверка подписи добавила бы зависимость от публичного ключа,
     который OpenAI не документирует.
     """
@@ -44,9 +49,24 @@ def parse_id_token(token: str) -> IdTokenClaims:
         return IdTokenClaims()
 
     return IdTokenClaims(
-        email=payload.get("email"),
-        plan_type=_get_nested(payload, _AUTH_NS, "plan_type"),
-        account_id=_get_nested(payload, _ACCOUNT_NS, "account_id"),
+        email=(
+            _as_non_empty_string(payload.get("email"))
+            or _as_non_empty_string(_get_nested(payload, _PROFILE_NS, "email"))
+        ),
+        plan_type=(
+            _as_non_empty_string(
+                _get_nested(payload, _AUTH_NS, "chatgpt_plan_type")
+            )
+            or _as_non_empty_string(_get_nested(payload, _AUTH_NS, "plan_type"))
+        ),
+        account_id=(
+            _as_non_empty_string(
+                _get_nested(payload, _AUTH_NS, "chatgpt_account_id")
+            )
+            or _as_non_empty_string(
+                _get_nested(payload, _ACCOUNT_NS, "account_id")
+            )
+        ),
         subscription_expires_at=_parse_unix(_get_nested(payload, _PROFILE_NS, "subscription_expires_at")),
     )
 
@@ -58,17 +78,27 @@ def _decode_jwt_part(part: str) -> dict:
     return json.loads(decoded)
 
 
-def _get_nested(payload: dict, namespace: str, key: str) -> str | int | None:
+def _get_nested(payload: dict, namespace: str, key: str) -> object | None:
     nested = payload.get(namespace)
     if not isinstance(nested, dict):
         return None
     return nested.get(key)
 
 
-def _parse_unix(value: int | None) -> datetime | None:
-    if value is None:
+def _as_non_empty_string(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
-    return datetime.fromtimestamp(value, tz=timezone.utc)
+    value = value.strip()
+    return value or None
+
+
+def _parse_unix(value: object) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 @dataclass

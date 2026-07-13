@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
-from app.models.account import Account, AccountCheckJob
+from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier
 
@@ -77,6 +77,55 @@ async def test_get_account_detail(auth_client: AsyncClient, session: AsyncSessio
     acc_id = resp.json()["id"]
     resp = await auth_client.get(f"/api/accounts/{acc_id}")
     assert resp.status_code == 200
+
+
+async def test_get_account_detail_exports_exact_observed_usage_windows(
+    auth_client: AsyncClient, session: AsyncSession
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={"login": "usage-detail", "password": "pass"},
+    )
+    account_id = created.json()["id"]
+    reset_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    session.add(AccountLimits(
+        account_id=account_id,
+        refresh_token_encrypted="refresh",
+        codex_primary_remaining_pct=93,
+        codex_primary_window_seconds=2592000,
+        codex_primary_resets_at=reset_at,
+        codex_secondary_remaining_pct=None,
+        codex_secondary_window_seconds=None,
+        codex_secondary_resets_at=None,
+        codex_5h_remaining_pct=None,
+        codex_weekly_remaining_pct=None,
+    ))
+    await session.commit()
+
+    response = await auth_client.get(f"/api/accounts/{account_id}")
+
+    assert response.status_code == 200
+    limits = response.json()["limits"]
+    assert limits["codex_primary_remaining_pct"] == 93
+    assert limits["codex_primary_window_seconds"] == 2592000
+    assert limits["codex_primary_resets_at"] == reset_at.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert limits["codex_secondary_remaining_pct"] is None
+    assert limits["codex_secondary_window_seconds"] is None
+    assert limits["codex_secondary_resets_at"] is None
+    # Legacy fields are still in the response but do not mislabel the 30-day
+    # observation as a 5-hour/weekly allowance.
+    assert limits["codex_5h_remaining_pct"] is None
+    assert limits["codex_weekly_remaining_pct"] is None
+
+    listed = await auth_client.get("/api/accounts")
+    assert listed.status_code == 200
+    listed_account = next(
+        item for item in listed.json() if item["id"] == account_id
+    )
+    assert listed_account["limits"]["codex_primary_remaining_pct"] == 93
+    assert listed_account["limits"]["codex_primary_window_seconds"] == 2592000
 
 
 async def test_delete_account(auth_client: AsyncClient, session: AsyncSession):

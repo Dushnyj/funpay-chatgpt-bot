@@ -58,8 +58,16 @@ async def test_measure_and_update_success(session, httpx_mock):
         json={
             "plan_type": "plus",
             "rate_limit": {
-                "primary_window": {"used_percent": 20, "reset_at": "2026-07-12T18:00:00Z"},
-                "secondary_window": {"used_percent": 50, "reset_at": "2026-07-14T00:00:00Z"},
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18000,
+                    "reset_at": "2026-07-12T18:00:00Z",
+                },
+                "secondary_window": {
+                    "used_percent": 50,
+                    "limit_window_seconds": 604800,
+                    "reset_at": "2026-07-14T00:00:00Z",
+                },
             },
         },
     )
@@ -71,7 +79,10 @@ async def test_measure_and_update_success(session, httpx_mock):
             "accounts": {
                 "acc-openai-1": {
                     "account": {"plan_type": "plus"},
-                    "entitlement": {"expires_at": "2026-08-15T00:00:00Z"},
+                    "entitlement": {
+                        "has_active_subscription": True,
+                        "expires_at": "2026-08-15T00:00:00Z",
+                    },
                 }
             }
         },
@@ -88,6 +99,16 @@ async def test_measure_and_update_success(session, httpx_mock):
     assert reloaded.codex_5h_remaining_pct == 80
     assert reloaded.chat_weekly_remaining_pct is None
     assert reloaded.codex_weekly_remaining_pct == 50
+    assert reloaded.codex_primary_remaining_pct == 80
+    assert reloaded.codex_primary_window_seconds == 18000
+    assert reloaded.codex_primary_resets_at == datetime(
+        2026, 7, 12, 18, tzinfo=timezone.utc
+    )
+    assert reloaded.codex_secondary_remaining_pct == 50
+    assert reloaded.codex_secondary_window_seconds == 604800
+    assert reloaded.codex_secondary_resets_at == datetime(
+        2026, 7, 14, tzinfo=timezone.utc
+    )
     assert reloaded.plan_type == "plus"
     assert reloaded.measured_at is not None
     assert reloaded.refresh_status == "ok"
@@ -97,6 +118,112 @@ async def test_measure_and_update_success(session, httpx_mock):
     assert reloaded_account.plan_source == "accounts_check+wham_usage"
     assert reloaded_account.plan_confidence == pytest.approx(0.92)
     assert reloaded_account.plan_detected_at is not None
+
+
+@pytest.mark.asyncio
+async def test_measure_current_free_claims_preserves_sellable_override_and_exact_window(
+    session, httpx_mock
+):
+    free_tier = SubscriptionTier(
+        code="free",
+        name="Free",
+        description="ChatGPT Free",
+        is_active=True,
+        system_managed=True,
+        # Explicit operator override: measuring an account must not re-enable
+        # sale of this plan.
+        is_sellable=False,
+        sort_order=10,
+    )
+    session.add(free_tier)
+    await session.flush()
+    stale_expiry = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    account = Account(
+        login="current@e.com",
+        password_encrypted="p",
+        totp_secret_encrypted="t",
+        status="active",
+        subscription_expires_at=stale_expiry,
+    )
+    session.add(account)
+    await session.flush()
+    access_token = _make_jwt({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-current",
+            "chatgpt_plan_type": "free",
+        },
+        "https://api.openai.com/profile": {"email": "current@e.com"},
+    })
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="rt",
+        access_token_encrypted=access_token,
+        access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        account_id_openai=None,
+        subscription_expires_at=stale_expiry,
+    ))
+    await session.commit()
+    reset_at = 1783987200
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/wham/usage",
+        method="GET",
+        json={
+            "plan_type": "free",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 7,
+                    "limit_window_seconds": 2592000,
+                    "reset_at": reset_at,
+                }
+            },
+        },
+    )
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        method="GET",
+        json={
+            "accounts": {
+                "acct-current": {
+                    "account": {"plan_type": "free"},
+                    "entitlement": {
+                        "subscription_plan": "chatgptplusplan",
+                        "has_active_subscription": False,
+                        "expires_at": 1700000000,
+                    },
+                }
+            }
+        },
+    )
+
+    assert await measure_account_limits(session, account.id) == MeasureResult.OK
+
+    limits = await session.get(AccountLimits, account.id)
+    await session.refresh(account)
+    assert limits.account_id_openai == "acct-current"
+    assert limits.plan_type == "free"
+    assert account.tier_id == free_tier.id
+    assert account.plan_raw_type == "free"
+    assert account.plan_source == "accounts_check+wham_usage+access_token"
+    assert account.plan_confidence == pytest.approx(0.89)
+    assert free_tier.is_sellable is False
+    assert account.subscription_expires_at is None
+    assert limits.subscription_expires_at is None
+    assert limits.codex_primary_remaining_pct == 93
+    assert limits.codex_primary_window_seconds == 2592000
+    observed_reset = limits.codex_primary_resets_at
+    if observed_reset.tzinfo is None:
+        observed_reset = observed_reset.replace(tzinfo=timezone.utc)
+    assert observed_reset == datetime.fromtimestamp(reset_at, tz=timezone.utc)
+    assert limits.codex_secondary_remaining_pct is None
+    assert limits.codex_secondary_window_seconds is None
+    assert limits.codex_secondary_resets_at is None
+    assert limits.codex_5h_remaining_pct is None
+    assert limits.codex_weekly_remaining_pct is None
+    requests = httpx_mock.get_requests()
+    assert all(
+        request.headers["chatgpt-account-id"] == "acct-current"
+        for request in requests
+    )
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,14 @@ from __future__ import annotations
 import enum
 import json
 import logging
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.email.imap_provider import detect_imap_provider
+from app.integrations.email.microsoft_graph_provider import (
+    MicrosoftGraphEmailProvider,
+)
 from app.integrations.email.provider import EmailProvider, EmailProviderError
 from app.integrations.openai.oauth import (
     IdTokenClaims,
@@ -16,7 +20,8 @@ from app.integrations.openai.oauth import (
 from app.integrations.playwright.browser import browser_context
 from app.integrations.playwright.enable_2fa import Enable2FAError, enable_2fa
 from app.integrations.playwright.oauth_login import OAuthLoginError, login_and_get_auth_code
-from app.models.account import Account, AccountLimits
+from app.config import get_settings
+from app.models.account import Account, AccountLimits, EmailOAuthCredential
 from app.services.account_limits import MeasureResult, measure_account_limits
 from app.services.totp import is_valid_base32
 
@@ -59,6 +64,8 @@ class ValidationCode(str, enum.Enum):
     EMAIL_CODE_NOT_FOUND = "email_code_not_found"
     EMAIL_PROVIDER_UNSUPPORTED = "email_provider_unsupported"
     EMAIL_CONNECTION_FAILED = "email_connection_failed"
+    EMAIL_SECURITY_CHALLENGE = "email_security_challenge"
+    EMAIL_TIMEOUT = "email_timeout"
     SETUP_2FA_FAILED = "setup_2fa_failed"
     SETUP_2FA_UI_TIMEOUT = "setup_2fa_ui_timeout"
     SETUP_2FA_BUTTON_NOT_FOUND = "setup_2fa_button_not_found"
@@ -115,7 +122,12 @@ async def validate_account(session: AsyncSession, account_id: int) -> Validation
                 "Сохранённый TOTP-секрет имеет неверный формат.",
             )
 
-        email_provider = _build_email_provider(email, email_password)
+        email_provider = await _build_email_provider(
+            session,
+            account,
+            email,
+            email_password,
+        )
 
         if totp_secret:
             return await _validate_with_existing_totp(
@@ -156,11 +168,61 @@ async def validate_account(session: AsyncSession, account_id: int) -> Validation
         ) from exc
 
 
-def _build_email_provider(
+async def _build_email_provider(
+    session: AsyncSession,
+    account: Account,
     email: str | None,
     email_password: str | None,
 ) -> EmailProvider | None:
-    if not email or not email_password:
+    if not email:
+        return None
+
+    credential = await session.get(EmailOAuthCredential, account.id)
+    if (
+        credential is not None
+        and credential.provider == "microsoft_graph"
+        and credential.status == "connected"
+        and credential.email.strip().casefold() == email.strip().casefold()
+    ):
+        settings = get_settings()
+        client_id = settings.microsoft_graph_client_id.strip()
+        client_secret = settings.microsoft_graph_client_secret.strip()
+        if client_id and client_secret:
+
+            async def persist_refresh_token(refresh_token: str) -> None:
+                credential.refresh_token_encrypted = refresh_token
+                credential.updated_at = datetime.now(timezone.utc)
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+
+            async def mark_reauthorization_required() -> None:
+                credential.status = "reauthorization_required"
+                credential.updated_at = datetime.now(timezone.utc)
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+
+            return MicrosoftGraphEmailProvider(
+                email,
+                client_id=client_id,
+                client_secret=client_secret,
+                refresh_token=credential.refresh_token_encrypted,
+                on_refresh_token=persist_refresh_token,
+                on_reauthorization_required=mark_reauthorization_required,
+            )
+        if not email_password:
+            raise AccountValidationError(
+                ValidationStage.EMAIL_PREFLIGHT,
+                ValidationCode.EMAIL_PROVIDER_UNSUPPORTED,
+                "Microsoft Graph OAuth не настроен на сервере.",
+            )
+
+    if not email_password:
         return None
     return detect_imap_provider(email, email_password)
 

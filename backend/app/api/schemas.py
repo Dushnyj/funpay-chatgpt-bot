@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -90,6 +90,9 @@ class AccountOut(_Base):
     plan_source: str | None = None
     plan_confidence: float | None = None
     plan_detected_at: datetime | None = None
+    email_oauth_connected: bool = False
+    email_oauth_provider: str | None = None
+    email_oauth_status: str | None = None
     validation_job: ValidationJobOut | None = None
 
 
@@ -119,9 +122,30 @@ class AccountLimitsOut(_Base):
     chat_weekly_remaining_pct: int | None = None
     codex_5h_remaining_pct: int | None = None
     codex_weekly_remaining_pct: int | None = None
+    codex_primary_remaining_pct: int | None = None
+    codex_primary_window_seconds: int | None = None
+    codex_primary_resets_at: datetime | None = None
+    codex_secondary_remaining_pct: int | None = None
+    codex_secondary_window_seconds: int | None = None
+    codex_secondary_resets_at: datetime | None = None
     refresh_status: str
     measured_at: datetime | None = None
     plan_type: str | None = None
+
+    @field_validator(
+        "codex_primary_resets_at",
+        "codex_secondary_resets_at",
+        mode="before",
+    )
+    @classmethod
+    def normalize_observed_reset_timezone(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        # SQLite drops timezone metadata in tests and local installs. The API
+        # contract is UTC, matching the OpenAI Unix/ISO timestamps.
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
 
 
 class AccountWithLimits(AccountOut):

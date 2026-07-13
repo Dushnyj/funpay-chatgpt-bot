@@ -27,6 +27,8 @@ async def test_get_usage_success(httpx_mock):
     assert usage.plan_type == "plus"
     assert usage.primary_remaining_pct == 80
     assert usage.secondary_remaining_pct == 60
+    assert usage.primary_window_seconds == 18000
+    assert usage.secondary_window_seconds == 604800
 
 
 @pytest.mark.asyncio
@@ -65,7 +67,10 @@ async def test_get_account_metadata_success(httpx_mock):
             "accounts": {
                 "acc-1": {
                     "account": {"plan_type": "pro"},
-                    "entitlement": {"expires_at": "2026-09-01T00:00:00Z"},
+                    "entitlement": {
+                        "has_active_subscription": True,
+                        "expires_at": "2026-09-01T00:00:00Z",
+                    },
                 }
             }
         },

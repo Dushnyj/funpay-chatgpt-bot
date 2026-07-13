@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { getDeviceAuthStatus, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useStartDeviceAuth } from '../api/accounts'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useStartDeviceAuth } from '../api/accounts'
 import { useTiers } from '../api/catalog'
 import { api, ApiError } from '../api/client'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Account, DeviceAuthSession, DeviceAuthStatus, TotpExport } from '../types/api'
-import { formatDate } from '../utils/format'
+import { formatDate, formatDateTime } from '../utils/format'
 
 export default function Accounts() {
   const accountsQuery = useAccounts()
@@ -25,6 +25,7 @@ export default function Accounts() {
   const [recheckTarget, setRecheckTarget] = useState<number | null>(null)
   const [deviceAuthTarget, setDeviceAuthTarget] = useState<number | null>(null)
   const [deviceAuthModal, setDeviceAuthModal] = useState<{ account: Account; session: DeviceAuthSession } | null>(null)
+  const [emailOAuthTarget, setEmailOAuthTarget] = useState<number | null>(null)
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])
   const tiers = tiersQuery.data ?? []
@@ -42,6 +43,25 @@ export default function Accounts() {
     setActionError('')
     setActionSuccess('Вход подтверждён. Аккаунт и его тариф успешно обновлены.')
     await refetchAccounts()
+  }, [refetchAccounts])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const outcome = params.get('email_oauth')
+    if (!outcome) return
+    const reason = params.get('reason')
+    if (outcome === 'connected') {
+      setActionError('')
+      setActionSuccess('Outlook подключён через Microsoft OAuth. Проверка аккаунта запущена повторно.')
+      void refetchAccounts()
+    } else {
+      setActionSuccess('')
+      setActionError(humanizeEmailOAuthError(reason))
+    }
+    params.delete('email_oauth')
+    params.delete('reason')
+    const query = params.toString()
+    window.history.replaceState({}, '', `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`)
   }, [refetchAccounts])
 
   if (accountsQuery.isLoading) return <LoadingState label="Загружаем пул аккаунтов" />
@@ -119,6 +139,22 @@ export default function Accounts() {
     }
   }
 
+  const connectOutlook = async (account: Account) => {
+    setActionError('')
+    setActionSuccess('')
+    setEmailOAuthTarget(account.id)
+    try {
+      const oauth = await startMicrosoftEmailOAuth(account.id)
+      window.location.assign(oauth.authorization_url)
+    } catch (cause) {
+      const message = cause instanceof ApiError && cause.status === 503
+        ? 'Microsoft OAuth пока не настроен на сервере. Укажите Client ID, Client Secret и callback URL в окружении приложения.'
+        : cause instanceof ApiError ? cause.message : 'Не удалось начать подключение Outlook'
+      setActionError(message)
+      setEmailOAuthTarget(null)
+    }
+  }
+
   return (
     <div className="page-stack">
       <PageHeader
@@ -142,7 +178,7 @@ export default function Accounts() {
       {actionError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{actionError}</span></div>}
       {actionSuccess && <div className="form-alert form-alert--success" role="status"><Icon name="check" /><span>{actionSuccess}</span></div>}
       {hasDeviceAuthCandidate && !actionSuccess && (
-        <div className="form-alert form-alert--info"><Icon name="activity" /><span>Проверка через браузер — основной способ: вы подтверждаете вход в OpenAI лично. «Повторить автоматически» запускает headless-вход, который защита OpenAI может заблокировать.</span></div>
+        <div className="form-alert form-alert--info"><Icon name="activity" /><span>Проверка через браузер — основной способ. Перед первым входом включите в ChatGPT: <strong>Настройки → Безопасность и вход → Авторизация кода устройства для Codex</strong>. «Повторить автоматически» запускает headless-вход, который защита OpenAI может заблокировать.</span></div>
       )}
 
       <section className="panel panel--flush">
@@ -186,10 +222,10 @@ export default function Accounts() {
                   return (
                     <tr key={account.id}>
                     <td>
-                      <div className="identity-cell"><span className="identity-avatar">{account.login.slice(0, 1).toUpperCase()}</span><span><strong>{account.login}</strong><small>{account.email ?? 'Email для восстановления не задан'}</small></span></div>
+                      <div className="identity-cell"><span className="identity-avatar">{account.login.slice(0, 1).toUpperCase()}</span><span><strong>{account.login}</strong><small>{account.email ?? 'Email для восстановления не задан'}</small>{isOutlookAccount(account) && <small className={account.email_oauth_connected ? 'text-success' : 'text-warning'}>{account.email_oauth_connected ? 'Outlook OAuth подключён' : 'Outlook OAuth не подключён'}</small>}</span></div>
                     </td>
                     <td><PlanDetection account={account} tierName={tierName(account.tier_id)} /></td>
-                    <td>{formatDate(account.subscription_expires_at)}</td>
+                    <td>{account.subscription_expires_at ? formatDate(account.subscription_expires_at) : isFreePlan(account, tiers) ? 'Без срока' : '—'}</td>
                     <td>{account.max_active_rentals ?? 'По умолчанию'}</td>
                     <td><ValidationStatus account={account} /></td>
                     <td>
@@ -197,6 +233,11 @@ export default function Accounts() {
                         {isDeviceAuthEligible(account) && (
                           <button className="button button--primary button--compact" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Проверить ${account.login} через браузер`}>
                             {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}Через браузер
+                          </button>
+                        )}
+                        {isOutlookAccount(account) && (
+                          <button className={`button button--compact ${account.email_oauth_connected ? 'button--secondary' : 'button--primary'}`} onClick={() => connectOutlook(account)} disabled={emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} Outlook для ${account.login}`} title="Безопасный доступ к кодам почты через Microsoft OAuth">
+                            {emailOAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name={account.email_oauth_connected ? 'refresh' : 'shield'} size={15} />}{account.email_oauth_connected ? 'Outlook' : 'Почта OAuth'}
                           </button>
                         )}
                         {!isValidationInProgress(account) && (
@@ -286,14 +327,64 @@ function PlanDetection({ account, tierName }: { account: Account; tierName: stri
       <span className={`soft-badge ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName}</span>
       {details.length > 0 && <small>{details.join(' · ')}</small>}
       {account.plan_detected_at && <small>Определён {formatDate(account.plan_detected_at)}</small>}
+      <ObservedLimits account={account} />
     </div>
   )
+}
+
+function ObservedLimits({ account }: { account: Account }) {
+  const limits = account.limits
+  if (!limits?.measured_at) return null
+
+  const measuredAt = new Date(limits.measured_at)
+  const stale = limits.refresh_status !== 'ok'
+    || Number.isNaN(measuredAt.getTime())
+    || Date.now() - measuredAt.getTime() > 15 * 60 * 1_000
+
+  const windows = [
+    {
+      label: formatObservedWindow(limits.codex_primary_window_seconds),
+      remaining: limits.codex_primary_remaining_pct,
+      resetsAt: limits.codex_primary_resets_at,
+    },
+    {
+      label: formatObservedWindow(limits.codex_secondary_window_seconds),
+      remaining: limits.codex_secondary_remaining_pct,
+      resetsAt: limits.codex_secondary_resets_at,
+    },
+  ].filter((window) => window.remaining != null || window.label !== '—')
+
+  if (windows.length === 0) return <small>Лимиты Codex не опубликованы OpenAI</small>
+
+  return (
+    <div className={`observed-limits ${stale ? 'observed-limits--stale' : ''}`}>
+      <small className="observed-limits__meta">Codex · замер {formatDateTime(limits.measured_at)}{stale ? ' · данные устарели' : ''}</small>
+      {windows.map((window, index) => (
+        <span key={`${window.label}-${index}`}>
+          <strong>Окно {window.label}:</strong> {window.remaining == null ? 'остаток неизвестен' : `осталось ${window.remaining}%`}
+          {window.resetsAt && <small>сброс {formatDateTime(window.resetsAt)}</small>}
+        </span>
+      ))}
+    </div>
+  )
+}
+
+function formatObservedWindow(seconds: number | null) {
+  if (seconds == null) return '—'
+  if (seconds % 86_400 === 0) {
+    const days = seconds / 86_400
+    return `${days} ${days === 1 ? 'день' : days >= 2 && days <= 4 ? 'дня' : 'дней'}`
+  }
+  if (seconds % 3_600 === 0) return `${seconds / 3_600} ч`
+  if (seconds % 60 === 0) return `${seconds / 60} мин`
+  return `${seconds} сек`
 }
 
 function humanizePlanSource(source: string) {
   const labels: Record<string, string> = {
     accounts_check: 'OpenAI account',
     wham_usage: 'OpenAI usage',
+    access_token: 'OpenAI access token',
     id_token: 'OpenAI ID token',
     account_api: 'OpenAI API',
     usage_api: 'Usage API',
@@ -332,9 +423,15 @@ function ValidationStatus({ account }: { account: Account }) {
 function humanizeValidationStage(stage: string) {
   const labels: Record<string, string> = {
     queued: 'ожидание в очереди',
+    input: 'проверка введённых данных',
+    email_preflight: 'проверка доступа к почте',
     login: 'вход в ChatGPT',
     two_factor: 'двухфакторная защита',
     oauth: 'получение сессии',
+    setup_2fa: 'настройка двухфакторной защиты',
+    token_exchange: 'получение токенов OpenAI',
+    limit_measurement: 'получение тарифа и лимитов',
+    internal: 'внутренняя проверка',
     plan_detection: 'определение тарифа',
     limits: 'проверка лимитов',
     completed: 'завершено',
@@ -345,19 +442,60 @@ function humanizeValidationStage(stage: string) {
 function humanizeValidationError(code: string) {
   const labels: Record<string, string> = {
     invalid_credentials: 'Неверный логин или пароль',
+    invalid_totp: 'Неверный TOTP setup key',
+    missing_2fa_data: 'Не указан TOTP setup key или доступ к почте',
     totp_failed: 'Не удалось подтвердить код 2FA',
     setup_2fa_failed: 'Не удалось настроить 2FA',
+    setup_2fa_ui_timeout: 'ChatGPT не открыл настройки 2FA вовремя',
+    setup_2fa_button_not_found: 'В ChatGPT не найдена кнопка настройки 2FA',
+    setup_2fa_qr_not_found: 'ChatGPT не показал QR-код 2FA',
+    setup_2fa_qr_invalid: 'Не удалось прочитать QR-код 2FA',
     email_code_failed: 'Не удалось получить код из почты',
+    email_auth_failed: 'Почта отклонила вход',
+    email_code_not_found: 'Новое письмо с кодом OpenAI не найдено',
+    email_provider_unsupported: 'Для этой почты не настроен поддерживаемый способ входа',
+    email_connection_failed: 'Не удалось подключиться к почте',
+    email_security_challenge: 'Outlook запросил ручную проверку безопасности',
+    email_timeout: 'Outlook Web не ответил вовремя',
     login_failed: 'Не удалось войти в ChatGPT',
+    login_timeout: 'ChatGPT не завершил вход вовремя',
+    oauth_rejected: 'OpenAI отклонил авторизацию',
+    oauth_callback_invalid: 'OpenAI вернул некорректный результат авторизации',
+    cloudflare_challenge: 'Cloudflare запросил ручную проверку в браузере',
+    token_exchange_failed: 'Не удалось получить токены OpenAI',
     plan_detection_failed: 'Не удалось определить тариф',
+    measure_failed: 'Вход выполнен, но OpenAI не вернул данные тарифа и лимитов',
+    internal_error: 'Внутренняя ошибка проверки',
   }
   return labels[code] ?? code.replaceAll('_', ' ')
 }
 
+function humanizeEmailOAuthError(reason: string | null) {
+  const labels: Record<string, string> = {
+    invalid_state: 'Сессия подключения Outlook истекла или уже была использована. Начните подключение заново.',
+    access_denied: 'Доступ к Outlook не был разрешён.',
+    provider_error: 'Microsoft не завершил подключение почты.',
+    missing_code: 'Microsoft не вернул код авторизации.',
+    account_changed: 'Email аккаунта изменился во время подключения.',
+    configuration_missing: 'Microsoft OAuth не настроен на сервере.',
+    configuration_changed: 'Настройки Microsoft OAuth изменились во время подключения.',
+    token_service_unavailable: 'Сервис авторизации Microsoft временно недоступен.',
+    token_exchange_failed: 'Microsoft не выдал токены доступа к почте.',
+    offline_access_missing: 'Microsoft не разрешил длительный доступ к почте.',
+    profile_service_unavailable: 'Профиль Microsoft временно недоступен.',
+    profile_lookup_failed: 'Не удалось проверить профиль Microsoft.',
+    email_mismatch: 'Подтверждена другая почта Microsoft. Выберите email, указанный у аккаунта.',
+    storage_failed: 'Не удалось безопасно сохранить подключение Outlook.',
+  }
+  return labels[reason ?? ''] ?? 'Не удалось подключить Outlook через Microsoft OAuth.'
+}
+
 function AddAccountDialog({ onClose }: { onClose: () => void }) {
   const createAccount = useCreateAccount()
-  const [mode, setMode] = useState<'totp' | 'email'>('totp')
+  const [mode, setMode] = useState<'totp' | 'outlook' | 'email'>('totp')
   const [error, setError] = useState('')
+  const [createdOutlookAccountId, setCreatedOutlookAccountId] = useState<number | null>(null)
+  const [submitting, setSubmitting] = useState(false)
   const [form, setForm] = useState({
     login: '', password: '', totp_secret: '', email: '', email_password: '',
   })
@@ -370,19 +508,38 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
       return
     }
     if (mode === 'email' && (!form.email.trim() || !form.email_password)) {
-      setError('Для автоматической настройки 2FA нужны email и App Password.')
+      setError('Для автоматической настройки 2FA нужны email и пароль почты.')
       return
     }
+    if (mode === 'outlook' && !isOutlookAddress(form.email)) {
+      setError('Для Microsoft OAuth укажите адрес Outlook, Hotmail, Live или MSN.')
+      return
+    }
+    setSubmitting(true)
     try {
-      await createAccount.mutateAsync({
-        ...form,
-        totp_secret: mode === 'totp' ? form.totp_secret.trim() : '',
-        email: form.email.trim() || undefined,
-        email_password: form.email_password || undefined,
-      })
+      const account = createdOutlookAccountId === null
+        ? await createAccount.mutateAsync({
+            ...form,
+            totp_secret: mode === 'totp' ? form.totp_secret.trim() : '',
+            email: form.email.trim() || undefined,
+            email_password: mode === 'email' ? form.email_password || undefined : undefined,
+          })
+        : { id: createdOutlookAccountId }
+      if (mode === 'outlook') {
+        setCreatedOutlookAccountId(account.id)
+        const oauth = await startMicrosoftEmailOAuth(account.id)
+        window.location.assign(oauth.authorization_url)
+        return
+      }
       onClose()
     } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Не удалось добавить аккаунт')
+      setError(
+        createdOutlookAccountId !== null || (mode === 'outlook' && cause instanceof ApiError && cause.status === 503)
+          ? 'Аккаунт сохранён, но Microsoft OAuth пока не настроен на сервере. Подключите Outlook позже кнопкой «Почта OAuth».'
+          : cause instanceof ApiError ? cause.message : 'Не удалось добавить аккаунт',
+      )
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -406,21 +563,24 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
             <legend>Как настроить двухфакторную защиту</legend>
             <div className="segmented-control">
               <button type="button" className={mode === 'totp' ? 'active' : ''} onClick={() => setMode('totp')}><Icon name="key" />TOTP уже включён</button>
+              <button type="button" className={mode === 'outlook' ? 'active' : ''} onClick={() => setMode('outlook')}><Icon name="shield" />Outlook OAuth</button>
               <button type="button" className={mode === 'email' ? 'active' : ''} onClick={() => setMode('email')}><Icon name="shield" />Настроить через email</button>
             </div>
           </fieldset>
 
           {mode === 'totp' ? (
             <label className="field"><span className="field__label">TOTP setup key</span><input value={form.totp_secret} onChange={(event) => setForm({ ...form, totp_secret: event.target.value.toUpperCase().replaceAll(' ', '') })} placeholder="JBSWY3DPEHPK3PXP" autoComplete="off" /><span className="field__hint">Base32-ключ из настроек 2FA. Не QR-код и не одноразовый шестизначный код.</span></label>
+          ) : mode === 'outlook' ? (
+            <label className="field"><span className="field__label">Почта Outlook / Hotmail</span><input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="mail@outlook.com" required /><span className="field__hint">После сохранения Microsoft откроет безопасное окно согласия только на чтение писем. Пароль почты бот не получает.</span></label>
           ) : (
             <div className="form-grid">
               <label className="field"><span className="field__label">Email для подтверждений</span><input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="mail@example.com" required /></label>
-              <label className="field"><span className="field__label">App Password почты</span><input type="password" value={form.email_password} onChange={(event) => setForm({ ...form, email_password: event.target.value })} placeholder="Пароль приложения" autoComplete="new-password" required /></label>
+              <label className="field"><span className="field__label">Пароль почты</span><input type="password" value={form.email_password} onChange={(event) => setForm({ ...form, email_password: event.target.value })} placeholder="Пароль или App Password" autoComplete="new-password" required /><span className="field__hint">Outlook/Hotmail проверяется через Outlook Web; Gmail, Yahoo и другие IMAP-провайдеры обычно требуют отдельный App Password.</span></label>
             </div>
           )}
 
-          <div className="form-alert form-alert--info"><Icon name="activity" /><span>После сохранения аккаунт попадёт в очередь первичной проверки. Статус и этапы будут обновляться автоматически.</span></div>
-          <div className="modal__actions"><button type="button" className="button button--secondary" onClick={onClose}>Отмена</button><button type="submit" className="button button--primary" disabled={createAccount.isPending}>{createAccount.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <>Добавить аккаунт<Icon name="arrow-right" /></>}</button></div>
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>{mode === 'outlook' ? 'После сохранения подтвердите доступ Microsoft. Затем проверка аккаунта перезапустится автоматически.' : 'После сохранения аккаунт попадёт в очередь первичной проверки. Статус и этапы будут обновляться автоматически.'}</span></div>
+          <div className="modal__actions"><button type="button" className="button button--secondary" onClick={onClose}>Отмена</button><button type="submit" className="button button--primary" disabled={submitting}>{submitting ? <><span className="spinner spinner--light" />Сохраняем…</> : <>{createdOutlookAccountId === null ? 'Добавить аккаунт' : 'Повторить OAuth'}<Icon name="arrow-right" /></>}</button></div>
         </form>
       </div>
     </div>
@@ -469,6 +629,7 @@ function DeviceAuthDialog({
   const [pollError, setPollError] = useState('')
   const [copied, setCopied] = useState(false)
   const [copyError, setCopyError] = useState('')
+  const dialogRef = useRef<HTMLDivElement>(null)
   const intervalMs = Math.max(1, modal.session.interval_seconds) * 1_000
 
   useEffect(() => {
@@ -505,10 +666,35 @@ function DeviceAuthDialog({
   }, [intervalMs, modal.account.id, modal.session.session_id, onCompleted])
 
   useEffect(() => {
-    const handler = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const dialog = dialogRef.current
+    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])') ?? [])
+    focusable()[0]?.focus()
+
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (result.status !== 'pending') onClose()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const items = focusable()
+      if (items.length === 0) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
     window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+    return () => {
+      window.removeEventListener('keydown', handler)
+      previousFocus?.focus()
+    }
+  }, [onClose, result.status])
 
   const copyCode = async () => {
     try {
@@ -527,14 +713,14 @@ function DeviceAuthDialog({
     : result.error_detail ?? humanizeDeviceAuthError(result.error_code ?? '')
 
   return (
-    <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="modal device-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="device-auth-title">
+    <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && result.status !== 'pending' && onClose()}>
+      <div ref={dialogRef} className="modal device-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="device-auth-title" aria-describedby="device-auth-description">
         <div className="modal__header">
-          <div><span className="eyebrow">Проверка с вашим участием</span><h2 id="device-auth-title">Подтвердите вход в браузере</h2><p>Страница входа открыта в новой вкладке. Аккаунт обновится автоматически после подтверждения.</p></div>
-          <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>
+          <div><span className="eyebrow">Проверка с вашим участием</span><h2 id="device-auth-title">Подтвердите вход в браузере</h2><p id="device-auth-description">Страница входа открыта в новой вкладке. Аккаунт обновится автоматически после подтверждения.</p></div>
+          {result.status !== 'pending' && <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>}
         </div>
 
-        <div className="form-alert form-alert--info"><Icon name="shield" /><span>На открывшейся странице введите только этот одноразовый код. Пароль и другие данные в админ-панели повторно вводить не нужно.</span></div>
+        <div className="form-alert form-alert--info"><Icon name="shield" /><span><strong>Первый вход:</strong> в ChatGPT откройте «Настройки → Безопасность и вход» и включите «Авторизация кода устройства для Codex». Если OpenAI уже показал красное предупреждение, после включения закройте это окно и запустите «Через браузер» заново — старый код использовать нельзя.</span></div>
 
         <div className="device-auth-code" aria-label={`Одноразовый код ${modal.session.user_code}`}>
           <span>{modal.session.user_code}</span>
@@ -554,12 +740,29 @@ function DeviceAuthDialog({
         {copyError && <div className="form-alert form-alert--warning" role="status"><Icon name="warning" /><span>{copyError}</span></div>}
 
         <div className="modal__actions">
-          <button className="button button--secondary" onClick={onClose}>Закрыть</button>
+          {result.status === 'pending'
+            ? <span className="device-auth-keep-open">Не закрывайте окно до завершения проверки</span>
+            : <button className="button button--secondary" onClick={onClose}>Закрыть</button>}
           <a className="button button--primary" href={modal.session.verification_url} target="_blank" rel="noreferrer"><Icon name="external" />Открыть страницу входа</a>
         </div>
       </div>
     </div>
   )
+}
+
+function isFreePlan(account: Account, tiers: Array<{ id: number; code?: string }>) {
+  if (tiers.some((tier) => tier.id === account.tier_id && tier.code === 'free')) return true
+  const candidates = [account.plan_raw_type, account.limits?.plan_type]
+  return candidates.some((value) => value != null && ['free', 'chatgpt_free', 'chatgptfreeplan'].includes(value.toLowerCase()))
+}
+
+function isOutlookAddress(value: string | null | undefined) {
+  if (!value || !value.includes('@')) return false
+  return ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'].includes(value.trim().toLowerCase().split('@').pop() ?? '')
+}
+
+function isOutlookAccount(account: Account) {
+  return isOutlookAddress(account.email)
 }
 
 function formatDeviceAuthExpiry(value: string) {
@@ -576,6 +779,7 @@ function humanizeDeviceAuthError(code: string) {
     invalid_grant: 'OpenAI отклонил или уже использовал этот код.',
     login_failed: 'OpenAI не подтвердил вход в аккаунт.',
     plan_detection_failed: 'Вход выполнен, но тариф аккаунта определить не удалось.',
+    measure_failed: 'Вход выполнен, но OpenAI не вернул данные тарифа и лимитов.',
     device_auth_state_lost: 'Состояние проверки потеряно. Начните вход заново.',
   }
   return labels[code] ?? (code ? code.replaceAll('_', ' ') : 'OpenAI не подтвердил вход. Начните проверку заново.')

@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.integrations.email.imap_provider import IMAPProvider, detect_imap_provider
+from app.integrations.email.outlook_web_provider import OutlookWebProvider
 from app.integrations.email.provider import EmailErrorCode, EmailProviderError
 
 
@@ -21,12 +22,12 @@ def test_detect_gmail():
 
 def test_detect_outlook():
     provider = detect_imap_provider("user@outlook.com", "pass")
-    assert provider.imap_host == "outlook.office365.com"
+    assert isinstance(provider, OutlookWebProvider)
 
 
 def test_detect_hotmail():
     provider = detect_imap_provider("user@hotmail.com", "pass")
-    assert provider.imap_host == "outlook.office365.com"
+    assert isinstance(provider, OutlookWebProvider)
 
 
 def test_detect_yahoo():
@@ -119,13 +120,6 @@ async def test_protocol_errors_are_classified(failed_operation):
         else EmailErrorCode.CONNECTION_FAILED
     )
     assert error.value.code is expected
-
-
-async def test_outlook_basic_auth_is_explicitly_unsupported():
-    provider = detect_imap_provider("user@outlook.com", "pass")
-    with pytest.raises(EmailProviderError) as error:
-        await provider.preflight()
-    assert error.value.code is EmailErrorCode.UNSUPPORTED
 
 
 async def test_preflight_excludes_old_read_message_and_fetches_new_one():

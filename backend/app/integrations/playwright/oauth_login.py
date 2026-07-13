@@ -31,6 +31,8 @@ class OAuthErrorCode(str, enum.Enum):
     EMAIL_CODE_NOT_FOUND = "email_code_not_found"
     EMAIL_PROVIDER_UNSUPPORTED = "email_provider_unsupported"
     EMAIL_CONNECTION_FAILED = "email_connection_failed"
+    EMAIL_SECURITY_CHALLENGE = "email_security_challenge"
+    EMAIL_TIMEOUT = "email_timeout"
     LOGIN_TIMEOUT = "login_timeout"
     OAUTH_REJECTED = "oauth_rejected"
     OAUTH_CALLBACK_INVALID = "oauth_callback_invalid"

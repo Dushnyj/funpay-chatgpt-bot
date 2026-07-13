@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     funpay_session_key: str = ""
     telegram_bot_token: str = ""
     telegram_seller_chat_id: str = ""
+    microsoft_graph_client_id: str = ""
+    microsoft_graph_client_secret: str = ""
+    microsoft_graph_redirect_uri: str = ""
 
     @field_validator("encryption_key")
     @classmethod

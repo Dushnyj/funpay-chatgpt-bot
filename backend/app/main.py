@@ -12,6 +12,7 @@ from app.api.routers.accounts import router as accounts_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.catalog import router as catalog_router
 from app.api.routers.chats import router as chats_router
+from app.api.routers.email_oauth import router as email_oauth_router
 from app.api.routers.lots import router as lots_router
 from app.api.routers.orders import router as orders_router
 from app.api.routers.rentals import router as rentals_router
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
     from app.db.bootstrap import bootstrap_database
     from app.db.migrations import upgrade_database
     from app.db.session import async_session_factory
+    from app.services.account_device_auth import account_device_auth_manager
     from app.services.golden_key import get_effective_funpay_key
 
     settings = get_settings()
@@ -43,9 +45,14 @@ async def lifespan(app: FastAPI):
     )
     app.state.lifecycle = lifecycle
     await lifecycle.start()
-    yield
-    await lifecycle.stop()
-    await engine.dispose()
+    try:
+        yield
+    finally:
+        await account_device_auth_manager.shutdown()
+        try:
+            await lifecycle.stop()
+        finally:
+            await engine.dispose()
 
 
 app = FastAPI(title="FunPay ChatGPT Rental Bot", version="0.1.0", lifespan=lifespan)
@@ -53,6 +60,7 @@ app.include_router(auth_router)
 app.include_router(catalog_router)
 app.include_router(accounts_router)
 app.include_router(chats_router)
+app.include_router(email_oauth_router)
 app.include_router(lots_router)
 app.include_router(orders_router)
 app.include_router(rentals_router)

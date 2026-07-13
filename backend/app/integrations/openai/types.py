@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from pydantic import BaseModel
 
@@ -7,8 +7,10 @@ class UsageInfo(BaseModel):
     """Результат замера лимитов из /wham/usage."""
 
     plan_type: str | None = None
-    primary_remaining_pct: int | None = None  # 5h окно
-    secondary_remaining_pct: int | None = None  # weekly окно
+    primary_remaining_pct: int | None = None
+    secondary_remaining_pct: int | None = None
+    primary_window_seconds: int | None = None
+    secondary_window_seconds: int | None = None
     primary_resets_at: datetime | None = None
     secondary_resets_at: datetime | None = None
 
@@ -25,6 +27,12 @@ class UsageInfo(BaseModel):
             plan_type=raw.get("plan_type"),
             primary_remaining_pct=(100 - primary_used) if primary_used is not None else None,
             secondary_remaining_pct=(100 - secondary_used) if secondary_used is not None else None,
+            primary_window_seconds=_parse_window_seconds(
+                primary.get("limit_window_seconds")
+            ),
+            secondary_window_seconds=_parse_window_seconds(
+                secondary.get("limit_window_seconds")
+            ),
             primary_resets_at=_parse_dt(primary.get("reset_at")),
             secondary_resets_at=_parse_dt(secondary.get("reset_at")),
         )
@@ -35,6 +43,7 @@ class AccountMetadata(BaseModel):
 
     workspace_id: str | None = None
     plan_type: str | None = None
+    has_active_subscription: bool | None = None
     subscription_expires_at: datetime | None = None
 
     @classmethod
@@ -53,6 +62,9 @@ class AccountMetadata(BaseModel):
             return cls()
         account = entry.get("account") or {}
         entitlement = entry.get("entitlement") or {}
+        active = entitlement.get("has_active_subscription")
+        if not isinstance(active, bool):
+            active = None
         return cls(
             workspace_id=account_id,
             plan_type=(
@@ -60,7 +72,13 @@ class AccountMetadata(BaseModel):
                 or entitlement.get("plan_type")
                 or entry.get("plan_type")
             ),
-            subscription_expires_at=_parse_dt(entitlement.get("expires_at")),
+            has_active_subscription=active,
+            # ``expires_at`` may remain populated long after an entitlement
+            # became inactive. It is a current subscription expiry only when
+            # the endpoint explicitly marks the entitlement active.
+            subscription_expires_at=(
+                _parse_dt(entitlement.get("expires_at")) if active is True else None
+            ),
         )
 
 
@@ -92,7 +110,25 @@ def _find_account_entry(
     return None
 
 
-def _parse_dt(value: str | None) -> datetime | None:
+def _parse_dt(value: str | int | float | None) -> datetime | None:
     if value is None:
         return None
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _parse_window_seconds(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or not float(value).is_integer():
+        return None
+    return int(value)

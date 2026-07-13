@@ -1,8 +1,9 @@
+import asyncio
 import base64
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.integrations.openai.device_auth import DeviceAuthorization, DeviceCode
 from app.integrations.openai.oauth import RefreshedTokens
@@ -199,3 +200,144 @@ async def test_superseded_device_auth_session_cannot_poll(
     assert result.code is None
     assert poll_called is False
     assert replacement.status == "pending"
+
+
+async def test_background_poll_completes_without_frontend_status_requests(
+    session: AsyncSession,
+    test_engine,
+    monkeypatch,
+):
+    account = await _account(session)
+    session_factory = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    manager = AccountDeviceAuthManager(session_factory=session_factory)
+    completed = asyncio.Event()
+
+    async def fake_request():
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    async def fake_poll(*_args):
+        return DeviceAuthorization("code", "verifier", "challenge")
+
+    async def fake_exchange(_authorization):
+        return RefreshedTokens("access", "refresh", _id_token("owner@example.com"))
+
+    async def fake_save(_session, target: Account, _tokens):
+        target.status = "active"
+        completed.set()
+
+    monkeypatch.setattr("app.services.account_device_auth.request_device_code", fake_request)
+    monkeypatch.setattr("app.services.account_device_auth.poll_device_authorization", fake_poll)
+    monkeypatch.setattr("app.services.account_device_auth.exchange_device_authorization", fake_exchange)
+    monkeypatch.setattr("app.services.account_device_auth._save_tokens_and_measure", fake_save)
+
+    auth_session = await manager.start(session, account)
+    await asyncio.wait_for(completed.wait(), timeout=2)
+    for _ in range(20):
+        if auth_session.status == "completed":
+            break
+        await asyncio.sleep(0.01)
+
+    assert auth_session.status == "completed"
+    async with session_factory() as background_session:
+        job = await background_session.get(AccountCheckJob, auth_session.job_id)
+        stored_account = await background_session.get(Account, account.id)
+    assert job is not None and job.status == "done" and job.result == "ok"
+    assert stored_account is not None and stored_account.status == "active"
+    await manager.shutdown()
+
+
+async def test_background_and_frontend_poll_cannot_exchange_twice(
+    session: AsyncSession,
+    test_engine,
+    monkeypatch,
+):
+    account = await _account(session)
+    session_factory = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    manager = AccountDeviceAuthManager(session_factory=session_factory)
+    poll_started = asyncio.Event()
+    release_poll = asyncio.Event()
+    poll_calls = 0
+
+    async def fake_request():
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    async def fake_poll(*_args):
+        nonlocal poll_calls
+        poll_calls += 1
+        poll_started.set()
+        await release_poll.wait()
+        return DeviceAuthorization("code", "verifier", "challenge")
+
+    async def fake_exchange(_authorization):
+        return RefreshedTokens("access", "refresh", _id_token("owner@example.com"))
+
+    async def fake_save(_session, target: Account, _tokens):
+        target.status = "active"
+
+    monkeypatch.setattr("app.services.account_device_auth.request_device_code", fake_request)
+    monkeypatch.setattr("app.services.account_device_auth.poll_device_authorization", fake_poll)
+    monkeypatch.setattr("app.services.account_device_auth.exchange_device_authorization", fake_exchange)
+    monkeypatch.setattr("app.services.account_device_auth._save_tokens_and_measure", fake_save)
+
+    auth_session = await manager.start(session, account)
+    await asyncio.wait_for(poll_started.wait(), timeout=2)
+    frontend_poll = asyncio.create_task(
+        manager.poll(session, account, auth_session.id)
+    )
+    release_poll.set()
+    result = await asyncio.wait_for(frontend_poll, timeout=2)
+
+    assert result.status == "completed"
+    assert poll_calls == 1
+    await manager.shutdown()
+
+
+async def test_shutdown_cancels_background_task_and_terminalizes_job(
+    session: AsyncSession,
+    test_engine,
+    monkeypatch,
+):
+    account = await _account(session)
+    session_factory = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    manager = AccountDeviceAuthManager(session_factory=session_factory)
+    poll_started = asyncio.Event()
+
+    async def fake_request():
+        return DeviceCode("device", "ABCD-EFGH", 60)
+
+    async def fake_poll(*_args):
+        poll_started.set()
+        return None
+
+    monkeypatch.setattr("app.services.account_device_auth.request_device_code", fake_request)
+    monkeypatch.setattr("app.services.account_device_auth.poll_device_authorization", fake_poll)
+
+    auth_session = await manager.start(session, account)
+    await asyncio.wait_for(poll_started.wait(), timeout=2)
+    assert manager._tasks
+
+    await manager.shutdown()
+
+    assert auth_session.status == "expired"
+    assert auth_session.error_code == "device_auth_shutdown"
+    assert manager._tasks == {}
+    assert manager._sessions == {}
+    async with session_factory() as background_session:
+        job = await background_session.get(AccountCheckJob, auth_session.job_id)
+        stored_account = await background_session.get(Account, account.id)
+    assert job is not None and job.status == "failed"
+    assert "device_auth_shutdown" in (job.error or "")
+    assert stored_account is not None
+    assert stored_account.status == "validation_failed"

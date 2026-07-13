@@ -31,6 +31,9 @@ def _test_env(monkeypatch):
     monkeypatch.setenv("FUNPAY_SESSION_KEY", "")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("TELEGRAM_SELLER_CHAT_ID", "")
+    monkeypatch.setenv("MICROSOFT_GRAPH_CLIENT_ID", "")
+    monkeypatch.setenv("MICROSOFT_GRAPH_CLIENT_SECRET", "")
+    monkeypatch.setenv("MICROSOFT_GRAPH_REDIRECT_URI", "")
 
     from app.config import get_settings
 

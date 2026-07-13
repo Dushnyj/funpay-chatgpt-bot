@@ -63,7 +63,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
-    assert version == "20260713_0006"
+    assert version == "20260713_0008"
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
@@ -72,6 +72,42 @@ async def test_upgrade_database_creates_head_schema_idempotently(
     assert {
         "plan_raw_type", "plan_source", "plan_confidence", "plan_detected_at"
     } <= set(account_columns)
+    async with engine.connect() as connection:
+        limits_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns("account_limits")
+            }
+        )
+    assert {
+        "codex_primary_remaining_pct",
+        "codex_primary_window_seconds",
+        "codex_primary_resets_at",
+        "codex_secondary_remaining_pct",
+        "codex_secondary_window_seconds",
+        "codex_secondary_resets_at",
+    } <= limits_columns
+    assert "email_oauth_credentials" in tables
+    async with engine.connect() as connection:
+        oauth_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns(
+                    "email_oauth_credentials"
+                )
+            }
+        )
+    assert {
+        "account_id",
+        "provider",
+        "email",
+        "external_subject",
+        "refresh_token_encrypted",
+        "scopes",
+        "status",
+        "connected_at",
+        "updated_at",
+    } <= oauth_columns
     await engine.dispose()
 
 
@@ -159,7 +195,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260713_0006"
+    assert version == "20260713_0008"
     await engine.dispose()
 
 
@@ -244,5 +280,5 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation"),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260713_0006"
+    assert version == "20260713_0008"
     await engine.dispose()

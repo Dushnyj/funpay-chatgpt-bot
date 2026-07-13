@@ -40,7 +40,12 @@ ADMIN_COOKIE_SECURE=true
 FUNPAY_SESSION_KEY=<опциональный env fallback>
 TELEGRAM_BOT_TOKEN=<опциональный env fallback>
 TELEGRAM_SELLER_CHAT_ID=<опциональный env fallback>
+MICROSOFT_GRAPH_CLIENT_ID=<Application (client) ID Microsoft Entra>
+MICROSOFT_GRAPH_CLIENT_SECRET=<client secret приложения>
+MICROSOFT_GRAPH_REDIRECT_URI=https://ваш-домен/api/email-oauth/microsoft/callback
 ```
+
+Для личных Outlook/Hotmail зарегистрируйте web-приложение в Microsoft Entra с поддержкой personal Microsoft accounts. Добавьте delegated permissions `User.Read` и `Mail.Read`, затем web redirect URI, в точности совпадающий со значением выше. В админ-панели откройте аккаунт и нажмите **Почта OAuth**; после согласия Microsoft проверка аккаунта перезапустится автоматически. Пароль Outlook приложению не передаётся.
 
 Генерация:
 ```bash
@@ -98,7 +103,7 @@ Periodic `pg_dump` по cron:
 3. Войти с паролем (из ADMIN_PASSWORD_HASH)
 4. **Настройки:** сохранить Golden Key, `funpay_node_id` и при необходимости Telegram token/chat ID
 5. **Аккаунты:** добавить ChatGPT-аккаунт без ручного выбора тарифа
-6. Нажать **Проверить через браузер**, открыть страницу OpenAI и ввести одноразовый код; после OAuth план определится автоматически
+6. В ChatGPT включить **Настройки → Безопасность и вход → Авторизация кода устройства для Codex**, затем нажать **Проверить через браузер** и подтвердить одноразовый код; после OAuth план определится автоматически
 7. **Тарифы:** включить продажу только нужных системных планов; создавать/переименовывать планы вручную не нужно
 8. **Цены:** настроить PriceMatrix (tier × duration × scope × пороги)
 9. **Шаблоны:** при необходимости отредактировать RU/EN сообщения
@@ -117,7 +122,8 @@ Periodic `pg_dump` по cron:
 |---|---|---|
 | FunPay не подключается | Неверный/протухший golden_key | Заменить Golden Key в админке и проверить статус |
 | Аккаунт показывает `cloudflare_challenge` | OpenAI заблокировал headless Chromium | Использовать «Проверить через браузер» и device code flow |
-| Outlook/Hotmail показывает `email_provider_unsupported` | Microsoft отключил IMAP Basic Auth | Использовать browser/device flow; не повторять парольный IMAP |
+| Outlook/Hotmail показывает, что OAuth не подключён | Microsoft Graph не настроен или согласие ещё не выдано | Заполнить три `MICROSOFT_GRAPH_*` значения, перезапустить backend и нажать «Почта OAuth» |
+| Outlook показывает `email_security_challenge` | Microsoft потребовал дополнительную проверку нового серверного IP | Подключить Microsoft Graph OAuth; парольный Outlook Web оставить только fallback |
 | Аккаунт показывает `validation_failed` | Ошибка содержит точные stage/code/detail | Исправить указанную причину и повторить проверку |
 | План не определён | OpenAI вернул неизвестный или конфликтующий raw plan | Не выдавать аккаунт; проверить raw/source и повторить OAuth |
 | Лимиты не замеряются | refresh_token протух | Бот попытается авто-перезаход; при неудаче → maintenance |

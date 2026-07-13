@@ -28,6 +28,44 @@ def test_parse_id_token_extracts_claims():
     assert claims.subscription_expires_at is not None
 
 
+def test_parse_current_access_token_claims_from_auth_and_profile_namespaces():
+    jwt = _make_jwt({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-current",
+            "chatgpt_plan_type": "free",
+        },
+        "https://api.openai.com/profile": {
+            "email": "current@example.com",
+        },
+    })
+
+    claims = parse_id_token(jwt)
+
+    assert claims.email == "current@example.com"
+    assert claims.plan_type == "free"
+    assert claims.account_id == "acct-current"
+    assert claims.subscription_expires_at is None
+
+
+def test_current_token_claims_take_precedence_over_legacy_aliases():
+    jwt = _make_jwt({
+        "email": "legacy@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-current",
+            "chatgpt_plan_type": "free",
+            "plan_type": "plus",
+        },
+        "https://api.openai.com/account": {"account_id": "acct-legacy"},
+        "https://api.openai.com/profile": {"email": "profile@example.com"},
+    })
+
+    claims = parse_id_token(jwt)
+
+    assert claims.email == "legacy@example.com"
+    assert claims.plan_type == "free"
+    assert claims.account_id == "acct-current"
+
+
 def test_parse_id_token_handles_missing_claims():
     jwt = _make_jwt({"email": "minimal@example.com"})
     claims = parse_id_token(jwt)

@@ -1,4 +1,9 @@
-from app.models.account import Account, AccountCheckJob, AccountLimits
+from app.models.account import (
+    Account,
+    AccountCheckJob,
+    AccountLimits,
+    EmailOAuthCredential,
+)
 from app.models.audit import AuditLog
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.chat import ChatConversation, ChatMessage
@@ -8,7 +13,7 @@ from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
 
 __all__ = [
-    "Account", "AccountLimits", "AccountCheckJob",
+    "Account", "AccountLimits", "AccountCheckJob", "EmailOAuthCredential",
     "SubscriptionTier", "Duration", "LimitScope",
     "Lot", "PriceMatrix", "LotTemplate", "BumpLog",
     "Order", "Rental",

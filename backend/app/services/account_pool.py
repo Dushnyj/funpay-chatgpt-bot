@@ -120,13 +120,18 @@ class AccountPool:
         else:  # codex
             if criteria.min_limit_pct is not None:
                 stmt = stmt.where(
-                    AccountLimits.codex_5h_remaining_pct >= criteria.min_limit_pct,
-                    AccountLimits.codex_weekly_remaining_pct >= criteria.min_limit_pct,
+                    AccountLimits.codex_primary_remaining_pct
+                    >= criteria.min_limit_pct,
+                    or_(
+                        AccountLimits.codex_secondary_remaining_pct.is_(None),
+                        AccountLimits.codex_secondary_remaining_pct
+                        >= criteria.min_limit_pct,
+                    ),
                 )
             stmt = stmt.order_by(
-                _lower_limit(
-                    AccountLimits.codex_5h_remaining_pct,
-                    AccountLimits.codex_weekly_remaining_pct,
+                _lower_optional_limit(
+                    AccountLimits.codex_primary_remaining_pct,
+                    AccountLimits.codex_secondary_remaining_pct,
                 ).desc()
             )
 
@@ -156,3 +161,12 @@ class AccountPool:
 def _lower_limit(left, right):
     """Portable scalar minimum (SQLite and PostgreSQL)."""
     return case((left <= right, left), else_=right)
+
+
+def _lower_optional_limit(primary, secondary):
+    """Minimum of observed Codex windows, allowing absent secondary data."""
+    return case(
+        (secondary.is_(None), primary),
+        (primary <= secondary, primary),
+        else_=secondary,
+    )

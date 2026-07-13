@@ -46,6 +46,19 @@ class AccountLimits(Base):
     chat_weekly_remaining_pct: Mapped[int | None] = mapped_column(default=None)
     codex_5h_remaining_pct: Mapped[int | None] = mapped_column(default=None)
     codex_weekly_remaining_pct: Mapped[int | None] = mapped_column(default=None)
+    # Exact window observations from /wham/usage. The legacy 5h/weekly columns
+    # remain for API/database compatibility and are populated only when the
+    # observed duration really is 5 hours / 7 days.
+    codex_primary_remaining_pct: Mapped[int | None] = mapped_column(default=None)
+    codex_primary_window_seconds: Mapped[int | None] = mapped_column(default=None)
+    codex_primary_resets_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    codex_secondary_remaining_pct: Mapped[int | None] = mapped_column(default=None)
+    codex_secondary_window_seconds: Mapped[int | None] = mapped_column(default=None)
+    codex_secondary_resets_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     plan_type: Mapped[str | None] = mapped_column(default=None)
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
@@ -53,6 +66,28 @@ class AccountLimits(Base):
     refresh_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     refresh_recover_attempts: Mapped[int] = mapped_column(default=0)
     refresh_last_recover_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class EmailOAuthCredential(Base):
+    """Delegated mailbox OAuth credential owned by exactly one account."""
+
+    __tablename__ = "email_oauth_credentials"
+
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True
+    )
+    provider: Mapped[str] = mapped_column(String(32), default="microsoft_graph")
+    email: Mapped[str] = mapped_column(String(320))
+    external_subject: Mapped[str | None] = mapped_column(String(255), default=None)
+    refresh_token_encrypted: Mapped[str] = mapped_column(FernetEncrypted)
+    scopes: Mapped[str] = mapped_column(String(1024), default="")
+    status: Mapped[str] = mapped_column(String(32), default="connected")
+    connected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
 
 class AccountCheckJob(Base):

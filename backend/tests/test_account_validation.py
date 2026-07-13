@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.models.account import Account, AccountLimits
+from app.models.account import Account, AccountLimits, EmailOAuthCredential
 from app.models.catalog import SubscriptionTier
 
 
@@ -383,3 +383,49 @@ async def test_validate_account_enable_2fa_failure(session, monkeypatch):
 
     reloaded = await session.get(Account, acc.id)
     assert reloaded.status == "validation_failed"
+
+
+async def test_outlook_validation_prefers_connected_graph_credential(
+    session,
+    monkeypatch,
+):
+    from app.config import get_settings
+    from app.integrations.email.microsoft_graph_provider import (
+        MicrosoftGraphEmailProvider,
+    )
+    from app.services.account_validation import _build_email_provider
+
+    monkeypatch.setenv("MICROSOFT_GRAPH_CLIENT_ID", "graph-client")
+    monkeypatch.setenv("MICROSOFT_GRAPH_CLIENT_SECRET", "graph-secret")
+    get_settings.cache_clear()
+    account = Account(
+        login="openai-owner@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        email="owner@outlook.com",
+        email_password_encrypted="legacy-mail-password",
+    )
+    session.add(account)
+    await session.flush()
+    credential = EmailOAuthCredential(
+        account_id=account.id,
+        provider="microsoft_graph",
+        email="OWNER@outlook.com",
+        refresh_token_encrypted="graph-refresh",
+        scopes="Mail.Read",
+        status="connected",
+    )
+    session.add(credential)
+    await session.commit()
+
+    provider = await _build_email_provider(
+        session,
+        account,
+        account.email,
+        account.email_password_encrypted,
+    )
+
+    assert isinstance(provider, MicrosoftGraphEmailProvider)
+    await provider._on_refresh_token("rotated-graph-refresh")
+    await session.refresh(credential)
+    assert credential.refresh_token_encrypted == "rotated-graph-refresh"

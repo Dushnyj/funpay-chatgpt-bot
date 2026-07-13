@@ -11,6 +11,7 @@ import aioimaplib
 
 from app.integrations.email.provider import (
     EmailErrorCode,
+    EmailProvider,
     EmailProviderError,
     parse_verification_code,
 )
@@ -219,20 +220,24 @@ def detect_imap_provider(
     email: str,
     password: str,
     fallback_host: str = _DEFAULT_FALLBACK_HOST,
-) -> IMAPProvider:
-    """По email-домену определяет IMAP-сервер и создаёт провайдера.
+) -> EmailProvider:
+    """По email-домену выбирает безопасный источник кодов подтверждения.
 
-    Для неизвестных доменов используется fallback_host
-    (настраивается через SellerSettings в будущем).
+    Microsoft consumer mail uses Outlook Web because password-based IMAP is
+    disabled.  Other domains use IMAP; unknown domains use ``fallback_host``.
     """
     domain = email.split("@")[-1].lower() if "@" in email else ""
+    if domain in {"outlook.com", "hotmail.com", "live.com", "msn.com"}:
+        # Microsoft disabled IMAP Basic authentication.  Use Outlook Web with
+        # an ephemeral browser session instead; no mailbox cookies are written
+        # to disk or persisted in the database.
+        from app.integrations.email.outlook_web_provider import OutlookWebProvider
+
+        return OutlookWebProvider(email, password)
+
     host = _KNOWN_HOSTS.get(domain, fallback_host)
-    # Microsoft disabled Basic authentication for Exchange Online. Treating a
-    # password retry as recoverable only creates an endless validation loop.
-    basic_auth_supported = domain not in {"outlook.com", "hotmail.com", "live.com", "msn.com"}
     return IMAPProvider(
         email=email,
         password=password,
         imap_host=host,
-        basic_auth_supported=basic_auth_supported,
     )

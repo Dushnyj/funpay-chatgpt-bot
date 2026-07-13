@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.openai.client import OpenAIClient
 from app.integrations.openai.exceptions import BackendApiError, RefreshFailedError, TokenExpiredError
-from app.integrations.openai.oauth import refresh_access_token
+from app.integrations.openai.oauth import parse_id_token, refresh_access_token
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.services.subscription_plans import (
@@ -20,6 +20,8 @@ from app.services.subscription_plans import (
 _TOKEN_FRESH_THRESHOLD = timedelta(minutes=5)
 # Скв: при 401 от backend-api делаем refresh и ретраим замер один раз
 _MAX_RETRIES = 1
+_FIVE_HOURS_SECONDS = 5 * 60 * 60
+_ONE_WEEK_SECONDS = 7 * 24 * 60 * 60
 
 
 class MeasureResult(enum.Enum):
@@ -53,6 +55,12 @@ async def measure_account_limits(
             return MeasureResult.REFRESH_FAILED
         access_token = refreshed
 
+    # Current OpenAI access tokens carry the ChatGPT account ID and plan in the
+    # auth namespace. Older id_token-derived values remain a supported fallback.
+    access_claims = parse_id_token(access_token)
+    if access_claims.account_id:
+        limits.account_id_openai = access_claims.account_id
+
     # Замер с retry при 401
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -67,29 +75,52 @@ async def measure_account_limits(
             if refreshed is None:
                 return MeasureResult.REFRESH_FAILED
             access_token = refreshed
+            access_claims = parse_id_token(access_token)
+            if access_claims.account_id:
+                limits.account_id_openai = access_claims.account_id
         except BackendApiError:
             return MeasureResult.BACKEND_ERROR
 
     # ``wham/usage`` is the observed Codex allowance used by the Codex client.
     # OpenAI does not publish a stable ChatGPT-message allowance API, so never
     # mirror these values into the chat fields and present guessed data as fact.
-    primary = usage.primary_remaining_pct
-    secondary = usage.secondary_remaining_pct
     limits.chat_5h_remaining_pct = None
-    limits.codex_5h_remaining_pct = primary
     limits.chat_weekly_remaining_pct = None
-    limits.codex_weekly_remaining_pct = secondary
+    limits.codex_primary_remaining_pct = usage.primary_remaining_pct
+    limits.codex_primary_window_seconds = usage.primary_window_seconds
+    limits.codex_primary_resets_at = usage.primary_resets_at
+    limits.codex_secondary_remaining_pct = usage.secondary_remaining_pct
+    limits.codex_secondary_window_seconds = usage.secondary_window_seconds
+    limits.codex_secondary_resets_at = usage.secondary_resets_at
+
+    # Backward-compatible aliases must not mislabel a 30-day (or any other)
+    # observed window as 5h/weekly.
+    limits.codex_5h_remaining_pct = (
+        usage.primary_remaining_pct
+        if usage.primary_window_seconds == _FIVE_HOURS_SECONDS
+        else None
+    )
+    limits.codex_weekly_remaining_pct = (
+        usage.secondary_remaining_pct
+        if usage.secondary_window_seconds == _ONE_WEEK_SECONDS
+        else None
+    )
     resolved_plan = resolve_subscription_plan(
         (
             PlanSignal(metadata.plan_type, "accounts_check", 0.98),
             PlanSignal(usage.plan_type, "wham_usage", 0.90),
             PlanSignal(claim_plan_type, "id_token", 0.80),
+            PlanSignal(access_claims.plan_type, "access_token", 0.85),
         )
     )
     await _store_resolved_plan(session, account, limits, resolved_plan)
-    if metadata.subscription_expires_at is not None:
+    if metadata.has_active_subscription is True:
         limits.subscription_expires_at = metadata.subscription_expires_at
         account.subscription_expires_at = metadata.subscription_expires_at
+    elif metadata.has_active_subscription is False:
+        # Inactive entitlements often contain a stale historical expires_at.
+        limits.subscription_expires_at = None
+        account.subscription_expires_at = None
     elif limits.subscription_expires_at is None and account.subscription_expires_at is not None:
         # /accounts/check legitimately omits expiry for some responses. Keep
         # stronger evidence already stored from an ID token or prior measure.
@@ -154,6 +185,10 @@ async def _get_canonical_tier(
             name=definition.name,
             description=definition.description,
             is_active=True,
+            system_managed=True,
+            is_sellable=definition.is_sellable,
+            sort_order=definition.sort_order,
+            usage_multiplier=definition.usage_multiplier,
         )
         session.add(tier)
         await session.flush()
@@ -162,7 +197,6 @@ async def _get_canonical_tier(
 
     tier.code = definition.code
     tier.system_managed = True
-    tier.is_sellable = definition.is_sellable
     tier.sort_order = definition.sort_order
     tier.usage_multiplier = definition.usage_multiplier
     await session.flush()

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './client'
-import type { Account, AccountCreate, DeviceAuthSession, DeviceAuthStatus } from '../types/api'
+import type { Account, AccountCreate, DeviceAuthSession, DeviceAuthStatus, EmailOAuthStart } from '../types/api'
 
 export function useAccounts() {
   return useQuery({
@@ -50,4 +50,8 @@ export function useStartDeviceAuth() {
 
 export function getDeviceAuthStatus(accountId: number, sessionId: string) {
   return api.get<DeviceAuthStatus>(`/accounts/${accountId}/device-auth/${encodeURIComponent(sessionId)}`)
+}
+
+export function startMicrosoftEmailOAuth(accountId: number) {
+  return api.post<EmailOAuthStart>(`/accounts/${accountId}/email-oauth/microsoft`)
 }
