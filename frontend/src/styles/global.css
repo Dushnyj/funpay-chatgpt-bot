@@ -730,15 +730,15 @@ h3 { margin: 0; font-size: 15px; }
 }
 
 /* Compact account operations */
-.accounts-table--operator { min-width: 1060px; }
-.accounts-table--operator th:nth-child(1) { width: 17%; }
-.accounts-table--operator th:nth-child(2) { width: 8%; }
-.accounts-table--operator th:nth-child(3) { width: 25%; }
+.accounts-table--operator { min-width: 0; }
+.accounts-table--operator th:nth-child(1) { width: 22%; }
+.accounts-table--operator th:nth-child(2) { width: 6%; }
+.accounts-table--operator th:nth-child(3) { width: 23%; }
 .accounts-table--operator th:nth-child(4) { width: 10%; }
-.accounts-table--operator th:nth-child(5) { width: 8%; }
-.accounts-table--operator th:nth-child(6) { width: 12%; }
-.accounts-table--operator th:nth-child(7) { width: 20%; }
-.accounts-table--operator td { height: auto; min-height: 62px; padding: 10px 12px; }
+.accounts-table--operator th:nth-child(5) { width: 7%; }
+.accounts-table--operator th:nth-child(6) { width: 11%; }
+.accounts-table--operator th:nth-child(7) { width: 21%; }
+.accounts-table--operator td { height: auto; min-height: 62px; padding: 10px 8px; }
 .account-login { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .account-plan { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .account-subscription, .rental-capacity { font-variant-numeric: tabular-nums; white-space: nowrap; }
