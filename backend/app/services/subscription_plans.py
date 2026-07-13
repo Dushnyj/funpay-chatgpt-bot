@@ -160,6 +160,7 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
 PLANS_BY_CODE = {plan.code: plan for plan in SYSTEM_SUBSCRIPTION_PLANS}
 FREE_LONG_WINDOW_SECONDS = 30 * 24 * 60 * 60
 PAID_LONG_WINDOW_SECONDS = 7 * 24 * 60 * 60
+PAID_SHORT_WINDOW_SECONDS = 5 * 60 * 60
 _PLANS_BY_ALIAS = {
     alias: plan
     for plan in SYSTEM_SUBSCRIPTION_PLANS
@@ -247,6 +248,16 @@ def validate_plan_window_contract(
     }
     if expected not in observed:
         return False, expected
-    if plan_code != "free" and FREE_LONG_WINDOW_SECONDS in observed:
+
+    # Treat every reported positive duration as part of the contract instead
+    # of accepting an expected duration alongside an unknown second window.
+    # Free exposes only its 30-day allowance. Paid plans may expose either the
+    # 7-day allowance alone or a separate 5-hour allowance alongside it.
+    allowed = (
+        {FREE_LONG_WINDOW_SECONDS}
+        if plan_code == "free"
+        else {PAID_SHORT_WINDOW_SECONDS, PAID_LONG_WINDOW_SECONDS}
+    )
+    if not observed.issubset(allowed):
         return False, expected
     return True, expected

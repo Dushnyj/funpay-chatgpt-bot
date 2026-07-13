@@ -86,6 +86,12 @@ def test_free_contract_is_exactly_thirty_day_long_window():
     assert validate_plan_window_contract(
         "free", 7 * 24 * 60 * 60, None,
     ) == (False, 30 * 24 * 60 * 60)
+    assert validate_plan_window_contract(
+        "free", 30 * 24 * 60 * 60, 7 * 24 * 60 * 60,
+    ) == (False, 30 * 24 * 60 * 60)
+    assert validate_plan_window_contract(
+        "free", 30 * 24 * 60 * 60, 5 * 60 * 60,
+    ) == (False, 30 * 24 * 60 * 60)
 
 
 def test_unknown_plan_never_inherits_paid_window_contract():
@@ -108,4 +114,14 @@ def test_every_paid_contract_has_five_hour_plus_seven_day_windows(plan_code):
         plan_code,
         5 * 60 * 60,
         30 * 24 * 60 * 60,
+    ) == (False, 7 * 24 * 60 * 60)
+    assert validate_plan_window_contract(
+        plan_code,
+        7 * 24 * 60 * 60,
+        None,
+    ) == (True, 7 * 24 * 60 * 60)
+    assert validate_plan_window_contract(
+        plan_code,
+        7 * 24 * 60 * 60,
+        14 * 24 * 60 * 60,
     ) == (False, 7 * 24 * 60 * 60)

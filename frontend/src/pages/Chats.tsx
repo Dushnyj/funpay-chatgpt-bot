@@ -171,11 +171,12 @@ function Conversation({
   const [draft, setDraft] = useState('')
   const [sendError, setSendError] = useState('')
   const sendMessage = useSendChatMessage(chat.id)
-  const endRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<HTMLDivElement>(null)
   const lastMessageId = messages.at(-1)?.id
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: 'end' })
+    const container = messagesRef.current
+    if (container) container.scrollTop = container.scrollHeight
   }, [chat.id, lastMessageId])
 
   useEffect(() => {
@@ -212,7 +213,7 @@ function Conversation({
         </div>
       </header>
 
-      <div className="chat-messages" role="log" aria-live="polite" aria-relevant="additions">
+      <div ref={messagesRef} className="chat-messages" role="log" aria-live="polite" aria-relevant="additions">
         {isLoading && <LoadingState label="Загружаем историю" />}
         {isError && <ErrorState message="Не удалось загрузить историю" onRetry={onRetry} />}
         {!isLoading && !isError && messages.length === 0 && (
@@ -233,7 +234,6 @@ function Conversation({
             </div>
           </article>
         ))}
-        <div ref={endRef} />
       </div>
 
       <form

@@ -21,6 +21,19 @@ const METRIC_CARDS: Array<{
   { key: 'revenue_netto', label: 'Выручка netto', hint: 'После комиссии', icon: 'prices', currency: true },
 ]
 
+function formatAddedAccounts(count: number) {
+  const lastTwo = count % 100
+  const last = count % 10
+  const noun = lastTwo >= 11 && lastTwo <= 14
+    ? 'аккаунтов'
+    : last === 1
+      ? 'аккаунт'
+      : last >= 2 && last <= 4
+        ? 'аккаунта'
+        : 'аккаунтов'
+  return `${count} ${noun} ${count === 1 ? 'добавлен' : 'добавлено'}`
+}
+
 export default function Dashboard() {
   const metricsQuery = useMetrics()
   const accountsQuery = useAccounts()
@@ -41,7 +54,7 @@ export default function Dashboard() {
     { label: 'Доступ администратора', complete: true, detail: 'Защищённая сессия активна', to: '/settings' },
     { label: 'Категория FunPay', complete: Boolean(settingsQuery.data?.funpay_node_id), detail: settingsQuery.data?.funpay_node_id ? `Node ID ${settingsQuery.data.funpay_node_id}` : 'Укажите Node ID', to: '/settings' },
     { label: 'Подключение FunPay', complete: connected, detail: connected ? 'События принимаются' : 'Golden key и runner не активны', to: '/settings' },
-    { label: 'Пул аккаунтов', complete: accounts.length > 0, detail: accounts.length ? `${accounts.length} аккаунтов добавлено` : 'Добавьте первый аккаунт', to: '/accounts' },
+    { label: 'Пул аккаунтов', complete: accounts.length > 0, detail: accounts.length ? formatAddedAccounts(accounts.length) : 'Добавьте первый аккаунт', to: '/accounts' },
     { label: 'Матрица цен', complete: Boolean(pricesQuery.data?.length), detail: pricesQuery.data?.length ? `${pricesQuery.data.length} правил цены` : 'Настройте правила продаж', to: '/prices' },
   ]
   const completedSteps = setupSteps.filter((step) => step.complete).length
@@ -119,7 +132,7 @@ export default function Dashboard() {
             <div className="system-row"><span><Icon name="accounts" />Пул аккаунтов</span><StatusBadge value={accounts.length ? 'active' : 'unknown'} label={accounts.length ? 'Настроен' : 'Пуст'} /></div>
             <div className="system-row"><span><Icon name="prices" />Правила цен</span><StatusBadge value={pricesQuery.data?.length ? 'active' : 'unknown'} label={pricesQuery.data?.length ? 'Настроены' : 'Не заданы'} /></div>
           </div>
-          <div className="system-note"><Icon name="warning" /><p>Health endpoint сейчас проверяет только доступность web-процесса. Состояние scheduler и внешних интеграций требует отдельной backend-метрики.</p></div>
+          <div className="system-note"><Icon name="activity" /><p>Health endpoint подтверждает работу web-процесса, PostgreSQL, планировщика и текущего подключения FunPay.</p></div>
         </section>
       </div>
 
