@@ -4,7 +4,9 @@ from sqlalchemy import func, select
 # Регистрируем модель в Base.metadata на этапе импорта модуля,
 # чтобы create_all в фикстуре test_engine создал таблицу.
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.lot import LotTemplate
 from app.models.message import MessageTemplate
+from app.services.lot_templates import DEFAULT_LOT_TEMPLATES
 from app.services.messages import validate_template_content
 from app.services.seed_data import (
     DEFAULT_DURATIONS,
@@ -13,6 +15,7 @@ from app.services.seed_data import (
     DEFAULT_TIERS,
     LEGACY_LIMIT_MESSAGE_TEMPLATES,
     seed_catalog,
+    seed_lot_templates,
     seed_message_templates,
 )
 
@@ -54,6 +57,26 @@ async def test_seed_message_templates_idempotent(session):
     )
     assert count_result.scalar_one() == expected_count
 
+
+@pytest.mark.asyncio
+async def test_seed_lot_templates_is_idempotent_and_preserves_content(session):
+    await seed_lot_templates(session)
+    template = (
+        await session.execute(
+            select(LotTemplate).where(LotTemplate.key == "default")
+        )
+    ).scalar_one()
+    template.description_template_ru = "Свой текст"
+    template.is_enabled = False
+    await session.commit()
+
+    await seed_lot_templates(session)
+    rows = (await session.execute(select(LotTemplate))).scalars().all()
+
+    assert len(rows) == len(DEFAULT_LOT_TEMPLATES)
+    assert rows[0].description_template_ru == "Свой текст"
+    assert rows[0].is_enabled is True
+    assert rows[0].system_managed is True
 
 @pytest.mark.asyncio
 async def test_seed_upgrades_only_exact_legacy_limit_defaults(session):

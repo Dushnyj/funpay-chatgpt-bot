@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -92,12 +92,28 @@ class LotTemplate(Base):
     __tablename__ = "lot_templates"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Stable API identity.  It is deliberately independent from localized
+    # labels so an operator can rename a template without breaking links.
+    key: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str] = mapped_column(String(120))
     tier_id: Mapped[int | None] = mapped_column(ForeignKey("subscription_tiers.id"), default=None)
     limit_scope_id: Mapped[int | None] = mapped_column(ForeignKey("limit_scopes.id"), default=None)
     title_template_ru: Mapped[str] = mapped_column(String(255))
     title_template_en: Mapped[str] = mapped_column(String(255))
     description_template_ru: Mapped[str] = mapped_column(String(4000), default="")
     description_template_en: Mapped[str] = mapped_column(String(4000), default="")
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    system_managed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+Index(
+    "uq_lot_templates_enabled_custom_target",
+    func.coalesce(LotTemplate.tier_id, 0),
+    func.coalesce(LotTemplate.limit_scope_id, 0),
+    unique=True,
+    postgresql_where=text("system_managed = false AND is_enabled = true"),
+    sqlite_where=text("system_managed = 0 AND is_enabled = 1"),
+)
 
 
 class BumpLog(Base):

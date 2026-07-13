@@ -261,8 +261,18 @@ async def test_code_handler_sends_labelled_totp_and_fresh_email_otp(
     session: AsyncSession,
 ):
     from app.services.seed_data import seed_message_templates
+    from app.models.message import MessageTemplate
 
     await seed_message_templates(session)
+    email_template = (
+        await session.execute(
+            select(MessageTemplate).where(
+                MessageTemplate.key == "email_code_success",
+                MessageTemplate.lang == "ru",
+            )
+        )
+    ).scalar_one()
+    email_template.content = "Почтовый код из панели: {email_code}"
     rental = await _seed_rental(session)
     account = await session.get(Account, rental.account_id)
     account.email = "owner@example.com"
@@ -292,7 +302,7 @@ async def test_code_handler_sends_labelled_totp_and_fresh_email_otp(
 
     text = gateway.sent_messages[0][1]
     assert "TOTP (приложение): 123456" in text
-    assert "Email OTP OpenAI: 654321" in text
+    assert "Почтовый код из панели: 654321" in text
     provider.preflight.assert_not_awaited()
     cutoff = provider.fetch_fresh_verification_code.await_args.kwargs["not_before"]
     assert cutoff >= max(

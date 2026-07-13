@@ -98,6 +98,7 @@ class AccountOut(_Base):
     email: str | None = None
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = None
+    active_rentals_count: int = 0
     status: str
     operator_status_override: str | None = None
     notes: str | None = None
@@ -239,6 +240,9 @@ class TemplateOut(_Base):
     key: str
     lang: str
     content: str
+    allowed_fields: list[str] = Field(default_factory=list)
+    default_content: str | None = None
+    is_custom: bool = False
 
 
 class TemplateItem(BaseModel):
@@ -249,6 +253,53 @@ class TemplateItem(BaseModel):
 
 class TemplateUpdate(BaseModel):
     items: list[TemplateItem] = Field(min_length=1, max_length=500)
+
+
+class LotTemplateOut(BaseModel):
+    id: int
+    key: str
+    name: str
+    tier_id: int | None = None
+    limit_scope_id: int | None = None
+    title_ru: str
+    title_en: str
+    description_ru: str
+    description_en: str
+    enabled: bool
+    system_managed: bool
+    is_custom: bool
+    default_title_ru: str | None = None
+    default_title_en: str | None = None
+    default_description_ru: str | None = None
+    default_description_en: str | None = None
+    allowed_fields: list[str] = Field(default_factory=list)
+
+
+class LotTemplateCreate(BaseModel):
+    key: str = Field(min_length=2, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    tier_id: int | None = Field(default=None, gt=0)
+    limit_scope_id: int | None = Field(default=None, gt=0)
+    title_ru: str = Field(min_length=1, max_length=255)
+    title_en: str = Field(min_length=1, max_length=255)
+    description_ru: str = Field(default="", max_length=4_000)
+    description_en: str = Field(default="", max_length=4_000)
+    enabled: bool = True
+
+    @field_validator("key", "name", mode="before")
+    @classmethod
+    def strip_lot_template_identity(cls, value):
+        # Normalize before Field length checks so whitespace-only identities
+        # cannot be persisted as an empty template name or key.
+        return value.strip() if isinstance(value, str) else value
+
+
+class LotTemplateUpdate(BaseModel):
+    title_ru: str = Field(min_length=1, max_length=255)
+    title_en: str = Field(min_length=1, max_length=255)
+    description_ru: str = Field(default="", max_length=4_000)
+    description_en: str = Field(default="", max_length=4_000)
+    enabled: bool
 
 
 # --- Lots ---

@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.routers import accounts as accounts_router
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
 from app.models.account import (
@@ -14,7 +15,8 @@ from app.models.account import (
     EmailOAuthCredential,
 )
 from app.models.audit import AuditLog
-from app.models.catalog import SubscriptionTier
+from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.rental import Order, Rental
 
 
 @pytest.fixture
@@ -620,3 +622,138 @@ async def test_totp_export_is_not_cacheable_and_is_audited(
     assert audit.account_id == created.json()["id"]
     assert audit.metadata_ == {"actor": "admin"}
     assert audit.message_text is None
+
+
+async def test_totp_code_is_not_cacheable_hides_secret_and_is_audited(
+    auth_client: AsyncClient, session: AsyncSession
+):
+    tier_id = await _seed_tier(session)
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "totp-code-audit",
+            "password": "pass",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "tier_id": tier_id,
+        },
+    )
+
+    response = await auth_client.get(
+        f"/api/accounts/{created.json()['id']}/totp-code"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    payload = response.json()
+    assert payload["code"].isdigit()
+    assert len(payload["code"]) == 6
+    assert 1 <= payload["seconds_remaining"] <= 30
+    assert "secret" not in payload
+    audit = (
+        await session.execute(
+            select(AuditLog).where(AuditLog.event_type == "totp_code_generated")
+        )
+    ).scalar_one()
+    assert audit.account_id == created.json()["id"]
+    assert audit.metadata_ == {"actor": "admin"}
+    assert audit.message_text is None
+
+
+async def test_totp_code_waits_for_a_safe_window_at_boundary(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "totp-window-boundary",
+            "password": "pass",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+        },
+    )
+    timestamps = iter((1_750_000_019.0, 1_750_000_020.1))
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(accounts_router, "_now", lambda: next(timestamps))
+    monkeypatch.setattr(accounts_router, "_sleep", fake_sleep)
+
+    response = await auth_client.get(
+        f"/api/accounts/{created.json()['id']}/totp-code"
+    )
+
+    assert response.status_code == 200
+    assert sleeps == pytest.approx([1.05])
+    assert response.json()["seconds_remaining"] == 28
+
+
+async def test_account_list_reports_active_rentals_count(
+    auth_client: AsyncClient, session: AsyncSession
+):
+    tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
+    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    scope = LimitScope(code="any", name="Any")
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    account = Account(
+        login="rental-count@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        tier_id=tier.id,
+        status="active",
+    )
+    session.add(account)
+    await session.flush()
+    now = datetime.now(timezone.utc)
+    for index, status in enumerate(("active", "expired"), start=1):
+        order = Order(
+            funpay_order_id=f"count-order-{index}",
+            funpay_chat_id=f"chat-{index}",
+            buyer_funpay_id=f"buyer-{index}",
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            price=100,
+            status="completed",
+        )
+        session.add(order)
+        await session.flush()
+        session.add(
+            Rental(
+                order_id=order.id,
+                account_id=account.id,
+                buyer_funpay_id=f"buyer-{index}",
+                buyer_funpay_chat_id=f"chat-{index}",
+                tier_id=tier.id,
+                duration_id=duration.id,
+                limit_scope_id=scope.id,
+                lang="ru",
+                started_at=now,
+                expires_at=now + timedelta(days=7),
+                status=status,
+                credentials_delivery_status="sent",
+                credentials_delivery_template="welcome",
+                credentials_delivery_attempts=1,
+            )
+        )
+    await session.commit()
+
+    response = await auth_client.get("/api/accounts")
+
+    assert response.status_code == 200
+    listed = next(item for item in response.json() if item["id"] == account.id)
+    assert listed["active_rentals_count"] == 1
+
+    updated = await auth_client.patch(
+        f"/api/accounts/{account.id}", json={"notes": "capacity stays exact"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["active_rentals_count"] == 1
+
+    rechecked = await auth_client.post(f"/api/accounts/{account.id}/recheck")
+    assert rechecked.status_code == 202
+    assert rechecked.json()["active_rentals_count"] == 1

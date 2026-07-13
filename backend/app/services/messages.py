@@ -40,6 +40,10 @@ TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
     "code_expired": frozenset(),
     "rental_ambiguous": frozenset(),
     "code_rate_limited": frozenset({"retry_in_sec"}),
+    "email_code_success": frozenset({"email_code"}),
+    "email_code_duplicate": frozenset(),
+    "email_code_not_found": frozenset(),
+    "email_code_unavailable": frozenset(),
     "subscription": frozenset({"tier", "expires_at", "expires_in"})
     | _USAGE_FIELDS,
     "replace_success": frozenset(
@@ -60,6 +64,7 @@ REQUIRED_TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
     "welcome": frozenset({"login", "password"}),
     "replace_success": frozenset({"login", "password"}),
     "code_success": frozenset({"code"}),
+    "email_code_success": frozenset({"email_code"}),
 }
 
 _FORMATTER = Formatter()

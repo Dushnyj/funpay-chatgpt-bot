@@ -19,6 +19,14 @@ def test_generate_code_matches_pyotp():
     assert code == expected
 
 
+def test_generate_code_at_matches_fixed_window():
+    from app.services.totp import generate_totp_at
+
+    secret = pyotp.random_base32()
+    timestamp = 1_750_000_029.9
+    assert generate_totp_at(secret, timestamp) == pyotp.TOTP(secret).at(timestamp)
+
+
 def test_verify_code_valid():
     from app.services.totp import generate_totp, verify_totp
 

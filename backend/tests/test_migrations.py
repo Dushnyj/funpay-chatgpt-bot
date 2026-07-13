@@ -63,7 +63,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
-    assert version == "20260713_0011"
+    assert version == "20260713_0012"
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
@@ -161,6 +161,91 @@ async def test_upgrade_database_creates_head_schema_idempotently(
     await engine.dispose()
 
 
+async def test_lot_template_upgrade_preserves_legacy_draft_disabled(
+    tmp_path, monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'lot-template-upgrade.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0011")
+
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO lot_templates "
+                "(tier_id, limit_scope_id, title_template_ru, title_template_en, "
+                "description_template_ru, description_template_en) VALUES "
+                "(NULL, NULL, 'Старый {plan}', 'Legacy {plan}', '', '')"
+            )
+        )
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260713_0012")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                text(
+                    "SELECT key, name, is_enabled, system_managed "
+                    "FROM lot_templates"
+                )
+            )
+        ).one()
+        columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns("lot_templates")
+            }
+        )
+        unique = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).get_unique_constraints(
+                "lot_templates"
+            )
+        )
+        target_index_sql = (
+            await connection.execute(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'index' "
+                    "AND name = 'uq_lot_templates_enabled_custom_target'"
+                )
+            )
+        ).scalar_one_or_none()
+    assert tuple(row) == ("legacy-1", "Legacy template 1", 0, 0)
+    assert {"key", "name", "is_enabled", "system_managed"} <= columns
+    assert any(item["column_names"] == ["key"] for item in unique)
+    assert target_index_sql is not None
+    normalized_index_sql = " ".join(target_index_sql.lower().split())
+    assert "coalesce(tier_id, 0)" in normalized_index_sql
+    assert "coalesce(limit_scope_id, 0)" in normalized_index_sql
+    assert "where system_managed = 0 and is_enabled = 1" in normalized_index_sql
+    await engine.dispose()
+
+    await asyncio.to_thread(command.downgrade, config, "20260713_0011")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        downgraded = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns("lot_templates")
+            }
+        )
+        downgraded_target_index_sql = (
+            await connection.execute(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'index' "
+                    "AND name = 'uq_lot_templates_enabled_custom_target'"
+                )
+            )
+        ).scalar_one_or_none()
+    assert not {"key", "name", "is_enabled", "system_managed"} & downgraded
+    assert downgraded_target_index_sql is None
+    await engine.dispose()
+
+
 async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     tmp_path, monkeypatch
 ):
@@ -248,7 +333,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260713_0011"
+    assert version == "20260713_0012"
     await engine.dispose()
 
 
@@ -337,7 +422,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260713_0011"
+    assert version == "20260713_0012"
     await engine.dispose()
 
 

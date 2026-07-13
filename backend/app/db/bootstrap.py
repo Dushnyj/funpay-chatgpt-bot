@@ -2,7 +2,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.models.settings import SellerSettings
-from app.services.seed_data import seed_catalog, seed_message_templates
+from app.services.seed_data import (
+    seed_catalog,
+    seed_lot_templates,
+    seed_message_templates,
+)
 
 
 async def bootstrap_database(
@@ -28,4 +32,5 @@ async def bootstrap_database(
 
         await seed_catalog(session, commit=False)
         await seed_message_templates(session, commit=False)
+        await seed_lot_templates(session, commit=False)
         await session.commit()

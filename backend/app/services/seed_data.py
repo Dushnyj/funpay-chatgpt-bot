@@ -2,7 +2,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.lot import LotTemplate
 from app.models.message import MessageTemplate
+from app.services.lot_templates import (
+    DEFAULT_LOT_TEMPLATES,
+    validate_lot_template_values,
+)
 from app.services.subscription_plans import SYSTEM_SUBSCRIPTION_PLANS
 
 
@@ -137,6 +142,34 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
     "code_rate_limited": {
         "ru": "⏳ Подождите {retry_in_sec} сек. перед запросом нового кода.",
         "en": "⏳ Wait {retry_in_sec} sec. before requesting a new code.",
+    },
+    "email_code_success": {
+        "ru": "📧 Email OTP OpenAI: {email_code}",
+        "en": "📧 OpenAI email OTP: {email_code}",
+    },
+    "email_code_duplicate": {
+        "ru": (
+            "📧 Последний email-код уже выдавался. Запросите новый код в "
+            "OpenAI и повторите !код."
+        ),
+        "en": (
+            "📧 The latest email code was already delivered. Request a new "
+            "one in OpenAI, then use !code again."
+        ),
+    },
+    "email_code_not_found": {
+        "ru": (
+            "📧 Свежий email-код не найден. Если OpenAI просит код из письма — "
+            "вызовите продавца: !продавец."
+        ),
+        "en": (
+            "📧 No fresh email code was found. If OpenAI asks for one, contact "
+            "the seller with !seller."
+        ),
+    },
+    "email_code_unavailable": {
+        "ru": "📧 Для доступа к почте нужен продавец: !продавец.",
+        "en": "📧 Mailbox access needs seller assistance: !seller.",
     },
     "subscription": {
         "ru": (
@@ -319,6 +352,49 @@ async def seed_message_templates(
             legacy_content = LEGACY_LIMIT_MESSAGE_TEMPLATES.get(key, {}).get(lang)
             if legacy_content is not None and existing.content == legacy_content:
                 existing.content = content
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+
+
+async def seed_lot_templates(
+    session: AsyncSession, *, commit: bool = True
+) -> None:
+    """Seed system lot templates without overwriting operator customizations."""
+    for key, default in DEFAULT_LOT_TEMPLATES.items():
+        validate_lot_template_values(
+            title_ru=default.title_ru,
+            title_en=default.title_en,
+            description_ru=default.description_ru,
+            description_en=default.description_en,
+        )
+        existing = (
+            await session.execute(
+                select(LotTemplate).where(LotTemplate.key == key)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            # Identity metadata and availability are system invariants;
+            # editable content remains entirely operator-owned.
+            existing.name = default.name
+            existing.system_managed = True
+            existing.is_enabled = True
+            continue
+        session.add(
+            LotTemplate(
+                key=key,
+                name=default.name,
+                tier_id=None,
+                limit_scope_id=None,
+                title_template_ru=default.title_ru,
+                title_template_en=default.title_en,
+                description_template_ru=default.description_ru,
+                description_template_en=default.description_en,
+                is_enabled=True,
+                system_managed=True,
+            )
+        )
     if commit:
         await session.commit()
     else:

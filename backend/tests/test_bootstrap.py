@@ -4,11 +4,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings
 from app.db.bootstrap import bootstrap_database
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.lot import LotTemplate
 from app.models.message import MessageTemplate
 from app.models.settings import SellerSettings
 from app.services.seed_data import (
     DEFAULT_DURATIONS,
     DEFAULT_LIMIT_SCOPES,
+    DEFAULT_LOT_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_TIERS,
 )
@@ -39,6 +41,9 @@ async def test_bootstrap_initializes_admin_and_reference_data(test_engine):
         assert (
             await session.execute(select(func.count()).select_from(MessageTemplate))
         ).scalar_one() == len(DEFAULT_MESSAGE_TEMPLATES) * 2
+        assert (
+            await session.execute(select(func.count()).select_from(LotTemplate))
+        ).scalar_one() == len(DEFAULT_LOT_TEMPLATES)
 
 
 async def test_bootstrap_does_not_overwrite_existing_admin_hash(test_engine):

@@ -1,13 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useRepairAccountCredentials, useStartDeviceAuth, useUpdateAccount } from '../api/accounts'
 import { useTiers } from '../api/catalog'
 import { api, ApiError } from '../api/client'
 import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
-import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpExport } from '../types/api'
-import { isValidationInProgress, validationState } from '../utils/accountValidation'
-import { formatDate, formatDateTime } from '../utils/format'
+import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpCode, TotpExport } from '../types/api'
+import { compactAccountUsage, formatUsageWindow, isValidationInProgress, rentalCapacityLabel, validationState } from '../utils/accountValidation'
+import { formatDateTime } from '../utils/format'
 
 export default function Accounts() {
   const accountsQuery = useAccounts()
@@ -20,7 +20,7 @@ export default function Accounts() {
   const [showForm, setShowForm] = useState(false)
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('all')
-  const [totpModal, setTotpModal] = useState<{ account: Account; data: TotpExport } | null>(null)
+  const [totpModal, setTotpModal] = useState<{ account: Account; data: TotpCode } | null>(null)
   const [totpLoading, setTotpLoading] = useState<number | null>(null)
   const [editTarget, setEditTarget] = useState<Account | null>(null)
   const [credentialTarget, setCredentialTarget] = useState<Account | null>(null)
@@ -38,7 +38,7 @@ export default function Accounts() {
   const filteredAccounts = useMemo(() => {
     const query = search.trim().toLowerCase()
     return accounts.filter((account) => {
-      const matchesSearch = !query || account.login.toLowerCase().includes(query) || account.email?.toLowerCase().includes(query)
+      const matchesSearch = !query || account.login.toLowerCase().includes(query)
       const matchesStatus = status === 'all' || validationState(account) === status
       return matchesSearch && matchesStatus
     })
@@ -77,17 +77,19 @@ export default function Accounts() {
     ? 'Определяется'
     : tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
   const activeCount = accounts.filter((account) => validationState(account) === 'active').length
-  const attentionCount = accounts.filter((account) => validationState(account) === 'validation_failed').length
+  const attentionCount = accounts.filter(accountNeedsAttention).length
   const hasDeviceAuthCandidate = accounts.some(isDeviceAuthEligible)
 
-  const exportTotp = async (account: Account) => {
+  const openTotpCode = async (account: Account) => {
     setActionError('')
     setTotpLoading(account.id)
     try {
-      const data = await api.get<TotpExport>(`/accounts/${account.id}/totp-export`)
+      const data = await api.get<TotpCode>(`/accounts/${account.id}/totp-code`)
       setTotpModal({ account, data })
     } catch (cause) {
-      setActionError(cause instanceof ApiError ? cause.message : 'Не удалось получить TOTP-секрет')
+      setActionError(cause instanceof ApiError && cause.status === 400
+        ? 'У аккаунта нет рабочего TOTP setup key. Обновите данные входа.'
+        : cause instanceof ApiError ? cause.message : 'Не удалось получить одноразовый код')
     } finally {
       setTotpLoading(null)
     }
@@ -187,23 +189,21 @@ export default function Accounts() {
 
       {actionError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{actionError}</span></div>}
       {actionSuccess && <div className="form-alert form-alert--success" role="status"><Icon name="check" /><span>{actionSuccess}</span></div>}
-      {!settingsQuery.isLoading && (
-        <div className={`form-alert ${graphConfigured ? 'form-alert--success' : 'form-alert--warning'}`} role="status">
-          <Icon name={graphConfigured ? 'check' : 'warning'} />
-          <span>{graphConfigured
-            ? 'Microsoft Graph настроен: Outlook можно подключать безопасно, без хранения пароля почты.'
-            : 'Microsoft Graph не настроен: Outlook OAuth временно недоступен. Обычный TOTP и другие способы добавления аккаунта продолжают работать.'}</span>
+      {!settingsQuery.isLoading && !graphConfigured && accounts.some(isOutlookAccount) && (
+        <div className="form-alert form-alert--warning" role="status">
+          <Icon name="warning" />
+          <span>Microsoft Graph не настроен — «Почта OAuth» недоступна.</span>
         </div>
       )}
       {hasDeviceAuthCandidate && !actionSuccess && (
-        <div className="form-alert form-alert--info"><Icon name="activity" /><span>Проверка через браузер — основной способ. Перед первым входом включите в ChatGPT: <strong>Настройки → Безопасность и вход → Авторизация кода устройства для Codex</strong>. «Повторить автоматически» запускает headless-вход, который защита OpenAI может заблокировать.</span></div>
+        <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для кнопки «Вход» включите в ChatGPT: <strong>Настройки → Безопасность и вход → Авторизация кода устройства для Codex</strong>.</span></div>
       )}
 
       <section className="panel panel--flush">
         <div className="toolbar">
           <label className="search-field">
             <Icon name="search" />
-            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск по логину или email" aria-label="Поиск аккаунтов" />
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск по аккаунту" aria-label="Поиск аккаунтов" />
           </label>
           <label className="select-field">
             <span>Статус</span>
@@ -229,54 +229,59 @@ export default function Accounts() {
           <EmptyState icon="search" title="Ничего не найдено" description="Измените строку поиска или фильтр статуса." />
         ) : (
           <TableShell>
-            <table className="data-table accounts-table">
-              <thead><tr><th>Аккаунт</th><th>План и окно лимита</th><th>Подписка</th><th>Лимит аренд</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
+            <table className="data-table accounts-table accounts-table--operator">
+              <thead><tr><th>Аккаунт</th><th>План</th><th>Лимиты Chat / Codex</th><th>Подписка</th><th>Аренды</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
               <tbody>
                 {filteredAccounts.map((account) => {
-                  const totpUnavailable = account.status !== 'active'
-                  const totpHint = totpUnavailable
-                    ? 'TOTP станет доступен после успешной проверки и активации аккаунта'
-                    : 'Экспортировать TOTP'
+                  const activeRentals = account.active_rentals_count
+                  const maximumRentals = account.max_active_rentals ?? settingsQuery.data?.default_max_active_rentals
+                  const totpHint = 'Получить текущий одноразовый код или открыть setup key'
+                  const hasActiveRentals = activeRentals != null && activeRentals > 0
                   return (
                     <tr key={account.id}>
                     <td data-label="Аккаунт">
-                      <div className="identity-cell"><span className="identity-avatar">{account.login.slice(0, 1).toUpperCase()}</span><span><strong>{account.login}</strong><small>{account.email ?? 'Email для восстановления не задан'}</small>{isOutlookAccount(account) && <small className={account.email_oauth_connected ? 'text-success' : 'text-warning'}>{account.email_oauth_connected ? 'Outlook OAuth подключён' : 'Outlook OAuth не подключён'}</small>}</span></div>
+                      <strong className="account-login" title={account.login}>{account.login}</strong>
                     </td>
-                    <td data-label="План и лимит"><PlanDetection account={account} tierName={tierName(account.tier_id)} expectedLongWindowSeconds={expectedCodexLongWindowSeconds(account, tiers)} /></td>
-                    <td data-label="Подписка">{account.subscription_expires_at ? formatDate(account.subscription_expires_at) : isFreePlan(account, tiers) ? 'Без срока' : '—'}</td>
-                    <td data-label="Лимит аренд">{account.max_active_rentals ?? 'По умолчанию'}</td>
+                    <td data-label="План"><span className={`soft-badge account-plan ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName(account.tier_id)}</span></td>
+                    <td data-label="Лимиты Chat / Codex"><CompactLimits account={account} /></td>
+                    <td data-label="Подписка"><span className="account-subscription">{isFreePlan(account, tiers) ? 'Без срока' : formatDateTime(account.subscription_expires_at)}</span></td>
+                    <td data-label="Аренды"><span className="rental-capacity" title={activeRentals == null ? 'Фактическое число аренд ещё не загружено' : `${activeRentals} активных аренд из ${maximumRentals ?? 'неизвестного максимума'}`}>{rentalCapacityLabel(activeRentals, account.max_active_rentals, settingsQuery.data?.default_max_active_rentals)}</span></td>
                     <td data-label="Проверка"><ValidationStatus account={account} /></td>
                     <td data-label="Действия">
-                      <div className="row-actions">
+                      <div className="row-actions account-actions">
                         {isDeviceAuthEligible(account) && (
-                          <button className="button button--primary button--compact" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Проверить ${account.login} через браузер`}>
-                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}Через браузер
+                          <button className="button button--primary button--compact account-action" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Войти в ${account.login} через браузер`} title="Ручная проверка через браузер">
+                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={14} />}Вход
                           </button>
                         )}
                         {isOutlookAccount(account) && (
-                          <button className={`button button--compact ${account.email_oauth_connected ? 'button--secondary' : 'button--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} Outlook для ${account.login}`} title={graphConfigured ? 'Безопасный доступ к кодам почты через Microsoft OAuth' : 'Microsoft Graph не настроен на сервере'}>
-                            {emailOAuthTarget === account.id ? <span className={`spinner ${account.email_oauth_connected ? '' : 'spinner--light'}`} /> : <Icon name={account.email_oauth_connected ? 'refresh' : 'shield'} size={15} />}{account.email_oauth_connected ? 'Outlook' : 'Почта OAuth'}
-                          </button>
+                          <span className="action-help" title={graphConfigured ? undefined : 'Microsoft Graph не настроен на сервере'} tabIndex={graphConfigured ? undefined : 0} aria-label={graphConfigured ? undefined : 'Почта OAuth недоступна: Microsoft Graph не настроен'}>
+                            <button className={`button button--compact account-action ${account.email_oauth_connected ? 'button--secondary' : 'button--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook для ${account.login} через OAuth`} title={graphConfigured ? `${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} безопасный доступ к почте` : undefined}>
+                              {emailOAuthTarget === account.id ? <span className={`spinner ${account.email_oauth_connected ? '' : 'spinner--light'}`} /> : <Icon name={account.email_oauth_connected ? 'check' : 'shield'} size={14} />}Почта OAuth
+                            </button>
+                          </span>
                         )}
                         {!isValidationInProgress(account) && (
-                          <button className="icon-button" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Повторить автоматически — защита OpenAI может заблокировать headless-вход">
-                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
+                          <button className="button button--ghost button--compact account-action" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Повторить автоматическую проверку">
+                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={14} />}Повторить
                           </button>
                         )}
-                        <button className="icon-button" onClick={() => setCredentialTarget(account)} aria-label={`Исправить данные входа ${account.login}`} title="Исправить логин, пароль, TOTP или почту">
-                          <Icon name="shield" />
-                        </button>
-                        <button className="icon-button" onClick={() => setEditTarget(account)} aria-label={`Редактировать параметры ${account.login}`} title="Редактировать срок, ёмкость и статус">
-                          <Icon name="settings" />
-                        </button>
-                        <span className="action-help" title={totpHint} tabIndex={totpUnavailable ? 0 : undefined} aria-label={totpUnavailable ? totpHint : undefined}>
-                          <button className="icon-button" onClick={() => exportTotp(account)} disabled={totpLoading === account.id || totpUnavailable} aria-label={totpUnavailable ? `Экспорт TOTP для ${account.login} недоступен: аккаунт должен пройти проверку` : `Экспорт TOTP для ${account.login}`}>
-                            {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" />}
+                        <span className="action-help" title={totpHint}>
+                          <button className="button button--ghost button--compact account-action" onClick={() => openTotpCode(account)} disabled={totpLoading === account.id} aria-label={`Получить одноразовый ключ для ${account.login}`} title={totpHint}>
+                            {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" size={14} />}Ключ
                           </button>
                         </span>
-                        <button className="icon-button icon-button--danger" onClick={() => setDeleteTarget(account)} aria-label={`Удалить ${account.login}`} title="Удалить">
-                          <Icon name="trash" />
+                        <button className="icon-button account-icon-action" onClick={() => setCredentialTarget(account)} aria-label={`Изменить данные входа ${account.login}`} title="Логин, пароль, TOTP и почта">
+                          <Icon name="shield" size={16} />
                         </button>
+                        <button className="icon-button account-icon-action" onClick={() => setEditTarget(account)} aria-label={`Изменить параметры ${account.login}`} title="Срок подписки, ёмкость и статус">
+                          <Icon name="settings" size={16} />
+                        </button>
+                        <span className="action-help" title={hasActiveRentals ? 'Сначала завершите активные аренды' : undefined} tabIndex={hasActiveRentals ? 0 : undefined} aria-label={hasActiveRentals ? `Удаление ${account.login} недоступно: есть активные аренды` : undefined}>
+                          <button className="button button--ghost button--compact account-action account-action--danger" onClick={() => setDeleteTarget(account)} disabled={hasActiveRentals} aria-label={`Удалить ${account.login}`} title={hasActiveRentals ? undefined : 'Удалить аккаунт'}>
+                            <Icon name="trash" size={14} />Удалить
+                          </button>
+                        </span>
                       </div>
                     </td>
                     </tr>
@@ -327,125 +332,59 @@ function normalizeVerificationUrl(value: string) {
   return url.toString()
 }
 
-function PlanDetection({ account, tierName, expectedLongWindowSeconds }: { account: Account; tierName: string; expectedLongWindowSeconds: number | null }) {
-  const details = [
-    account.plan_raw_type ? `raw: ${account.plan_raw_type}` : null,
-    account.plan_source ? `источник: ${humanizePlanSource(account.plan_source)}` : null,
-    account.plan_confidence != null ? `уверенность: ${formatConfidence(account.plan_confidence)}` : null,
-  ].filter(Boolean)
-
-  return (
-    <div className="plan-detection">
-      <span className={`soft-badge ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName}</span>
-      {details.length > 0 && <small>{details.join(' · ')}</small>}
-      {account.plan_detected_at && <small>Определён {formatDate(account.plan_detected_at)}</small>}
-      <PlanWindowContract account={account} expectedLongWindowSeconds={expectedLongWindowSeconds} />
-      <ObservedLimits account={account} expectedLongWindowSeconds={expectedLongWindowSeconds} />
-    </div>
-  )
-}
-
-function PlanWindowContract({ account, expectedLongWindowSeconds }: { account: Account; expectedLongWindowSeconds: number | null }) {
-  const status = account.limits?.plan_window_status ?? 'unknown'
-  const expected = account.limits?.expected_long_window_seconds ?? expectedLongWindowSeconds
-  const expectedLabel = expected == null ? null : formatObservedWindow(expected)
-  const planKind = expected === 30 * 86_400 ? 'Free' : expected == null ? null : 'платный тариф'
-
-  const label = status === 'ok'
-    ? 'Длинное окно подтверждено'
-    : status === 'mismatch'
-      ? 'Окно не совпало'
-      : 'Окно ещё не проверено'
-  const description = status === 'mismatch'
-    ? `${expectedLabel ? `Ожидалось длинное окно ${expectedLabel}. ` : ''}Аккаунт исключён из выдачи до успешной повторной проверки.`
-    : status === 'ok'
-      ? `Длинное окно Codex: ${expectedLabel ?? 'определено OpenAI'}${planKind ? ` · ${planKind}` : ''}.`
-      : expectedLabel
-        ? `Ожидается свежий замер длинного окна ${expectedLabel}${planKind ? ` · ${planKind}` : ''}.`
-        : 'Сначала система должна определить тариф и получить свежие окна Codex.'
-
-  return (
-    <div className={`plan-window-contract plan-window-contract--${status}`}>
-      <StatusBadge value={status} label={label} />
-      <small>{description}</small>
-    </div>
-  )
-}
-
-function ObservedLimits({ account, expectedLongWindowSeconds }: { account: Account; expectedLongWindowSeconds: number | null }) {
+function CompactLimits({ account }: { account: Account }) {
   const limits = account.limits
-  if (!limits?.measured_at) return null
-
-  const measuredAt = new Date(limits.measured_at)
-  const stale = limits.refresh_status !== 'ok'
-    || Number.isNaN(measuredAt.getTime())
-    || Date.now() - measuredAt.getTime() > 60 * 60 * 1_000
-
-  const expected = limits.expected_long_window_seconds ?? expectedLongWindowSeconds
-
-  const windows = [
-    {
-      seconds: limits.codex_primary_window_seconds,
-      label: formatObservedWindow(limits.codex_primary_window_seconds),
-      remaining: limits.codex_primary_remaining_pct,
-      resetsAt: limits.codex_primary_resets_at,
-    },
-    {
-      seconds: limits.codex_secondary_window_seconds,
-      label: formatObservedWindow(limits.codex_secondary_window_seconds),
-      remaining: limits.codex_secondary_remaining_pct,
-      resetsAt: limits.codex_secondary_resets_at,
-    },
-  ].filter((window) => window.remaining != null || window.label !== '—')
-
-  if (windows.length === 0) return <small>Лимиты Codex не опубликованы OpenAI</small>
+  const usage = compactAccountUsage(limits)
+  const stale = areLimitsStale(limits)
+  const windowStatus = limits?.plan_window_status ?? 'unknown'
 
   return (
-    <div className={`observed-limits ${stale ? 'observed-limits--stale' : ''}`}>
-      <small className="observed-limits__meta">Фактические окна Codex от OpenAI · замер {formatDateTime(limits.measured_at)}{stale ? ' · данные устарели' : ''}</small>
-      {windows.map((window, index) => (
-        <span key={`${window.label}-${index}`}>
-          <strong>{observedWindowKind(window.seconds, expected)} {window.label}:</strong> {window.remaining == null ? 'остаток неизвестен' : `осталось ${window.remaining}%`}
-          {window.resetsAt && <small>сброс {formatDateTime(window.resetsAt)}</small>}
-        </span>
-      ))}
+    <div className={`compact-limits ${stale ? 'compact-limits--stale' : ''}`}>
+      <CompactLimitGroup product="Chat" windows={usage.chat} />
+      <CompactLimitGroup product="Codex" windows={usage.codex} />
+      {windowStatus === 'mismatch' && <small className="compact-limits__alert compact-limits__alert--danger" title="Аккаунт исключён из автоматической выдачи">Окно тарифа не совпало</small>}
+      {windowStatus === 'unknown' && <small className="compact-limits__alert" title="До свежего замера аккаунт не должен участвовать в автоматической выдаче">Окно не проверено</small>}
+      {stale && <small className="compact-limits__alert" title={limits?.measured_at ? `Последний замер: ${formatDateTime(limits.measured_at)}` : 'Свежего замера ещё нет'}>Лимиты устарели</small>}
     </div>
   )
 }
 
-function formatObservedWindow(seconds: number | null) {
-  if (seconds == null) return '—'
-  if (seconds % 86_400 === 0) {
-    const days = seconds / 86_400
-    return `${days} ${days === 1 ? 'день' : days >= 2 && days <= 4 ? 'дня' : 'дней'}`
-  }
-  if (seconds % 3_600 === 0) return `${seconds / 3_600} ч`
-  if (seconds % 60 === 0) return `${seconds / 60} мин`
-  return `${seconds} сек`
+function CompactLimitGroup({ product, windows }: { product: 'Chat' | 'Codex'; windows: ReturnType<typeof compactAccountUsage>['chat'] }) {
+  return (
+    <div className="compact-limit-group">
+      <strong>{product}</strong>
+      <span>
+        {windows.length === 0
+          ? <small>—</small>
+          : windows.map((window) => (
+              <small key={window.key}>
+                {formatUsageWindow(window.windowSeconds)} — {window.remainingPct}%
+                {window.resetsAt ? ` · сброс ${formatCompactDateTime(window.resetsAt)}` : ''}
+              </small>
+            ))}
+      </span>
+    </div>
+  )
 }
 
-function observedWindowKind(seconds: number | null, expectedLongWindowSeconds: number | null) {
-  if (seconds != null && expectedLongWindowSeconds != null && seconds === expectedLongWindowSeconds) return 'Длинное окно'
-  if (seconds != null && seconds <= 6 * 3_600) return 'Короткое окно'
-  return 'Наблюдаемое окно'
+function formatCompactDateTime(value: string) {
+  return formatDateTime(value).replace(' г.', '')
 }
 
-function humanizePlanSource(source: string) {
-  const labels: Record<string, string> = {
-    accounts_check: 'OpenAI account',
-    wham_usage: 'OpenAI usage',
-    access_token: 'OpenAI access token',
-    id_token: 'OpenAI ID token',
-    account_api: 'OpenAI API',
-    usage_api: 'Usage API',
-    heuristic: 'сопоставление',
-  }
-  return source.split('+').map((item) => labels[item] ?? item).join(' + ')
+function areLimitsStale(limits: Account['limits']) {
+  if (!limits) return false
+  if (limits.refresh_status !== 'ok' || !limits.measured_at) return true
+  const measuredAt = new Date(limits.measured_at)
+  return Number.isNaN(measuredAt.getTime()) || Date.now() - measuredAt.getTime() > 60 * 60 * 1_000
 }
 
-function formatConfidence(value: number) {
-  const percent = value <= 1 ? value * 100 : value
-  return `${Math.round(percent)}%`
+function accountNeedsAttention(account: Account) {
+  const state = validationState(account)
+  if (state === 'validation_failed') return true
+  if (state !== 'active') return false
+  return !account.limits
+    || account.limits.plan_window_status !== 'ok'
+    || areLimitsStale(account.limits)
 }
 
 function ValidationStatus({ account }: { account: Account }) {
@@ -461,15 +400,15 @@ function ValidationStatus({ account }: { account: Account }) {
   return (
     <div className="validation-state">
       <StatusBadge value={state} label={label} />
-      {job?.stage && !nonBlockingFailure && <small>Этап: {humanizeValidationStage(job.stage)}</small>}
+      {state === 'detecting' && job?.stage && <small>{humanizeValidationStage(job.stage)}</small>}
       {state === 'validation_failed' && (job?.error_detail || job?.error_code) && (
         <small className="validation-state__error" title={job.error_detail ?? job.error_code ?? undefined}>
-          {job.error_detail ?? humanizeValidationError(job.error_code ?? '')}
+          {humanizeValidationError(job.error_code ?? '') || 'Проверка не пройдена'}
         </small>
       )}
       {nonBlockingFailure && (
         <small className="validation-state__warning" title={job.error_detail ?? job.error_code ?? undefined}>
-          Последняя фоновая проверка не завершилась: {(job.error_detail ?? humanizeValidationError(job.error_code ?? '')).replace(/[.!?]+$/u, '')}. Аккаунт остаётся активным по свежим токенам и лимитам.
+          Фоновая ошибка
         </small>
       )}
     </div>
@@ -807,23 +746,124 @@ function AddAccountDialog({ graphConfigured, onClose }: { graphConfigured: boole
   )
 }
 
-function TotpDialog({ modal, onClose }: { modal: { account: Account; data: TotpExport }; onClose: () => void }) {
-  const [copied, setCopied] = useState<'secret' | 'uri' | null>(null)
+function TotpDialog({ modal, onClose }: { modal: { account: Account; data: TotpCode }; onClose: () => void }) {
+  const [currentCode, setCurrentCode] = useState(modal.data.code)
+  const [expiresAt, setExpiresAt] = useState(() => Date.now() + Math.max(1, modal.data.seconds_remaining) * 1_000)
+  const [secondsRemaining, setSecondsRemaining] = useState(modal.data.seconds_remaining)
+  const [codeValid, setCodeValid] = useState(true)
+  const [codeLoading, setCodeLoading] = useState(false)
+  const [setupData, setSetupData] = useState<TotpExport | null>(null)
+  const [setupLoading, setSetupLoading] = useState(false)
+  const [copied, setCopied] = useState<'code' | 'secret' | 'uri' | null>(null)
+  const [error, setError] = useState('')
+  const refreshingRef = useRef(false)
+  const retryAtRef = useRef(0)
+  const retryDelayRef = useRef(5_000)
 
-  const copy = async (kind: 'secret' | 'uri', value: string) => {
-    await navigator.clipboard.writeText(value)
-    setCopied(kind)
-    window.setTimeout(() => setCopied(null), 1600)
+  const refreshCode = useCallback(async () => {
+    if (refreshingRef.current) return
+    refreshingRef.current = true
+    setCodeLoading(true)
+    try {
+      const data = await api.get<TotpCode>(`/accounts/${modal.account.id}/totp-code`)
+      setCurrentCode(data.code)
+      setSecondsRemaining(data.seconds_remaining)
+      setExpiresAt(Date.now() + Math.max(1, data.seconds_remaining) * 1_000)
+      setCodeValid(true)
+      retryAtRef.current = 0
+      retryDelayRef.current = 5_000
+      setError('')
+    } catch (cause) {
+      retryAtRef.current = Date.now() + retryDelayRef.current
+      retryDelayRef.current = Math.min(retryDelayRef.current * 2, 30_000)
+      setError(cause instanceof ApiError && cause.status === 400
+        ? 'У аккаунта нет рабочего TOTP setup key.'
+        : cause instanceof ApiError ? cause.message : 'Не удалось обновить одноразовый код')
+    } finally {
+      refreshingRef.current = false
+      setCodeLoading(false)
+    }
+  }, [modal.account.id])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now()
+      const remaining = Math.max(0, Math.ceil((expiresAt - now) / 1_000))
+      setSecondsRemaining(remaining)
+      if (remaining === 0) {
+        setCodeValid(false)
+        if (now >= retryAtRef.current) void refreshCode()
+      }
+    }, 1_000)
+    return () => window.clearInterval(timer)
+  }, [expiresAt, refreshCode])
+
+  const copy = async (kind: 'code' | 'secret' | 'uri', value: string) => {
+    try {
+      await navigator.clipboard.writeText(value)
+      setError('')
+      setCopied(kind)
+      window.setTimeout(() => setCopied(null), 1_600)
+    } catch {
+      setError('Не удалось скопировать автоматически. Выделите значение вручную.')
+    }
+  }
+
+  const toggleSetupKey = async () => {
+    if (setupData) {
+      setSetupData(null)
+      return
+    }
+    setSetupLoading(true)
+    setError('')
+    try {
+      const data = await api.get<TotpExport>(`/accounts/${modal.account.id}/totp-export`)
+      setSetupData(data)
+    } catch (cause) {
+      setError(cause instanceof ApiError && cause.status === 400
+        ? 'У аккаунта нет рабочего TOTP setup key.'
+        : cause instanceof ApiError ? cause.message : 'Не удалось получить setup key')
+    } finally {
+      setSetupLoading(false)
+    }
   }
 
   return (
     <ModalOverlay onClose={onClose}>
       <div className="modal totp-dialog" role="dialog" aria-modal="true" aria-labelledby="totp-title">
-        <div className="modal__header"><div><span className="eyebrow">Чувствительные данные</span><h2 id="totp-title">TOTP для {modal.account.login}</h2></div><button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button></div>
-        <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Любой, кто получит этот ключ или QR-код, сможет генерировать коды входа. Не отправляйте его покупателю.</span></div>
-        <img src={modal.data.qr_png_base64} alt={`QR-код TOTP для ${modal.account.login}`} className="qr-code" />
-        <label className="field"><span className="field__label">Secret (base32)</span><span className="copy-field"><input readOnly value={modal.data.secret} /><button type="button" onClick={() => copy('secret', modal.data.secret)}><Icon name={copied === 'secret' ? 'check' : 'copy'} />{copied === 'secret' ? 'Скопировано' : 'Копировать'}</button></span></label>
-        <label className="field"><span className="field__label">otpauth URI</span><span className="copy-field"><input readOnly value={modal.data.otpauth_uri} /><button type="button" onClick={() => copy('uri', modal.data.otpauth_uri)}><Icon name={copied === 'uri' ? 'check' : 'copy'} />{copied === 'uri' ? 'Скопировано' : 'Копировать'}</button></span></label>
+        <div className="modal__header">
+          <div><span className="eyebrow">Доступ к аккаунту</span><h2 id="totp-title">Одноразовый код</h2><p>{modal.account.login}</p></div>
+          <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>
+        </div>
+
+        {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
+
+        <div className="totp-current-code" aria-live="polite">
+          <div>
+            <span>{codeValid && secondsRemaining > 0 ? currentCode : '••••••'}</span>
+            <small>{codeValid && secondsRemaining > 0 ? `Действует ещё ${secondsRemaining} с` : codeLoading ? 'Обновляем код…' : 'Повторим автоматически'}</small>
+          </div>
+          <button type="button" onClick={() => copy('code', currentCode)} disabled={!codeValid || secondsRemaining <= 0 || codeLoading} aria-label="Скопировать одноразовый код">
+            <Icon name={copied === 'code' ? 'check' : 'copy'} />{copied === 'code' ? 'Скопировано' : 'Копировать'}
+          </button>
+        </div>
+
+        <div className="totp-secondary-actions">
+          <button type="button" className="button button--secondary button--compact" onClick={refreshCode} disabled={codeLoading}>{codeLoading ? <span className="spinner" /> : <Icon name="refresh" size={14} />}Обновить код</button>
+          <button type="button" className="button button--ghost button--compact" onClick={toggleSetupKey} disabled={setupLoading} aria-expanded={setupData !== null}>
+            {setupLoading ? <span className="spinner" /> : <Icon name="key" size={14} />}{setupData ? 'Скрыть setup key' : 'Показать setup key и QR'}
+          </button>
+        </div>
+
+        {setupData && (
+          <div className="totp-setup-export">
+            <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Setup key даёт постоянный доступ к кодам. Не передавайте его покупателю.</span></div>
+            <img src={setupData.qr_png_base64} alt={`QR-код TOTP для ${modal.account.login}`} className="qr-code" />
+            <label className="field"><span className="field__label">Setup key (base32)</span><span className="copy-field"><input readOnly value={setupData.secret} /><button type="button" onClick={() => copy('secret', setupData.secret)}><Icon name={copied === 'secret' ? 'check' : 'copy'} />{copied === 'secret' ? 'Скопировано' : 'Копировать'}</button></span></label>
+            <label className="field"><span className="field__label">otpauth URI</span><span className="copy-field"><input readOnly value={setupData.otpauth_uri} /><button type="button" onClick={() => copy('uri', setupData.otpauth_uri)}><Icon name={copied === 'uri' ? 'check' : 'copy'} />{copied === 'uri' ? 'Скопировано' : 'Копировать'}</button></span></label>
+          </div>
+        )}
+
         <div className="modal__actions"><button className="button button--primary" onClick={onClose}>Готово</button></div>
       </div>
     </ModalOverlay>
@@ -935,14 +975,16 @@ function DeviceAuthDialog({
 function isFreePlan(account: Account, tiers: Array<{ id: number; code?: string }>) {
   if (tiers.some((tier) => tier.id === account.tier_id && tier.code === 'free')) return true
   const candidates = [account.plan_raw_type, account.limits?.plan_type]
-  return candidates.some((value) => value != null && ['free', 'chatgpt_free', 'chatgptfreeplan'].includes(value.toLowerCase()))
+  return candidates.some((value) => value != null && normalizePlanCode(value) === 'free')
 }
 
-function expectedCodexLongWindowSeconds(account: Account, tiers: Array<{ id: number; code?: string }>) {
-  if (account.limits?.expected_long_window_seconds != null) return account.limits.expected_long_window_seconds
-  if (isFreePlan(account, tiers)) return 30 * 86_400
-  if (account.tier_id !== null) return 7 * 86_400
-  return null
+function normalizePlanCode(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^chat[_-]?gpt[_-]?/, '')
+    .replace(/[_-]?plan$/, '')
+    .replace(/[^a-z0-9]+/g, '_')
 }
 
 function isOutlookAddress(value: string | null | undefined) {

@@ -6,8 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import FakeChatGateway
 from app.models.account import Account, AccountLimits
+from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
-from app.models.lot import PriceMatrix, Lot
+from app.models.lot import Lot, LotTemplate, PriceMatrix
 from app.services.lot_auto_manager import LotAutoManager
 
 
@@ -79,6 +80,60 @@ async def test_creates_lot_when_capacity_available(session: AsyncSession):
     assert any(a.action == "create" for a in actions)
 
 
+async def test_uses_most_specific_enabled_lot_template_deterministically(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    session.add_all(
+        [
+            PriceMatrix(
+                tier_id=tier.id,
+                duration_id=duration.id,
+                limit_scope_id=scope.id,
+                min_limit_pct=70,
+                price=599,
+            ),
+            LotTemplate(
+                key="general",
+                name="General",
+                title_template_ru="GENERAL {plan} {days} {condition}",
+                title_template_en="GENERAL {plan} {days} {condition}",
+                description_template_ru="Общий {long_window_days}",
+                description_template_en="General {long_window_days}",
+                is_enabled=True,
+                system_managed=False,
+            ),
+            LotTemplate(
+                key="specific",
+                name="Specific",
+                tier_id=tier.id,
+                limit_scope_id=scope.id,
+                title_template_ru="SPECIFIC {plan} {days} {condition}",
+                title_template_en="SPECIFIC {plan} {days} {condition}",
+                description_template_ru=(
+                    "Точный {long_window_days}; "
+                    "{min_limit}/{short_limit}/{long_limit}"
+                ),
+                description_template_en=(
+                    "Specific {long_window_days}; "
+                    "{min_limit}/{short_limit}/{long_limit}"
+                ),
+                is_enabled=True,
+                system_managed=False,
+            ),
+        ]
+    )
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert any(action.action == "create" for action in actions)
+    lot = (await session.execute(select(Lot))).scalar_one()
+    assert lot.title_ru.startswith("SPECIFIC")
+    assert lot.description_ru == "Точный 7; 70%/—/—"
+
+
 async def test_successful_first_create_is_durable_when_second_remote_call_fails(
     session: AsyncSession,
 ):
@@ -121,6 +176,123 @@ async def test_successful_first_create_is_durable_when_second_remote_call_fails(
     lots = list((await session.execute(select(Lot))).scalars())
     assert len(lots) == 1
     assert lots[0].funpay_id is not None
+
+
+async def test_template_render_error_does_not_block_other_lot_and_is_audited(
+    session: AsyncSession,
+):
+    valid_tier, duration, scope = await _seed_catalog(session)
+    invalid_tier = SubscriptionTier(
+        code="pro",
+        name="X" * 120,
+        is_active=True,
+        is_sellable=True,
+    )
+    session.add(invalid_tier)
+    await session.flush()
+    await _add_account_with_limits(session, valid_tier.id, n=1)
+    await _add_account_with_limits(session, invalid_tier.id, n=2)
+    valid_matrix = PriceMatrix(
+        tier_id=valid_tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    invalid_matrix = PriceMatrix(
+        tier_id=invalid_tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=799,
+    )
+    session.add_all(
+        [
+            valid_matrix,
+            invalid_matrix,
+            LotTemplate(
+                key="invalid-render",
+                name="Invalid render",
+                tier_id=invalid_tier.id,
+                title_template_ru=("Y" * 140) + " {plan} {days} {condition}",
+                title_template_en=("Y" * 140) + " {plan} {days} {condition}",
+                description_template_ru="",
+                description_template_en="",
+                is_enabled=True,
+                system_managed=False,
+            ),
+        ]
+    )
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert [action.action for action in actions].count("create") == 1
+    lot = (await session.execute(select(Lot))).scalar_one()
+    assert lot.tier_id == valid_tier.id
+    audit = (await session.execute(select(AuditLog))).scalar_one()
+    assert audit.event_type == "lot_template_render_failed"
+    assert audit.metadata_["config_key"] == invalid_matrix.config_key
+    assert "255" in audit.metadata_["error"]
+
+
+async def test_existing_active_lot_with_template_render_error_is_paused_and_audited(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    tier.name = "X" * 120
+    await _add_account_with_limits(session, tier.id)
+    matrix = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="Old",
+        title_en="Old",
+        status="active",
+        auto_created=True,
+        funpay_id="701",
+    )
+    session.add_all(
+        [
+            lot,
+            LotTemplate(
+                key="invalid-existing-render",
+                name="Invalid existing render",
+                tier_id=tier.id,
+                title_template_ru=("Y" * 140) + " {plan} {days} {condition}",
+                title_template_en=("Y" * 140) + " {plan} {days} {condition}",
+                description_template_ru="",
+                description_template_en="",
+                is_enabled=True,
+                system_managed=False,
+            ),
+        ]
+    )
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    actions = await LotAutoManager(55).run(session, gateway)
+
+    await session.refresh(lot)
+    assert any(
+        action.lot_id == lot.id and action.action == "pause"
+        for action in actions
+    )
+    assert lot.status == "paused"
+    assert lot.paused_reason == "auto_template_error"
+    assert gateway.activity_changes == [(701, False)]
+    audit = (await session.execute(select(AuditLog))).scalar_one()
+    assert audit.event_type == "lot_template_render_failed"
+    assert audit.metadata_["config_key"] == matrix.config_key
 
 
 async def test_pauses_lot_when_no_capacity(session: AsyncSession):

@@ -327,7 +327,10 @@ class CodeHandler:
             code=labelled_totp,
             expires_in=_fmt_remaining(rental.expires_at, now),
         )
-        text += self._email_code_suffix(ctx.lang, email_code, email_state)
+        email_text = await self._render_email_code_status(
+            session, ctx.lang, email_code, email_state,
+        )
+        text += f"\n\n{email_text}"
         await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
 
     async def _send_rate_limit_if_needed(
@@ -402,40 +405,24 @@ class CodeHandler:
             return None, "seller_required"
 
     @staticmethod
-    def _email_code_suffix(
+    async def _render_email_code_status(
+        session: AsyncSession,
         lang: str,
         email_code: FreshVerificationCode | None,
         state: str,
     ) -> str:
         if email_code is not None:
-            if lang == "en":
-                return f"\n\n📧 OpenAI email OTP: {email_code.code}"
-            return f"\n\n📧 Email OTP OpenAI: {email_code.code}"
-        if lang == "en":
-            if state == "duplicate":
-                return (
-                    "\n\n📧 The latest email OTP was already delivered. "
-                    "Request a new one in OpenAI, then use !code again."
-                )
-            if state == "not_found":
-                return (
-                    "\n\n📧 No fresh email OTP was found. If OpenAI asks for "
-                    "one, contact the seller with !seller."
-                )
-            return (
-                "\n\n📧 Mailbox access needs seller assistance: !seller."
+            return await render_message(
+                session,
+                "email_code_success",
+                lang,
+                email_code=email_code.code,
             )
-        if state == "duplicate":
-            return (
-                "\n\n📧 Последний email-код уже выдавался. Запросите новый "
-                "код в OpenAI и повторите !код."
-            )
-        if state == "not_found":
-            return (
-                "\n\n📧 Свежий email-код не найден. Если OpenAI просит код "
-                "из письма — вызовите продавца: !продавец."
-            )
-        return "\n\n📧 Для доступа к почте нужен продавец: !продавец."
+        template = {
+            "duplicate": "email_code_duplicate",
+            "not_found": "email_code_not_found",
+        }.get(state, "email_code_unavailable")
+        return await render_message(session, template, lang)
 
 
 class HelpHandler:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +32,7 @@ from app.models.account import (
 from app.models.audit import AuditLog
 from app.models.rental import Rental
 from app.services.account_device_auth import account_device_auth_manager
+from app.services.totp import generate_totp_at, is_valid_base32
 from app.integrations.openai.device_auth import DeviceAuthError
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depends(get_current_user)])
@@ -84,6 +87,7 @@ def _account_out(
     account: Account,
     job: AccountCheckJob | None = None,
     email_oauth: EmailOAuthCredential | None = None,
+    active_rentals_count: int = 0,
 ) -> AccountOut:
     base = AccountOut.model_validate(account)
     return base.model_copy(
@@ -98,6 +102,7 @@ def _account_out(
             "email_oauth_status": (
                 email_oauth.status if email_oauth is not None else None
             ),
+            "active_rentals_count": active_rentals_count,
         }
     )
 
@@ -107,8 +112,9 @@ def _account_with_limits(
     limits: AccountLimits | None,
     job: AccountCheckJob | None = None,
     email_oauth: EmailOAuthCredential | None = None,
+    active_rentals_count: int = 0,
 ) -> AccountWithLimits:
-    base = _account_out(account, job, email_oauth)
+    base = _account_out(account, job, email_oauth, active_rentals_count)
     return AccountWithLimits(
         **base.model_dump(),
         limits=(
@@ -159,6 +165,27 @@ async def _email_oauth_by_account(
     return {credential.account_id: credential for credential in result.scalars()}
 
 
+async def _active_rental_counts(
+    session: AsyncSession, account_ids: list[int],
+) -> dict[int, int]:
+    if not account_ids:
+        return {}
+    result = await session.execute(
+        select(Rental.account_id, func.count(Rental.id))
+        .where(
+            Rental.account_id.in_(account_ids),
+            Rental.status == "active",
+        )
+        .group_by(Rental.account_id)
+    )
+    return {account_id: int(count) for account_id, count in result.all()}
+
+
+async def _active_rental_count(session: AsyncSession, account_id: int) -> int:
+    counts = await _active_rental_counts(session, [account_id])
+    return counts.get(account_id, 0)
+
+
 @router.get("", response_model=list[AccountWithLimits])
 async def list_accounts(session: AsyncSession = Depends(get_db_session)):
     result = await session.execute(select(Account).order_by(Account.id))
@@ -167,12 +194,14 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
     jobs = await _latest_jobs(session, account_ids)
     limits = await _limits_by_account(session, account_ids)
     email_oauth = await _email_oauth_by_account(session, account_ids)
+    active_rental_counts = await _active_rental_counts(session, account_ids)
     return [
         _account_with_limits(
             account,
             limits.get(account.id),
             jobs.get(account.id),
             email_oauth.get(account.id),
+            active_rental_counts.get(account.id, 0),
         )
         for account in accounts
     ]
@@ -242,8 +271,13 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
     limits = await session.get(AccountLimits, account_id)
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
+    active_rental_counts = await _active_rental_counts(session, [account.id])
     return _account_with_limits(
-        account, limits, jobs.get(account.id), email_oauth
+        account,
+        limits,
+        jobs.get(account.id),
+        email_oauth,
+        active_rental_counts.get(account.id, 0),
     )
 
 
@@ -286,7 +320,8 @@ async def recheck_account(
     await session.refresh(account)
     await session.refresh(job)
     email_oauth = await session.get(EmailOAuthCredential, account.id)
-    return _account_out(account, job, email_oauth)
+    active_rentals_count = await _active_rental_count(session, account.id)
+    return _account_out(account, job, email_oauth, active_rentals_count)
 
 
 @router.post(
@@ -350,12 +385,22 @@ async def get_device_auth_status(
         raise HTTPException(status_code=404, detail="Device authorization not found")
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
+    active_rentals_count = (
+        await _active_rental_count(session, account.id)
+        if auth_session.status == "completed"
+        else 0
+    )
     return DeviceAuthStatusOut(
         status=auth_session.status,
         error_code=auth_session.error_code,
         error_detail=auth_session.error_detail,
         account=(
-            _account_out(account, jobs.get(account.id), email_oauth)
+            _account_out(
+                account,
+                jobs.get(account.id),
+                email_oauth,
+                active_rentals_count,
+            )
             if auth_session.status == "completed"
             else None
         ),
@@ -376,7 +421,13 @@ async def update_account(account_id: int, req: AccountUpdate, session: AsyncSess
     await session.refresh(account)
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
-    return _account_out(account, jobs.get(account.id), email_oauth)
+    active_rentals_count = await _active_rental_count(session, account.id)
+    return _account_out(
+        account,
+        jobs.get(account.id),
+        email_oauth,
+        active_rentals_count,
+    )
 
 
 @router.patch(
@@ -516,7 +567,8 @@ async def update_account_credentials(
 
     await session.refresh(account)
     await session.refresh(job)
-    return _account_out(account, job, email_oauth)
+    active_rentals_count = await _active_rental_count(session, account.id)
+    return _account_out(account, job, email_oauth, active_rentals_count)
 
 
 @router.delete("/{account_id}", status_code=204)
@@ -544,6 +596,76 @@ class TotpExportResponse(BaseModel):
     secret: str
     otpauth_uri: str
     qr_png_base64: str
+
+
+class TotpCodeResponse(BaseModel):
+    code: str = Field(pattern=r"^\d{6}$")
+    seconds_remaining: int = Field(ge=1, le=30)
+
+
+_TOTP_STEP_SECONDS = 30
+_TOTP_MIN_RESPONSE_VALIDITY_SECONDS = 5
+_TOTP_TRANSPORT_SAFETY_SECONDS = 2
+
+
+def _now() -> float:
+    """Local clock seam for deterministic TOTP boundary tests."""
+    return time.time()
+
+
+async def _sleep(seconds: float) -> None:
+    """Local async wait seam paired with ``_now``."""
+    await asyncio.sleep(seconds)
+
+
+@router.get("/{account_id}/totp-code", response_model=TotpCodeResponse)
+async def get_totp_code(
+    account_id: int,
+    response: Response,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Generate a current TOTP without exposing the reusable setup secret."""
+    account = await session.get(Account, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    secret = account.totp_secret_encrypted or ""
+    if not secret:
+        raise HTTPException(status_code=400, detail="Account has no TOTP secret")
+    if not is_valid_base32(secret):
+        raise HTTPException(status_code=400, detail="Account has an invalid TOTP secret")
+
+    session.add(
+        AuditLog(
+            event_type="totp_code_generated",
+            account_id=account.id,
+            metadata_={"actor": "admin"},
+        )
+    )
+    await session.commit()
+
+    # Generate only after the audit transaction is durable, otherwise a slow
+    # commit can consume the final seconds of the code.  At the window edge we
+    # wait for the next code and report a conservative validity interval so a
+    # normal network round-trip cannot leave the UI copying an expired value.
+    timestamp = _now()
+    raw_remaining = _TOTP_STEP_SECONDS - (
+        int(timestamp) % _TOTP_STEP_SECONDS
+    )
+    if raw_remaining <= _TOTP_MIN_RESPONSE_VALIDITY_SECONDS:
+        await _sleep(raw_remaining + 0.05)
+        timestamp = _now()
+        raw_remaining = _TOTP_STEP_SECONDS - (
+            int(timestamp) % _TOTP_STEP_SECONDS
+        )
+    code = generate_totp_at(secret, timestamp)
+    seconds_remaining = max(
+        1,
+        raw_remaining - _TOTP_TRANSPORT_SAFETY_SECONDS,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return TotpCodeResponse(code=code, seconds_remaining=seconds_remaining)
 
 
 @router.get("/{account_id}/totp-export", response_model=TotpExportResponse)

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { validationState } from '../src/utils/accountValidation.ts'
+import {
+  compactAccountUsage,
+  formatUsageWindow,
+  rentalCapacityLabel,
+  validationState,
+} from '../src/utils/accountValidation.ts'
 
 test('a transient failed background job does not demote a proven active account', () => {
   assert.equal(validationState({
@@ -82,4 +87,67 @@ test('operator pause always wins over a background job', () => {
       finished_at: '2026-07-13T10:00:02Z',
     },
   }), 'maintenance')
+})
+
+test('compact usage keeps the exact 30-day Free window instead of relabelling it weekly', () => {
+  const usage = compactAccountUsage({
+    account_id: 1,
+    plan_window_status: 'ok',
+    expected_long_window_seconds: 30 * 86_400,
+    chat_5h_remaining_pct: null,
+    chat_weekly_remaining_pct: null,
+    codex_5h_remaining_pct: null,
+    codex_weekly_remaining_pct: null,
+    codex_primary_remaining_pct: 95,
+    codex_primary_window_seconds: 30 * 86_400,
+    codex_primary_resets_at: '2026-08-12T10:30:00Z',
+    codex_secondary_remaining_pct: null,
+    codex_secondary_window_seconds: null,
+    codex_secondary_resets_at: null,
+    refresh_status: 'ok',
+    measured_at: '2026-07-13T10:30:00Z',
+  })
+
+  assert.deepEqual(usage.codex, [{
+    key: 'codex-primary',
+    windowSeconds: 30 * 86_400,
+    remainingPct: 95,
+    resetsAt: '2026-08-12T10:30:00Z',
+  }])
+  assert.equal(formatUsageWindow(usage.codex[0].windowSeconds), '30 дней')
+})
+
+test('compact usage shows every published Chat and paid Codex window', () => {
+  const usage = compactAccountUsage({
+    account_id: 2,
+    plan_window_status: 'ok',
+    expected_long_window_seconds: 7 * 86_400,
+    chat_5h_remaining_pct: 81,
+    chat_weekly_remaining_pct: 73,
+    codex_5h_remaining_pct: 79,
+    codex_weekly_remaining_pct: 66,
+    codex_primary_remaining_pct: 79,
+    codex_primary_window_seconds: 5 * 3_600,
+    codex_primary_resets_at: '2026-07-13T15:00:00Z',
+    codex_secondary_remaining_pct: 66,
+    codex_secondary_window_seconds: 7 * 86_400,
+    codex_secondary_resets_at: '2026-07-20T10:30:00Z',
+    refresh_status: 'ok',
+    measured_at: '2026-07-13T10:30:00Z',
+  })
+
+  assert.deepEqual(usage.chat.map((item) => [formatUsageWindow(item.windowSeconds), item.remainingPct]), [
+    ['5 ч', 81],
+    ['7 дней', 73],
+  ])
+  assert.deepEqual(usage.codex.map((item) => [formatUsageWindow(item.windowSeconds), item.remainingPct]), [
+    ['5 ч', 79],
+    ['7 дней', 66],
+  ])
+})
+
+test('rental capacity is always rendered as actual active rentals over effective maximum', () => {
+  assert.equal(rentalCapacityLabel(2, 5, 1), '2 / 5')
+  assert.equal(rentalCapacityLabel(0, null, 3), '0 / 3')
+  assert.equal(rentalCapacityLabel(undefined, null, undefined), '— / —')
 })

@@ -59,6 +59,7 @@ export interface Account {
   email: string | null
   subscription_expires_at: string | null
   max_active_rentals: number | null
+  active_rentals_count: number
   status: string
   operator_status_override?: 'maintenance' | 'disabled' | null
   notes: string | null
@@ -122,6 +123,11 @@ export interface TotpExport {
   qr_png_base64: string
 }
 
+export interface TotpCode {
+  code: string
+  seconds_remaining: number
+}
+
 export interface DeviceAuthSession {
   session_id: string
   verification_url: string
@@ -153,6 +159,44 @@ export interface MessageTemplate {
   key: string
   lang: string
   content: string
+  allowed_fields: string[]
+  default_content: string | null
+  is_custom: boolean
+}
+
+export interface LotTemplate {
+  id: number
+  key: string
+  name: string
+  tier_id: number | null
+  limit_scope_id: number | null
+  title_ru: string
+  title_en: string
+  description_ru: string
+  description_en: string
+  enabled: boolean
+  system_managed: boolean
+  is_custom: boolean
+  default_title_ru: string | null
+  default_title_en: string | null
+  default_description_ru: string | null
+  default_description_en: string | null
+  allowed_fields: string[]
+}
+
+export interface LotTemplateUpdate {
+  title_ru: string
+  title_en: string
+  description_ru: string
+  description_en: string
+  enabled: boolean
+}
+
+export interface LotTemplateCreate extends LotTemplateUpdate {
+  key: string
+  name: string
+  tier_id: number | null
+  limit_scope_id: number | null
 }
 
 export interface Lot {

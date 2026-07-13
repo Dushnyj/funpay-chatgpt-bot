@@ -10,10 +10,16 @@ from app.integrations.funpay.gateway import ChatGateway
 from app.models.account import Account, AccountLimits
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.lot import Lot, PriceMatrix
+from app.models.audit import AuditLog
 from app.models.rental import Rental
 from app.models.settings import SellerSettings
 from app.services.limit_eligibility import apply_limit_scope_filters
 from app.services.lot_sync import LotSyncService
+from app.services.lot_templates import (
+    LotTemplateRenderError,
+    render_lot_template,
+    resolve_lot_template,
+)
 
 
 _LIMITS_FRESH_THRESHOLD = timedelta(hours=1)
@@ -65,13 +71,27 @@ class LotAutoManager:
             if lot is None:
                 if not has_capacity:
                     continue
-                lot = await self._create_lot(session, matrix)
+                try:
+                    lot = await self._create_lot(session, matrix)
+                except LotTemplateRenderError as exc:
+                    await self._handle_template_render_error(
+                        session, gateway, matrix, None, exc,
+                    )
+                    continue
                 await self._sync.sync_lot(session, gateway, lot.id, active=True)
                 await session.commit()
                 actions.append(LotAction(lot.id, "create"))
                 continue
 
-            changed = await self._apply_matrix(session, lot, matrix)
+            try:
+                changed = await self._apply_matrix(session, lot, matrix)
+            except LotTemplateRenderError as exc:
+                action = await self._handle_template_render_error(
+                    session, gateway, matrix, lot, exc,
+                )
+                if action is not None:
+                    actions.append(action)
+                continue
             automatically_paused = (
                 lot.status == "paused"
                 and (
@@ -115,6 +135,32 @@ class LotAutoManager:
 
         await session.flush()
         return actions
+
+    async def _handle_template_render_error(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        matrix: PriceMatrix,
+        lot: Lot | None,
+        error: LotTemplateRenderError,
+    ) -> LotAction | None:
+        session.add(
+            AuditLog(
+                event_type="lot_template_render_failed",
+                metadata_={
+                    "config_key": matrix.config_key,
+                    "error": str(error)[:500],
+                },
+            )
+        )
+        action: LotAction | None = None
+        if lot is not None and lot.status == "active":
+            await self._sync.pause_lot(session, gateway, lot.id)
+            lot.status = "paused"
+            lot.paused_reason = "auto_template_error"
+            action = LotAction(lot.id, "pause")
+        await session.commit()
+        return action
 
     async def _load_price_matrices(self, session: AsyncSession) -> list[PriceMatrix]:
         result = await session.execute(
@@ -202,6 +248,11 @@ class LotAutoManager:
         tier = await session.get(SubscriptionTier, matrix.tier_id)
         duration = await session.get(Duration, matrix.duration_id)
         scope = await session.get(LimitScope, matrix.limit_scope_id)
+        title_ru, title_en, description_ru, description_en = (
+            await self._render_contents(
+                session, tier, duration, scope, matrix,
+            )
+        )
         lot = Lot(
             config_key=matrix.config_key,
             funpay_node_id=self._funpay_node_id,
@@ -212,10 +263,10 @@ class LotAutoManager:
             max_5h_pct=matrix.max_5h_pct,
             max_weekly_pct=matrix.max_weekly_pct,
             price=matrix.price,
-            title_ru=self._title(tier, duration, scope, matrix, "ru"),
-            title_en=self._title(tier, duration, scope, matrix, "en"),
-            description_ru=self._description(tier, duration, scope, matrix, "ru"),
-            description_en=self._description(tier, duration, scope, matrix, "en"),
+            title_ru=title_ru,
+            title_en=title_en,
+            description_ru=description_ru,
+            description_en=description_en,
             status="active",
             paused_reason=None,
             auto_created=True,
@@ -232,10 +283,11 @@ class LotAutoManager:
         tier = await session.get(SubscriptionTier, matrix.tier_id)
         duration = await session.get(Duration, matrix.duration_id)
         scope = await session.get(LimitScope, matrix.limit_scope_id)
-        title_ru = self._title(tier, duration, scope, matrix, "ru")
-        title_en = self._title(tier, duration, scope, matrix, "en")
-        description_ru = self._description(tier, duration, scope, matrix, "ru")
-        description_en = self._description(tier, duration, scope, matrix, "en")
+        title_ru, title_en, description_ru, description_en = (
+            await self._render_contents(
+                session, tier, duration, scope, matrix,
+            )
+        )
         changed = any((
             lot.price != matrix.price,
             lot.funpay_node_id != self._funpay_node_id,
@@ -252,35 +304,59 @@ class LotAutoManager:
         lot.description_en = description_en
         return changed
 
-    def _title(self, tier, duration, scope, matrix: PriceMatrix, lang: str) -> str:
+    async def _render_contents(
+        self,
+        session: AsyncSession,
+        tier: SubscriptionTier | None,
+        duration: Duration | None,
+        scope: LimitScope | None,
+        matrix: PriceMatrix,
+    ) -> tuple[str, str, str, str]:
         if tier is None or duration is None:
-            return "ChatGPT"
-        condition = self._condition(scope, matrix, lang, compact=True)
-        if lang == "ru":
-            return f"ChatGPT {tier.name} — {duration.days} дн. — {condition}"
-        return f"ChatGPT {tier.name} — {duration.days} days — {condition}"
-
-    def _description(
-        self, tier, duration, scope, matrix: PriceMatrix, lang: str,
-    ) -> str:
-        if tier is None or duration is None:
-            return ""
-        condition = self._condition(scope, matrix, lang, compact=False)
-        if lang == "ru":
-            return (
-                f"Доступ к аккаунту ChatGPT {tier.name} на {duration.days} дн.\n"
-                f"Условие выдачи: {condition}.\n"
-                "Длительное окно Codex: 30 дней только на Free, 7 дней на платных "
-                "тарифах. Перед выдачей бот использует фактический остаток OpenAI.\n"
-                "Данные приходят в чат FunPay. Код 2FA: !код, помощь: !помощь."
-            )
-        return (
-            f"ChatGPT {tier.name} account access for {duration.days} days.\n"
-            f"Delivery condition: {condition}.\n"
-            "Long Codex window: 30 days on Free only, 7 days on paid plans. "
-            "The bot uses the actual OpenAI remainder before delivery.\n"
-            "Credentials arrive in FunPay chat. 2FA code: !code, help: !help."
+            return "ChatGPT", "ChatGPT", "", ""
+        template = await resolve_lot_template(
+            session,
+            tier_id=matrix.tier_id,
+            limit_scope_id=matrix.limit_scope_id,
         )
+        shared = {
+            "plan": tier.name,
+            "days": duration.days,
+            "long_window_days": 30 if tier.code == "free" else 7,
+            "min_limit": (
+                f"{matrix.min_limit_pct}%"
+                if matrix.min_limit_pct is not None else "—"
+            ),
+            "short_limit": (
+                f"{matrix.max_5h_pct}%"
+                if matrix.max_5h_pct is not None else "—"
+            ),
+            "long_limit": (
+                f"{matrix.max_weekly_pct}%"
+                if matrix.max_weekly_pct is not None else "—"
+            ),
+        }
+        title_ru, description_ru = render_lot_template(
+            template,
+            lang="ru",
+            variables={
+                **shared,
+                "condition": self._condition(
+                    scope, matrix, "ru", compact=True,
+                ),
+            },
+        )
+        title_en, description_en = render_lot_template(
+            template,
+            lang="en",
+            variables={
+                **shared,
+                "condition": self._condition(
+                    scope, matrix, "en", compact=True,
+                ),
+            },
+        )
+        return title_ru, title_en, description_ru, description_en
 
     @staticmethod
     def _condition(scope, matrix: PriceMatrix, lang: str, *, compact: bool) -> str:

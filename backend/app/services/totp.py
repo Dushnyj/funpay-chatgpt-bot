@@ -6,6 +6,11 @@ def generate_totp(secret: str) -> str:
     return pyotp.TOTP(secret).now()
 
 
+def generate_totp_at(secret: str, timestamp: float) -> str:
+    """Генерирует TOTP для фиксированного момента времени."""
+    return pyotp.TOTP(secret).at(timestamp)
+
+
 def verify_totp(secret: str, code: str) -> bool:
     """Проверяет код с допуском ±1 окно (30с) — покрывает рассинхрон часов."""
     return pyotp.TOTP(secret).verify(code, valid_window=1)
