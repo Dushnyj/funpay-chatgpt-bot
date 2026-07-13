@@ -231,12 +231,13 @@ h3 { margin: 0; font-size: 15px; }
 .action-help { display: inline-flex; border-radius: 9px; }
 .action-help:focus-visible { outline: 3px solid rgba(79, 70, 229, .28); outline-offset: 2px; }
 .accounts-table { min-width: 1040px; table-layout: fixed; }
+.accounts-table th { white-space: normal; line-height: 1.25; }
 .accounts-table th:nth-child(1) { width: 20%; }
 .accounts-table th:nth-child(2) { width: 22%; }
 .accounts-table th:nth-child(3) { width: 8%; }
-.accounts-table th:nth-child(4) { width: 8%; }
-.accounts-table th:nth-child(5) { width: 18%; }
-.accounts-table th:nth-child(6) { width: 24%; }
+.accounts-table th:nth-child(4) { width: 10%; }
+.accounts-table th:nth-child(5) { width: 14%; }
+.accounts-table th:nth-child(6) { width: 26%; }
 .accounts-table .identity-cell, .accounts-table .plan-detection, .accounts-table .validation-state { min-width: 0; }
 .accounts-table .identity-cell strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .accounts-table .row-actions { min-width: 0; flex-wrap: wrap; }
