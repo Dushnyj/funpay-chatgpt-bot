@@ -120,6 +120,13 @@ async def test_seed_catalog_is_complete_idempotent_and_preserves_existing(sessio
     assert {scope.code for scope in scopes} == {
         code for code, _ in DEFAULT_LIMIT_SCOPES
     }
+    scopes_by_code = {scope.code: scope for scope in scopes}
+    assert scopes_by_code["any"].is_enabled is True
+    assert scopes_by_code["chat"].is_enabled is False
+    assert scopes_by_code["codex"].is_enabled is True
+    assert [
+        scope.code for scope in sorted(scopes, key=lambda scope: scope.sort_order)
+    ] == ["any", "chat", "codex"]
     plus = next(tier for tier in tiers if tier.name == "Plus")
     assert plus.description == "operator value"
     assert plus.is_active is False
@@ -148,3 +155,22 @@ async def test_seed_catalog_preserves_operator_sellable_override(session):
 
     assert plus.system_managed is True
     assert plus.is_sellable is False
+
+
+@pytest.mark.asyncio
+async def test_seed_catalog_preserves_limit_scope_availability_override(session):
+    await seed_catalog(session)
+    codex = (
+        await session.execute(
+            select(LimitScope).where(LimitScope.code == "codex")
+        )
+    ).scalar_one()
+    codex.is_enabled = False
+    codex.sort_order = 5
+    await session.commit()
+
+    await seed_catalog(session)
+    await session.refresh(codex)
+
+    assert codex.is_enabled is False
+    assert codex.sort_order == 5

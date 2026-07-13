@@ -7,6 +7,8 @@ import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Duration, LimitScope, Lot, LotCreate, Tier } from '../types/api'
 import { formatCurrency } from '../utils/format'
+import { getLotCatalogAvailability } from '../utils/lotAvailability'
+import { isAvailableOfferScope } from '../utils/offerScopes'
 
 export default function Lots() {
   const lotsQuery = useLots()
@@ -48,8 +50,10 @@ export default function Lots() {
 
   const tierName = (id: number) => tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
   const durationDays = (id: number) => durations.find((duration) => duration.id === id)?.days
-  const scopeName = (id: number) => scopes.find((scope) => scope.id === id)?.code.toLowerCase() ?? 'unknown'
   const active = lots.filter((lot) => lot.status === 'active').length
+  const unavailableCatalogLots = lots.filter(
+    (lot) => !getLotCatalogAvailability(lot, tiers, durations, scopes).available,
+  ).length
 
   const clearFeedback = () => {
     setError('')
@@ -74,6 +78,41 @@ export default function Lots() {
     setStatusTarget(lot.id)
     const nextStatus = lot.status === 'active' ? 'paused' : 'active'
     try {
+      if (nextStatus === 'active') {
+        const [latestLots, latestTiers, latestDurations, latestScopes] = await Promise.all([
+          lotsQuery.refetch(),
+          tiersQuery.refetch(),
+          durationsQuery.refetch(),
+          scopesQuery.refetch(),
+        ])
+        if (latestLots.isError || latestTiers.isError || latestDurations.isError || latestScopes.isError) {
+          setError('Не удалось проверить актуальную конфигурацию лота. Обновите страницу и повторите попытку.')
+          return
+        }
+        const latestLot = latestLots.data?.find((item) => item.id === lot.id)
+        if (!latestLot) {
+          setError('Лот больше не существует. Список обновлён.')
+          return
+        }
+        if (latestLot.status === 'active') {
+          setSuccess('Лот уже активирован в другой вкладке. Список обновлён.')
+          return
+        }
+        if (latestLot.status !== 'paused') {
+          setError(`Лот нельзя активировать из статуса «${latestLot.status}». Список обновлён.`)
+          return
+        }
+        const availability = getLotCatalogAvailability(
+          latestLot,
+          latestTiers.data ?? [],
+          latestDurations.data ?? [],
+          latestScopes.data ?? [],
+        )
+        if (!availability.available) {
+          setError(`Лот не активирован: ${availability.reasons.join('; ')}. Исправьте справочники и повторите попытку.`)
+          return
+        }
+      }
       await updateStatus.mutateAsync({ id: lot.id, status: nextStatus })
       setSuccess(nextStatus === 'active' ? 'Лот активирован.' : 'Лот поставлен на паузу.')
     } catch (cause) {
@@ -112,6 +151,7 @@ export default function Lots() {
       {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
       {success && <div className="form-alert form-alert--success" role="status"><Icon name="check" /><span>{success}</span></div>}
       <div className="form-alert form-alert--info"><Icon name="activity" /><span>Автоматические лоты следуют матрице цен. Ручные можно создавать отдельно, ставить на паузу и активировать; удаление автоматических правил выполняется через матрицу.</span></div>
+      {unavailableCatalogLots > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Лотов с недоступной конфигурацией: {unavailableCatalogLots}. Они сохранены, но активация заблокирована. Конкретная причина указана в строке каждого лота.</span></div>}
 
       <section className="panel panel--flush">
         <div className="toolbar">
@@ -125,20 +165,29 @@ export default function Lots() {
             <table className="data-table lots-table">
               <thead><tr><th>Предложение</th><th>Конфигурация</th><th>Условие выдачи</th><th>Цена</th><th>FunPay</th><th>Статус</th><th><span className="sr-only">Действия</span></th></tr></thead>
               <tbody>{filteredLots.map((lot) => {
-                const scope = scopeName(lot.limit_scope_id)
+                const scopeItem = scopes.find((candidate) => candidate.id === lot.limit_scope_id)
+                const scope = scopeItem?.code.toLowerCase() ?? 'unknown'
+                const availability = getLotCatalogAvailability(lot, tiers, durations, scopes)
                 const threshold = scope === 'any'
                   ? 'Без гарантии остатка лимита'
                   : `${scope.toUpperCase()}: остаток в наблюдаемом окне ≥ ${lot.min_limit_pct ?? '—'}%`
-                const canToggle = lot.status === 'active' || lot.status === 'paused'
+                const canToggle = lot.status === 'active' || (lot.status === 'paused' && availability.available)
+                const activationBlockReason = availability.reasons.join('; ')
+                const availabilityDescriptionId = `lot-${lot.id}-availability`
+                const toggleTitle = canToggle
+                  ? (lot.status === 'active' ? 'Поставить на паузу' : 'Активировать')
+                  : lot.status === 'paused' && activationBlockReason
+                    ? `Нельзя активировать: ${activationBlockReason}`
+                    : 'Статус этого лота изменить нельзя'
                 return (
                   <tr key={lot.id}>
                     <td><div className="lot-title-cell"><strong>{lot.title_ru}</strong><small>{lot.auto_created ? 'Автоматический лот' : 'Ручной лот'} · ID {lot.id}</small></div></td>
-                    <td><strong>{tierName(lot.tier_id)}</strong><small className="table-subline">{durationDays(lot.duration_id) ?? '?'} дн. · {scope.toUpperCase()}</small></td>
+                    <td><strong>{tierName(lot.tier_id)}</strong><small className="table-subline">{durationDays(lot.duration_id) ?? '?'} дн. · {scope.toUpperCase()}</small>{!availability.available && <small id={availabilityDescriptionId} className="table-subline text-warning">{availability.reasons.join(' · ')}</small>}</td>
                     <td>{threshold}</td>
                     <td className="table-number">{formatCurrency(lot.price)}</td>
                     <td>{lot.funpay_id ? <span className="mono-chip">#{lot.funpay_id}</span> : <span className="muted">Не опубликован</span>}</td>
                     <td><StatusBadge value={lot.status} /></td>
-                    <td><div className="row-actions"><button className="icon-button" disabled={!canToggle || statusTarget === lot.id} onClick={() => toggleStatus(lot)} title={canToggle ? (lot.status === 'active' ? 'Поставить на паузу' : 'Активировать') : 'Статус этого лота изменить нельзя'} aria-label={lot.status === 'active' ? `Поставить на паузу ${lot.title_ru}` : `Активировать ${lot.title_ru}`}>{statusTarget === lot.id ? <span className="spinner" /> : <Icon name={lot.status === 'active' ? 'clock' : 'refresh'} />}</button><button className="icon-button icon-button--danger" disabled={lot.auto_created || lot.status === 'deleted'} onClick={() => setDeleteTarget(lot)} title={lot.auto_created ? 'Автоматические лоты управляются матрицей цен' : 'Удалить'} aria-label={`Удалить лот ${lot.title_ru}`}><Icon name="trash" /></button></div></td>
+                    <td><div className="row-actions"><button className="icon-button" disabled={!canToggle || statusTarget === lot.id} onClick={() => toggleStatus(lot)} title={toggleTitle} aria-label={lot.status === 'active' ? `Поставить на паузу ${lot.title_ru}` : `Активировать ${lot.title_ru}`} aria-describedby={!availability.available ? availabilityDescriptionId : undefined}>{statusTarget === lot.id ? <span className="spinner" /> : <Icon name={lot.status === 'active' ? 'clock' : 'refresh'} />}</button><button className="icon-button icon-button--danger" disabled={lot.auto_created || lot.status === 'deleted'} onClick={() => setDeleteTarget(lot)} title={lot.auto_created ? 'Автоматические лоты управляются матрицей цен' : 'Удалить'} aria-label={`Удалить лот ${lot.title_ru}`}><Icon name="trash" /></button></div></td>
                   </tr>
                 )
               })}</tbody>
@@ -171,7 +220,9 @@ function ManualLotDialog({
   const createLot = useCreateLot()
   const availableTiers = tiers.filter((tier) => tier.is_active && tier.is_sellable !== false)
   const availableDurations = durations.filter((duration) => duration.is_enabled).sort((a, b) => a.sort_order - b.sort_order)
-  const availableScopes = scopes.filter((scope) => scope.code.toLowerCase() !== 'chat')
+  const availableScopes = scopes
+    .filter(isAvailableOfferScope)
+    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
   const defaultScope = availableScopes.find((scope) => scope.code.toLowerCase() === 'any') ?? availableScopes[0]
   const [error, setError] = useState('')
   const [form, setForm] = useState({
@@ -234,9 +285,9 @@ function ManualLotDialog({
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
           <div className="form-alert form-alert--info"><Icon name="activity" /><span>Гарантию CHAT создать нельзя: OpenAI не отдаёт достоверный остаток сообщений ChatGPT. Для обычного доступа используйте ANY, для измеримой гарантии — CODEX.</span></div>
           <div className="form-grid form-grid--3">
-            <label className="field"><span className="field__label">Тариф</span><select data-autofocus value={form.tierId} onChange={(event) => setForm((current) => ({ ...current, tierId: event.target.value }))} required>{availableTiers.map((tier) => <option key={tier.id} value={tier.id}>{tier.name}</option>)}</select></label>
-            <label className="field"><span className="field__label">Срок</span><select value={form.durationId} onChange={(event) => setForm((current) => ({ ...current, durationId: event.target.value }))} required>{availableDurations.map((duration) => <option key={duration.id} value={duration.id}>{duration.days} дн.</option>)}</select></label>
-            <label className="field"><span className="field__label">Условие лимита</span><select value={form.scopeId} onChange={(event) => setForm((current) => ({ ...current, scopeId: event.target.value }))} required>{availableScopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}</select></label>
+            <label className="field"><span className="field__label">Тариф</span><select data-autofocus value={form.tierId} onChange={(event) => setForm((current) => ({ ...current, tierId: event.target.value }))} required disabled={availableTiers.length === 0}>{availableTiers.length === 0 && <option value="">Нет тарифов, разрешённых к продаже</option>}{availableTiers.map((tier) => <option key={tier.id} value={tier.id}>{tier.name}</option>)}</select></label>
+            <label className="field"><span className="field__label">Срок</span><select value={form.durationId} onChange={(event) => setForm((current) => ({ ...current, durationId: event.target.value }))} required disabled={availableDurations.length === 0}>{availableDurations.length === 0 && <option value="">Нет включённых сроков</option>}{availableDurations.map((duration) => <option key={duration.id} value={duration.id}>{duration.days} дн.</option>)}</select></label>
+            <label className="field"><span className="field__label">Условие лимита</span><select value={form.scopeId} onChange={(event) => setForm((current) => ({ ...current, scopeId: event.target.value }))} required disabled={availableScopes.length === 0}>{availableScopes.length === 0 && <option value="">Нет включённых типов лимита</option>}{availableScopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}</select></label>
           </div>
           <div className="form-grid form-grid--3">
             {selectedScope === 'codex' ? <label className="field"><span className="field__label">Минимальный остаток CODEX</span><div className="number-with-suffix"><input type="number" min="0" max="100" value={form.minLimit} onChange={(event) => setForm((current) => ({ ...current, minLimit: event.target.value }))} required /><span>%</span></div><span className="field__hint">Остаток в наблюдаемом окне OpenAI.</span></label> : <div className="builder-condition-note"><Icon name="check" /><span><strong>Без гарантии остатка</strong><small>Для ANY порог лимита не задаётся.</small></span></div>}
@@ -251,7 +302,7 @@ function ManualLotDialog({
             <label className="field"><span className="field__label">Описание на русском</span><textarea value={form.descriptionRu} onChange={(event) => setForm((current) => ({ ...current, descriptionRu: event.target.value }))} maxLength={4000} /></label>
             <label className="field"><span className="field__label">Описание на английском</span><textarea value={form.descriptionEn} onChange={(event) => setForm((current) => ({ ...current, descriptionEn: event.target.value }))} maxLength={4000} /></label>
           </div>
-          <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={createLot.isPending}>{createLot.isPending ? <><span className="spinner spinner--light" />Создаём…</> : <><Icon name="plus" />Создать лот</>}</button></div>
+          <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={createLot.isPending || availableTiers.length === 0 || availableDurations.length === 0 || availableScopes.length === 0}>{createLot.isPending ? <><span className="spinner spinner--light" />Создаём…</> : <><Icon name="plus" />Создать лот</>}</button></div>
         </form>
       </div>
     </ModalOverlay>

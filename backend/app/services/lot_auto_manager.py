@@ -45,9 +45,15 @@ class LotAutoManager:
         session: AsyncSession,
         gateway: ChatGateway,
     ) -> list[LotAction]:
+        actions = await self._pause_catalog_invalid_lots(session, gateway)
+        if self._funpay_node_id <= 0:
+            # Without a configured global node we can still make unsafe offers
+            # unavailable, but must not rewrite/sync otherwise valid auto lots:
+            # _apply_matrix would replace their per-lot node with zero.
+            await session.flush()
+            return actions
         matrices = await self._load_price_matrices(session)
         matrix_keys = {matrix.config_key for matrix in matrices}
-        actions: list[LotAction] = []
 
         # Configurations removed from the matrix must not remain for sale.
         orphaned = await session.execute(
@@ -69,7 +75,7 @@ class LotAutoManager:
             has_capacity = await self._check_capacity(session, matrix)
 
             if lot is None:
-                if not has_capacity:
+                if not has_capacity or self._funpay_node_id <= 0:
                     continue
                 try:
                     lot = await self._create_lot(session, matrix)
@@ -136,6 +142,49 @@ class LotAutoManager:
         await session.flush()
         return actions
 
+    async def _pause_catalog_invalid_lots(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+    ) -> list[LotAction]:
+        """Pause published offers whose catalog contract is no longer valid.
+
+        This applies to manual lots as well as generated ones. Disabling a
+        catalog item is an operator safety switch, not merely a hint for new
+        automatic lots, so an already-published manual offer cannot stay live.
+        """
+        result = await session.execute(
+            select(Lot)
+            .join(SubscriptionTier, SubscriptionTier.id == Lot.tier_id)
+            .join(Duration, Duration.id == Lot.duration_id)
+            .join(LimitScope, LimitScope.id == Lot.limit_scope_id)
+            .where(
+                Lot.status == "active",
+                or_(
+                    SubscriptionTier.is_active.is_(False),
+                    SubscriptionTier.is_sellable.is_(False),
+                    Duration.is_enabled.is_(False),
+                    LimitScope.is_enabled.is_(False),
+                    LimitScope.code.not_in(("any", "codex")),
+                ),
+            )
+        )
+        actions: list[LotAction] = []
+        for lot in result.scalars().all():
+            if lot.funpay_id:
+                await self._sync.pause_lot(session, gateway, lot.id)
+            else:
+                # A local active row without a remote id is inconsistent but
+                # can still be made safe without making a remote call.
+                lot.status = "paused"
+                await session.flush()
+            lot.paused_reason = (
+                "auto_no_config" if lot.auto_created else "catalog_unavailable"
+            )
+            await session.commit()
+            actions.append(LotAction(lot.id, "pause"))
+        return actions
+
     async def _handle_template_render_error(
         self,
         session: AsyncSession,
@@ -167,10 +216,13 @@ class LotAutoManager:
             select(PriceMatrix)
             .join(SubscriptionTier, SubscriptionTier.id == PriceMatrix.tier_id)
             .join(Duration, Duration.id == PriceMatrix.duration_id)
+            .join(LimitScope, LimitScope.id == PriceMatrix.limit_scope_id)
             .where(
                 SubscriptionTier.is_active.is_(True),
                 SubscriptionTier.is_sellable.is_(True),
                 Duration.is_enabled.is_(True),
+                LimitScope.is_enabled.is_(True),
+                LimitScope.code.in_(("any", "codex")),
             )
         )
         return list(result.scalars().all())
@@ -194,7 +246,14 @@ class LotAutoManager:
         duration = await session.get(Duration, matrix.duration_id)
         scope = await session.get(LimitScope, matrix.limit_scope_id)
         tier = await session.get(SubscriptionTier, matrix.tier_id)
-        if duration is None or scope is None or tier is None or not tier.is_sellable:
+        if (
+            duration is None
+            or scope is None
+            or tier is None
+            or not tier.is_sellable
+            or not scope.is_enabled
+            or scope.code not in {"any", "codex"}
+        ):
             return False
 
         settings = await session.get(SellerSettings, 1)

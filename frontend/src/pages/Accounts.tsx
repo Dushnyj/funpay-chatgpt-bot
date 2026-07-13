@@ -250,36 +250,36 @@ export default function Accounts() {
                     <td data-label="Действия">
                       <div className="row-actions account-actions">
                         {isDeviceAuthEligible(account) && (
-                          <button className="button button--primary button--compact account-action" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Войти в ${account.login} через браузер`} title="Ручная проверка через браузер">
-                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={14} />}Вход
+                          <button type="button" className="icon-button account-icon-action account-icon-action--primary" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Войти в ${account.login} через браузер`} title="Ручная проверка через браузер">
+                            {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}
                           </button>
                         )}
                         {isOutlookAccount(account) && (
                           <span className="action-help" title={graphConfigured ? undefined : 'Microsoft Graph не настроен на сервере'} tabIndex={graphConfigured ? undefined : 0} aria-label={graphConfigured ? undefined : 'Почта OAuth недоступна: Microsoft Graph не настроен'}>
-                            <button className={`button button--compact account-action ${account.email_oauth_connected ? 'button--secondary' : 'button--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook для ${account.login} через OAuth`} title={graphConfigured ? `${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} безопасный доступ к почте` : undefined}>
-                              {emailOAuthTarget === account.id ? <span className={`spinner ${account.email_oauth_connected ? '' : 'spinner--light'}`} /> : <Icon name={account.email_oauth_connected ? 'check' : 'shield'} size={14} />}Почта OAuth
+                            <button type="button" className={`icon-button account-icon-action ${account.email_oauth_connected ? 'account-icon-action--success' : 'account-icon-action--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook для ${account.login} через OAuth`} title={graphConfigured ? `${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} почту Outlook через OAuth` : 'Почта OAuth недоступна: Microsoft Graph не настроен'}>
+                              {emailOAuthTarget === account.id ? <span className={`spinner ${account.email_oauth_connected ? '' : 'spinner--light'}`} /> : <Icon name={account.email_oauth_connected ? 'check' : 'shield'} size={15} />}
                             </button>
                           </span>
                         )}
                         {!isValidationInProgress(account) && (
-                          <button className="button button--ghost button--compact account-action" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Повторить автоматическую проверку">
-                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={14} />}Повторить
+                          <button type="button" className="icon-button account-icon-action" onClick={() => recheck(account)} disabled={recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title="Повторить автоматическую проверку">
+                            {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
                           </button>
                         )}
                         <span className="action-help" title={totpHint}>
-                          <button className="button button--ghost button--compact account-action" onClick={() => openTotpCode(account)} disabled={totpLoading === account.id} aria-label={`Получить одноразовый ключ для ${account.login}`} title={totpHint}>
-                            {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" size={14} />}Ключ
+                          <button type="button" className="icon-button account-icon-action" onClick={() => openTotpCode(account)} disabled={totpLoading === account.id} aria-label={`Получить одноразовый ключ для ${account.login}`} title={totpHint}>
+                            {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" size={15} />}
                           </button>
                         </span>
-                        <button className="icon-button account-icon-action" onClick={() => setCredentialTarget(account)} aria-label={`Изменить данные входа ${account.login}`} title="Логин, пароль, TOTP и почта">
-                          <Icon name="shield" size={16} />
+                        <button type="button" className="icon-button account-icon-action" onClick={() => setCredentialTarget(account)} aria-label={`Изменить данные входа ${account.login}`} title="Изменить логин, пароль, TOTP и почту">
+                          <Icon name="eye" size={15} />
                         </button>
-                        <button className="icon-button account-icon-action" onClick={() => setEditTarget(account)} aria-label={`Изменить параметры ${account.login}`} title="Срок подписки, ёмкость и статус">
-                          <Icon name="settings" size={16} />
+                        <button type="button" className="icon-button account-icon-action" onClick={() => setEditTarget(account)} aria-label={`Изменить параметры ${account.login}`} title="Изменить срок подписки, ёмкость и статус">
+                          <Icon name="settings" size={15} />
                         </button>
                         <span className="action-help" title={hasActiveRentals ? 'Сначала завершите активные аренды' : undefined} tabIndex={hasActiveRentals ? 0 : undefined} aria-label={hasActiveRentals ? `Удаление ${account.login} недоступно: есть активные аренды` : undefined}>
-                          <button className="button button--ghost button--compact account-action account-action--danger" onClick={() => setDeleteTarget(account)} disabled={hasActiveRentals} aria-label={`Удалить ${account.login}`} title={hasActiveRentals ? undefined : 'Удалить аккаунт'}>
-                            <Icon name="trash" size={14} />Удалить
+                          <button type="button" className="icon-button account-icon-action account-icon-action--danger" onClick={() => setDeleteTarget(account)} disabled={hasActiveRentals} aria-label={`Удалить ${account.login}`} title={hasActiveRentals ? 'Удаление недоступно: есть активные аренды' : 'Удалить аккаунт'}>
+                            <Icon name="trash" size={15} />
                           </button>
                         </span>
                       </div>

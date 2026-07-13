@@ -28,6 +28,7 @@ async def validate_offer_configurations(
     *,
     require_sellable_tier: bool = True,
     require_enabled_duration: bool = True,
+    require_enabled_scope: bool = True,
 ) -> None:
     if not items:
         return
@@ -74,9 +75,13 @@ async def validate_offer_configurations(
             raise OfferConfigurationError(
                 f"Price row {index}: duration is disabled or missing"
             )
-        if scope is None or scope.code not in {"any", "chat", "codex"}:
+        if (
+            scope is None
+            or scope.code not in {"any", "chat", "codex"}
+            or (require_enabled_scope and not scope.is_enabled)
+        ):
             raise OfferConfigurationError(
-                f"Price row {index}: limit scope is invalid"
+                f"Price row {index}: limit scope is disabled or invalid"
             )
         if scope.code == "chat":
             # There is no stable OpenAI endpoint that reports the remaining

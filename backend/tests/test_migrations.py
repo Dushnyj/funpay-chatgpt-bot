@@ -63,7 +63,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
-    assert version == "20260713_0012"
+    assert version == "20260713_0013"
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
@@ -83,6 +83,12 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("account_limits")
             }
         )
+        scope_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns("limit_scopes")
+            }
+        )
     assert {
         "codex_primary_remaining_pct",
         "codex_primary_window_seconds",
@@ -95,6 +101,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
         "low_limit_warning_fingerprint",
         "low_limit_warned_at",
     } <= limits_columns
+    assert {"is_enabled", "sort_order"} <= scope_columns
     assert {
         "admin_login_failure_count",
         "admin_login_window_started_at",
@@ -159,6 +166,46 @@ async def test_upgrade_database_creates_head_schema_idempotently(
         "fulfillment_last_error",
     } <= order_columns
     await engine.dispose()
+
+
+async def test_0013_limit_scope_availability_fails_closed_for_unknown_codes(
+    tmp_path,
+    monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'catalog-0013.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0012")
+
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO limit_scopes (code, name) VALUES "
+                "('any', 'Any'), ('chat', 'Chat'), ('codex', 'Codex'), "
+                "('legacy', 'Legacy')"
+            )
+        )
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260713_0013")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                text("SELECT code, is_enabled FROM limit_scopes")
+            )
+        ).all()
+    await engine.dispose()
+
+    availability = {row.code: bool(row.is_enabled) for row in rows}
+    assert availability == {
+        "any": True,
+        "chat": False,
+        "codex": True,
+        "legacy": False,
+    }
 
 
 async def test_lot_template_upgrade_preserves_legacy_draft_disabled(
@@ -333,7 +380,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260713_0012"
+    assert version == "20260713_0013"
     await engine.dispose()
 
 
@@ -422,7 +469,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260713_0012"
+    assert version == "20260713_0013"
     await engine.dispose()
 
 

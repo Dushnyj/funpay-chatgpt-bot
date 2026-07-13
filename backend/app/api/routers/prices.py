@@ -53,6 +53,7 @@ async def update_prices(
             req.items,
             require_sellable_tier=False,
             require_enabled_duration=False,
+            require_enabled_scope=False,
         )
     except OfferConfigurationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

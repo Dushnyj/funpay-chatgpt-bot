@@ -80,6 +80,53 @@ async def test_creates_lot_when_capacity_available(session: AsyncSession):
     assert any(a.action == "create" for a in actions)
 
 
+async def test_disabled_limit_scope_is_excluded_from_automatic_lots(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    scope.is_enabled = False
+    await _add_account_with_limits(session, tier.id)
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.flush()
+
+    gateway = FakeChatGateway()
+    actions = await LotAutoManager(funpay_node_id=55).run(session, gateway)
+
+    assert actions == []
+    lots = (await session.execute(select(Lot))).scalars().all()
+    assert lots == []
+
+
+async def test_unknown_limit_scope_is_excluded_from_automatic_lots(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    scope.code = "legacy"
+    scope.is_enabled = True
+    await _add_account_with_limits(session, tier.id)
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.flush()
+
+    actions = await LotAutoManager(funpay_node_id=55).run(
+        session,
+        FakeChatGateway(),
+    )
+
+    assert actions == []
+    lots = (await session.execute(select(Lot))).scalars().all()
+    assert lots == []
+
+
 async def test_uses_most_specific_enabled_lot_template_deterministically(
     session: AsyncSession,
 ):
@@ -473,6 +520,94 @@ async def test_disabled_catalog_row_pauses_existing_auto_lot(
     assert any(action.action == "pause" for action in actions)
     assert lot.status == "paused"
     assert lot.paused_reason == "auto_no_config"
+
+
+async def test_disabled_limit_scope_pauses_existing_auto_lot(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    matrix = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=True,
+        funpay_id="602",
+    )
+    session.add(lot)
+    scope.is_enabled = False
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert any(action.action == "pause" for action in actions)
+    assert lot.status == "paused"
+    assert lot.paused_reason == "auto_no_config"
+
+
+@pytest.mark.parametrize(
+    "unavailable_catalog",
+    [
+        "tier_inactive",
+        "tier_unsellable",
+        "duration",
+        "scope",
+        "chat",
+        "unknown_scope",
+    ],
+)
+async def test_unavailable_catalog_pauses_existing_manual_lot(
+    session: AsyncSession,
+    unavailable_catalog: str,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    if unavailable_catalog == "tier_inactive":
+        tier.is_active = False
+    elif unavailable_catalog == "tier_unsellable":
+        tier.is_sellable = False
+    elif unavailable_catalog == "duration":
+        duration.is_enabled = False
+    elif unavailable_catalog == "scope":
+        scope.is_enabled = False
+    elif unavailable_catalog == "chat":
+        scope.code = "chat"
+        scope.is_enabled = True
+    else:
+        scope.code = "legacy"
+        scope.is_enabled = True
+    lot = Lot(
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=False,
+        funpay_id="603",
+    )
+    session.add(lot)
+    await session.flush()
+
+    actions = await LotAutoManager(55).run(session, FakeChatGateway())
+
+    assert any(action.action == "pause" for action in actions)
+    assert lot.status == "paused"
+    assert lot.paused_reason == "catalog_unavailable"
 
 
 @pytest.mark.parametrize(

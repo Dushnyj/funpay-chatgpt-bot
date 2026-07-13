@@ -39,6 +39,8 @@ class TierCreate(BaseModel):
 
 
 class TierUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     is_active: bool | None = None
     is_sellable: bool | None = None
 
@@ -49,6 +51,12 @@ class TierUpdate(BaseModel):
             raise ValueError("field cannot be null")
         return value
 
+    @model_validator(mode="after")
+    def require_change(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one field must be provided")
+        return self
+
 
 class DurationOut(_Base):
     id: int
@@ -58,9 +66,11 @@ class DurationOut(_Base):
 
 
 class DurationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: int = Field(gt=0)
     is_enabled: bool | None = None
-    sort_order: int | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=10_000)
 
     @field_validator("is_enabled", "sort_order", mode="before")
     @classmethod
@@ -69,11 +79,59 @@ class DurationUpdate(BaseModel):
             raise ValueError("field cannot be null")
         return value
 
+    @model_validator(mode="after")
+    def require_change(self):
+        if not (self.model_fields_set - {"id"}):
+            raise ValueError("at least one editable field must be provided")
+        return self
+
+
+class DurationPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_enabled: bool | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=10_000)
+
+    @field_validator("is_enabled", "sort_order", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one field must be provided")
+        return self
+
 
 class LimitScopeOut(_Base):
     id: int
     code: str
     name: str
+    is_enabled: bool = True
+    sort_order: int = 0
+
+
+class LimitScopeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_enabled: bool | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=10_000)
+
+    @field_validator("is_enabled", "sort_order", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
+
+    @model_validator(mode="after")
+    def require_change(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one field must be provided")
+        return self
 
 
 # --- Accounts ---

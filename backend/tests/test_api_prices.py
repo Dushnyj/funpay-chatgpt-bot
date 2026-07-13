@@ -209,3 +209,41 @@ async def test_full_matrix_save_preserves_temporarily_disabled_catalog_rows(
     listed = (await auth_client.get("/api/prices")).json()
     assert len(listed) == 1
     assert listed[0]["duration_id"] == duration.id
+
+
+@pytest.mark.parametrize("scope_code", ["any", "codex"])
+async def test_full_matrix_save_preserves_disabled_supported_scope(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    scope_code: str,
+):
+    tier = SubscriptionTier(
+        code="plus",
+        name="Plus",
+        is_active=True,
+        is_sellable=True,
+    )
+    duration = Duration(days=7, is_enabled=True, sort_order=10)
+    scope = LimitScope(
+        code=scope_code,
+        name=scope_code.title(),
+        is_enabled=False,
+    )
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    item = {
+        "tier_id": tier.id,
+        "duration_id": duration.id,
+        "limit_scope_id": scope.id,
+        "price": 599,
+    }
+    if scope_code == "codex":
+        item["min_limit_pct"] = 50
+
+    response = await auth_client.put("/api/prices", json={"items": [item]})
+
+    assert response.status_code == 200
+    assert response.json() == {"updated": 1}
+    listed = (await auth_client.get("/api/prices")).json()
+    assert len(listed) == 1
+    assert listed[0]["limit_scope_id"] == scope.id

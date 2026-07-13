@@ -846,9 +846,14 @@ async def test_sync_manual_lot_uses_runtime_gateway_and_separate_session(
     from app.models.catalog import Duration, LimitScope, SubscriptionTier
     from app.models.lot import Lot
 
-    tier = SubscriptionTier(name="lot-tier", is_active=True)
+    tier = SubscriptionTier(
+        code="plus",
+        name="lot-tier",
+        is_active=True,
+        is_sellable=True,
+    )
     duration = Duration(days=7, is_enabled=True, sort_order=1)
-    scope = LimitScope(code="lot-any", name="Any")
+    scope = LimitScope(code="any", name="Any", is_enabled=True)
     session.add_all([tier, duration, scope])
     await session.flush()
     lot = Lot(
@@ -886,3 +891,94 @@ async def test_sync_manual_lot_uses_runtime_gateway_and_separate_session(
     await session.refresh(lot)
     assert lot.status == "active"
     assert lot.paused_reason is None
+
+
+async def test_reconcile_pauses_invalid_manual_lot_without_global_node(
+    session,
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+    from app.integrations.funpay.gateway import FakeChatGateway
+    from app.models.catalog import Duration, LimitScope, SubscriptionTier
+    from app.models.lot import Lot, PriceMatrix
+
+    invalid_tier = SubscriptionTier(
+        code="plus",
+        name="invalid-lot-tier",
+        is_active=True,
+        is_sellable=False,
+    )
+    valid_tier = SubscriptionTier(
+        code="pro_5x",
+        name="valid-lot-tier",
+        is_active=True,
+        is_sellable=True,
+    )
+    duration = Duration(days=7, is_enabled=True, sort_order=1)
+    scope = LimitScope(code="any", name="Any", is_enabled=True)
+    session.add_all([invalid_tier, valid_tier, duration, scope])
+    await session.flush()
+    invalid_manual_lot = Lot(
+        funpay_node_id=55,
+        tier_id=invalid_tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        title_ru="Лот",
+        title_en="Lot",
+        status="active",
+        auto_created=False,
+        funpay_id="901",
+    )
+    matrix = PriceMatrix(
+        tier_id=valid_tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=799,
+    )
+    valid_auto_lot = Lot(
+        config_key=matrix.config_key,
+        funpay_node_id=55,
+        tier_id=valid_tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="Не менять",
+        title_en="Do not change",
+        description_ru="Сохранить",
+        description_en="Keep",
+        status="active",
+        auto_created=True,
+        funpay_id="902",
+    )
+    session.add_all([invalid_manual_lot, matrix, valid_auto_lot])
+    await session.commit()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = FakeChatGateway()
+
+    actions = await lifecycle.reconcile_lots()
+
+    assert [(action.lot_id, action.action) for action in actions] == [
+        (invalid_manual_lot.id, "pause")
+    ]
+    await session.refresh(invalid_manual_lot)
+    assert invalid_manual_lot.status == "paused"
+    assert invalid_manual_lot.paused_reason == "catalog_unavailable"
+
+    await session.refresh(valid_auto_lot)
+    assert valid_auto_lot.funpay_node_id == 55
+    assert valid_auto_lot.status == "active"
+    assert valid_auto_lot.price == 599
+    assert valid_auto_lot.title_ru == "Не менять"
+    assert valid_auto_lot.title_en == "Do not change"
+    assert valid_auto_lot.description_ru == "Сохранить"
+    assert valid_auto_lot.description_en == "Keep"

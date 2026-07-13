@@ -104,6 +104,94 @@ async def test_create_manual_lot_rejects_disabled_duration(
     assert "duration is disabled" in response.json()["detail"]
 
 
+async def test_create_manual_lot_rejects_disabled_limit_scope(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    tier.is_sellable = True
+    scope.is_enabled = False
+    await session.flush()
+
+    response = await auth_client.post("/api/lots", json={
+        "funpay_node_id": 55,
+        "tier_id": tier.id,
+        "duration_id": duration.id,
+        "limit_scope_id": scope.id,
+        "price": 599,
+        "title_ru": "Тест",
+        "title_en": "Test",
+    })
+
+    assert response.status_code == 422
+    assert "limit scope is disabled" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("unavailable_catalog", "expected_detail"),
+    [
+        ("tier_inactive", "tariff is unavailable"),
+        ("tier_unsellable", "tariff is unavailable"),
+        ("duration", "duration is disabled"),
+        ("scope", "limit scope is disabled"),
+        ("chat", "guaranteed ChatGPT limits are unavailable"),
+        ("unknown_scope", "limit scope is disabled or invalid"),
+    ],
+)
+async def test_reactivate_manual_lot_rejects_unavailable_catalog(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    unavailable_catalog: str,
+    expected_detail: str,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    tier.is_sellable = True
+    if unavailable_catalog == "tier_inactive":
+        tier.is_active = False
+    elif unavailable_catalog == "tier_unsellable":
+        tier.is_sellable = False
+    elif unavailable_catalog == "duration":
+        duration.is_enabled = False
+    elif unavailable_catalog == "scope":
+        scope.is_enabled = False
+    elif unavailable_catalog == "chat":
+        scope.code = "chat"
+        scope.is_enabled = True
+    else:
+        scope.code = "legacy"
+        scope.is_enabled = True
+    lot = Lot(
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="Тест",
+        title_en="Test",
+        status="paused",
+        paused_reason="manual",
+        auto_created=False,
+        funpay_id="700",
+    )
+    session.add(lot)
+    await session.commit()
+    lifecycle = _Lifecycle(session)
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.patch(
+            f"/api/lots/{lot.id}",
+            json={"status": "active"},
+        )
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 422
+    assert expected_detail in response.json()["detail"]
+    await session.refresh(lot)
+    assert lot.status == "paused"
+    assert lifecycle.synced == []
+
+
 async def test_delete_lot(auth_client: AsyncClient, session: AsyncSession):
     tier, duration, scope = await _seed_catalog(session)
     tier.is_sellable = True

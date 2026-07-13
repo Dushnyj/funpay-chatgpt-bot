@@ -131,6 +131,15 @@ async def update_lot_status(
     if lot.status == "deleted":
         raise HTTPException(status_code=409, detail="Deleted lot cannot change status")
 
+    if req.status == "active":
+        try:
+            # Re-check catalog availability at activation time. A manual lot
+            # may have been paused before its tier, duration or scope was
+            # disabled, and must not bypass the same rules as a new lot.
+            await validate_offer_configurations(session, [lot])
+        except OfferConfigurationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     try:
         if req.status == "active" and not lot.funpay_id:
             await lifecycle.sync_manual_lot(lot.id, active=True)

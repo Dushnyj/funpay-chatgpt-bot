@@ -20,6 +20,12 @@ DEFAULT_LIMIT_SCOPES: tuple[tuple[str, str], ...] = (
     ("chat", "Chat"),
     ("codex", "Codex"),
 )
+DEFAULT_LIMIT_SCOPE_AVAILABILITY: dict[str, bool] = {
+    "any": True,
+    # OpenAI does not expose a trustworthy remaining Chat message allowance.
+    "chat": False,
+    "codex": True,
+}
 
 # Полный перечень ключей из спеки (секция MessageTemplate).
 # Каждый ключ имеет ru и en варианты с плейсхолдерами для str.format.
@@ -318,9 +324,16 @@ async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
     existing_scopes = set(
         (await session.execute(select(LimitScope.code))).scalars().all()
     )
-    for code, name in DEFAULT_LIMIT_SCOPES:
+    for sort_order, (code, name) in enumerate(DEFAULT_LIMIT_SCOPES, start=1):
         if code not in existing_scopes:
-            session.add(LimitScope(code=code, name=name))
+            session.add(
+                LimitScope(
+                    code=code,
+                    name=name,
+                    is_enabled=DEFAULT_LIMIT_SCOPE_AVAILABILITY[code],
+                    sort_order=sort_order * 10,
+                )
+            )
 
     if commit:
         await session.commit()

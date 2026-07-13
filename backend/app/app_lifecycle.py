@@ -21,6 +21,7 @@ from app.services.bump import BumpService
 from app.services.funpay_lifecycle import build_callbacks
 from app.services.lot_auto_manager import LotAutoManager
 from app.services.lot_sync import LotSyncService
+from app.services.offer_configuration import validate_offer_configurations
 from app.services.order_processor import OrderProcessor
 from app.services.rental_service import (
     CREDENTIAL_DELIVERY_LEASE,
@@ -357,18 +358,22 @@ class AppLifecycle:
             async with async_session_factory() as session:
                 settings = await session.get(SellerSettings, 1)
                 node_id = settings.funpay_node_id if settings else None
-                if node_id:
-                    mgr = LotAutoManager(funpay_node_id=node_id)
-                    actions = await mgr.run(session, gateway)
-                    await session.commit()
-                    return actions
-            return []
+                # Catalog safety reconciliation must run even when the global
+                # node is not configured: a manual lot can carry its own node.
+                # LotAutoManager treats node 0 as "do not create new lots".
+                mgr = LotAutoManager(funpay_node_id=node_id or 0)
+                actions = await mgr.run(session, gateway)
+                await session.commit()
+                return actions
 
     async def sync_manual_lot(self, lot_id: int, active: bool = True) -> int:
         """Create/update a local lot on the currently connected FunPay account."""
         async with self._funpay_lock:
             gateway = self._require_gateway()
             async with async_session_factory() as session:
+                lot = await session.get(Lot, lot_id)
+                if active and lot is not None:
+                    await validate_offer_configurations(session, [lot])
                 offer_id = await self._lot_sync.sync_lot(
                     session, gateway, lot_id, active,
                 )
@@ -385,6 +390,9 @@ class AppLifecycle:
             gateway = self._require_gateway()
             async with async_session_factory() as session:
                 if active:
+                    lot = await session.get(Lot, lot_id)
+                    if lot is not None:
+                        await validate_offer_configurations(session, [lot])
                     await self._lot_sync.activate_lot(session, gateway, lot_id)
                     lot = await session.get(Lot, lot_id)
                     if lot is not None:

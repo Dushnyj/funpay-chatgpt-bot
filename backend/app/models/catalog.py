@@ -35,3 +35,7 @@ class LimitScope(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     code: Mapped[str] = mapped_column(unique=True)  # any | chat | codex
     name: Mapped[str] = mapped_column(unique=True)
+    # Codes and names are stable system identifiers. Operators may only
+    # control whether a scope participates in new offers and how it is shown.
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)

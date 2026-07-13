@@ -1,6 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from './client'
-import type { Tier, TierCreate, Duration, LimitScope } from '../types/api'
+import type {
+  Duration,
+  DurationUpdate,
+  LimitScope,
+  LimitScopeUpdate,
+  Tier,
+  TierCreate,
+  TierUpdate,
+} from '../types/api'
 
 export function useTiers() {
   return useQuery({ queryKey: ['tiers'], queryFn: () => api.get<Tier[]>('/tiers') })
@@ -25,9 +33,14 @@ export function useDeleteTier() {
 export function useUpdateTier() {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, ...body }: { id: number; is_sellable?: boolean; is_active?: boolean }) =>
+    mutationFn: ({ id, ...body }: TierUpdate & { id: number }) =>
       api.patch<Tier>(`/tiers/${id}`, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['tiers'] }),
+    onSuccess: (updated) => {
+      qc.setQueryData<Tier[]>(['tiers'], (current) =>
+        current?.map((tier) => tier.id === updated.id ? updated : tier),
+      )
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['tiers'] }),
   })
 }
 
@@ -35,6 +48,34 @@ export function useDurations() {
   return useQuery({ queryKey: ['durations'], queryFn: () => api.get<Duration[]>('/durations') })
 }
 
+export function useUpdateDuration() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...body }: DurationUpdate & { id: number }) =>
+      api.patch<Duration>(`/durations/${id}`, body),
+    onSuccess: (updated) => {
+      qc.setQueryData<Duration[]>(['durations'], (current) =>
+        current?.map((duration) => duration.id === updated.id ? updated : duration),
+      )
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['durations'] }),
+  })
+}
+
 export function useLimitScopes() {
   return useQuery({ queryKey: ['limit-scopes'], queryFn: () => api.get<LimitScope[]>('/limit-scopes') })
+}
+
+export function useUpdateLimitScope() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, ...body }: LimitScopeUpdate & { id: number }) =>
+      api.patch<LimitScope>(`/limit-scopes/${id}`, body),
+    onSuccess: (updated) => {
+      qc.setQueryData<LimitScope[]>(['limit-scopes'], (current) =>
+        current?.map((scope) => scope.id === updated.id ? updated : scope),
+      )
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['limit-scopes'] }),
+  })
 }

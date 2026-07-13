@@ -22,6 +22,7 @@ import {
   renderTemplatePreview,
   templateKeyForName,
 } from '../utils/templateEditor'
+import { isAvailableOfferScope, offerScopeUnavailableReason } from '../utils/offerScopes'
 import '../styles/templates.css'
 
 type TemplateSection = 'messages' | 'lots'
@@ -301,6 +302,18 @@ export default function Templates() {
 
   const activeLot = lots.find((item) => item.key === selectedLotKey)
   const activeLotDraft = activeLot ? lotDrafts[activeLot.key] ?? toLotDraft(activeLot) : null
+  const availableLotScopes = (scopesQuery.data ?? [])
+    .filter(isAvailableOfferScope)
+    .sort((left, right) => left.sort_order - right.sort_order || left.id - right.id)
+  const activeLotScope = activeLot?.limit_scope_id
+    ? (scopesQuery.data ?? []).find((scope) => scope.id === activeLot.limit_scope_id)
+    : null
+  const activeLotScopeUnavailableReason = !activeLot?.limit_scope_id
+    ? null
+    : !scopesQuery.isSuccess
+      ? 'тип лимита пока не удалось проверить'
+      : offerScopeUnavailableReason(activeLotScope)
+  const activeLotScopeUnavailable = activeLotScopeUnavailableReason !== null
   const lotTitleField = language === 'ru' ? 'title_ru' : 'title_en'
   const lotDescriptionField = language === 'ru' ? 'description_ru' : 'description_en'
   const lotTitle = activeLotDraft?.[lotTitleField] ?? ''
@@ -667,9 +680,10 @@ export default function Templates() {
                     <div className="templates-lot-settings">
                       {activeLot.system_managed
                         ? <span className="templates-system-required"><Icon name="shield" size={14} />Базовый шаблон всегда активен</span>
-                        : <label className="templates-switch"><input type="checkbox" checked={activeLotDraft.enabled} onChange={(event) => changeLot('enabled', event.target.checked)} disabled={editorBusy} /><span /><b>Использовать при генерации лотов</b></label>}
+                        : <label className="templates-switch"><input type="checkbox" checked={activeLotDraft.enabled} onChange={(event) => changeLot('enabled', event.target.checked)} disabled={editorBusy || activeLotScopeUnavailable} /><span /><b>Использовать при генерации лотов</b></label>}
                       <span>{CATEGORY_LABELS[lotCategory(activeLot)]}</span>
                     </div>
+                    {activeLotScopeUnavailable && <div className="form-alert form-alert--warning"><Icon name="warning" size={15} /><span>Причина: {activeLotScopeUnavailableReason}. Шаблон сохранён, но не участвует в генерации. Включите соответствующий ANY/CODEX в справочнике либо создайте новый шаблон с поддерживаемым типом.</span></div>}
                     <label className="templates-field">
                       <span><b>Название лота</b><small>{lotTitle.length} / 255</small></span>
                       <input ref={lotTitleRef} value={lotTitle} onFocus={() => setLotInsertTarget('title')} onChange={(event) => changeLot(lotTitleField, event.target.value)} maxLength={255} disabled={editorBusy} />
@@ -692,7 +706,7 @@ export default function Templates() {
                 <div className="templates-preview-pane__header"><span><Icon name="eye" size={15} />Предпросмотр</span><small>Тестовые данные · не публикуется</small></div>
                 {section === 'messages'
                   ? <MessagePreview content={messageContent} language={language} />
-                  : <LotPreview title={lotTitle} description={lotDescription} enabled={activeLotDraft?.enabled ?? false} />}
+                  : <LotPreview title={lotTitle} description={lotDescription} enabled={(activeLotDraft?.enabled ?? false) && !activeLotScopeUnavailable} />}
                 <div className="templates-preview-note"><Icon name="activity" size={15} /><span>Фигурные скобки заменяются актуальными данными заказа только при отправке или публикации.</span></div>
               </aside>
             </div>
@@ -714,7 +728,7 @@ export default function Templates() {
               </div>
               <div className="form-grid">
                 <label className="field"><span className="field__label">Тариф</span><select value={createDraft.tier_id ?? ''} onChange={(event) => setCreateDraft((current) => ({ ...current, tier_id: event.target.value ? Number(event.target.value) : null }))}><option value="">Любой тариф</option>{(tiersQuery.data ?? []).map((tier) => <option key={tier.id} value={tier.id}>{tier.name}</option>)}</select></label>
-                <label className="field"><span className="field__label">Тип лимита</span><select value={createDraft.limit_scope_id ?? ''} onChange={(event) => setCreateDraft((current) => ({ ...current, limit_scope_id: event.target.value ? Number(event.target.value) : null }))}><option value="">Любой лимит</option>{(scopesQuery.data ?? []).map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}</select></label>
+                <label className="field"><span className="field__label">Тип лимита</span><select value={createDraft.limit_scope_id ?? ''} onChange={(event) => setCreateDraft((current) => ({ ...current, limit_scope_id: event.target.value ? Number(event.target.value) : null }))}><option value="">Любой включённый лимит</option>{availableLotScopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}</select></label>
               </div>
               <div className="form-grid">
                 <label className="field"><span className="field__label">Название RU</span><input value={createDraft.title_ru} onChange={(event) => setCreateDraft((current) => ({ ...current, title_ru: event.target.value }))} maxLength={255} /></label>

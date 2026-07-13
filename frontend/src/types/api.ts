@@ -20,6 +20,11 @@ export interface TierCreate {
   is_active?: boolean
 }
 
+export interface TierUpdate {
+  is_active?: boolean
+  is_sellable?: boolean
+}
+
 export interface Duration {
   id: number
   days: number
@@ -27,10 +32,22 @@ export interface Duration {
   sort_order: number
 }
 
+export interface DurationUpdate {
+  is_enabled?: boolean
+  sort_order?: number
+}
+
 export interface LimitScope {
   id: number
   code: string
   name: string
+  is_enabled: boolean
+  sort_order: number
+}
+
+export interface LimitScopeUpdate {
+  is_enabled?: boolean
+  sort_order?: number
 }
 
 export interface AccountLimits {

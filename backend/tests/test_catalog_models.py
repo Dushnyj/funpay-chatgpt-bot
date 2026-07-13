@@ -33,10 +33,17 @@ async def test_create_duration(session):
 
 @pytest.mark.asyncio
 async def test_create_limit_scope(session):
-    scope = LimitScope(code="codex", name="Codex")
+    scope = LimitScope(
+        code="codex",
+        name="Codex",
+        is_enabled=True,
+        sort_order=30,
+    )
     session.add(scope)
     await session.commit()
 
     result = await session.execute(select(LimitScope).where(LimitScope.code == "codex"))
     fetched = result.scalar_one()
     assert fetched.name == "Codex"
+    assert fetched.is_enabled is True
+    assert fetched.sort_order == 30

@@ -6,6 +6,7 @@ import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, TableShell } from '../components/ui'
 import type { PriceMatrixItem, Tier } from '../types/api'
 import { formatCurrency } from '../utils/format'
+import { isAvailableOfferScope, isSupportedOfferScopeCode, offerScopeUnavailableReason } from '../utils/offerScopes'
 
 type DraftRule = PriceMatrixItem & { draftId: string }
 type BuilderState = {
@@ -38,7 +39,9 @@ export default function Prices() {
   const tiers = tiersQuery.data ?? []
   const durations = durationsQuery.data ?? []
   const scopes = scopesQuery.data ?? []
-  const configurableScopes = scopes.filter((scope) => scope.code.toLowerCase() !== 'chat')
+  const configurableScopes = scopes
+    .filter(isAvailableOfferScope)
+    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
   const sellableTiers = tiers.filter(isTierSellable)
   const enabledDurations = durations
     .filter((duration) => duration.is_enabled)
@@ -51,6 +54,10 @@ export default function Prices() {
   const unavailableDurationRules = draft.filter(
     (item) => durations.find((duration) => duration.id === item.duration_id)?.is_enabled !== true,
   ).length
+  const unavailableScopeRules = draft.filter((item) => {
+    const scope = scopes.find((candidate) => candidate.id === item.limit_scope_id)
+    return !isAvailableOfferScope(scope)
+  }).length
 
   const tierName = (id: number) => tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
   const tierCode = (id: number) => tiers.find((tier) => tier.id === id)?.code?.toLowerCase() ?? 'unknown'
@@ -77,8 +84,14 @@ export default function Prices() {
   const resolvedBuilderTier = sellableTiers.some((tier) => tier.id === requestedBuilderTier)
     ? requestedBuilderTier
     : sellableTiers[0]?.id ?? 0
-  const resolvedBuilderDuration = Number(builder.durationId) || enabledDurations[0]?.id || 0
-  const resolvedBuilderScope = Number(builder.scopeId) || configurableScopes.find((scope) => scope.code.toLowerCase() === 'any')?.id || configurableScopes[0]?.id || 0
+  const requestedBuilderDuration = Number(builder.durationId)
+  const resolvedBuilderDuration = enabledDurations.some((duration) => duration.id === requestedBuilderDuration)
+    ? requestedBuilderDuration
+    : enabledDurations[0]?.id ?? 0
+  const requestedBuilderScope = Number(builder.scopeId)
+  const resolvedBuilderScope = configurableScopes.some((scope) => scope.id === requestedBuilderScope)
+    ? requestedBuilderScope
+    : configurableScopes.find((scope) => scope.code.toLowerCase() === 'any')?.id ?? configurableScopes[0]?.id ?? 0
   const builderScopeCode = scopeCode(resolvedBuilderScope)
 
   if (pricesQuery.isLoading || tiersQuery.isLoading || durationsQuery.isLoading || scopesQuery.isLoading) {
@@ -112,7 +125,7 @@ export default function Prices() {
 
   const addRule = (presetScope?: 'any' | 'codex') => {
     const targetScope = presetScope
-      ? scopes.find((scope) => scope.code.toLowerCase() === presetScope)?.id ?? 0
+      ? configurableScopes.find((scope) => scope.code.toLowerCase() === presetScope)?.id ?? 0
       : resolvedBuilderScope
     const targetScopeCode = scopeCode(targetScope)
     const price = Number(builder.price)
@@ -192,13 +205,12 @@ export default function Prices() {
     const invalid = normalized.some((item) => {
       const code = scopeCode(item.limit_scope_id)
       return item.price <= 0
-        || code === 'unknown'
-        || code === 'chat'
+        || !isSupportedOfferScopeCode(code)
         || (code === 'any' && [item.max_5h_pct, item.max_weekly_pct].some((value) => value != null && (value < 0 || value > 100)))
         || (code !== 'any' && (item.min_limit_pct == null || item.min_limit_pct < 0 || item.min_limit_pct > 100))
     })
     if (invalid) {
-      setError('Проверьте цену и условие: ANY продаётся без гарантии, CODEX требует минимум 0–100%, а CHAT недоступен — OpenAI не публикует его остаток.')
+      setError('Проверьте цену и условие: поддерживаются только типы ANY и CODEX. ANY продаётся без гарантии, CODEX требует минимум 0–100%.')
       return
     }
     const signatures = normalized.map((item) => ruleSignature(
@@ -247,22 +259,23 @@ export default function Prices() {
         </div>
         <div className="price-rule-builder__fields">
           <label className="field"><span className="field__label">Тариф</span><select value={String(resolvedBuilderTier || '')} onChange={(event) => setBuilder((current) => ({ ...current, tierId: event.target.value }))} disabled={sellableTiers.length === 0}>{sellableTiers.length === 0 && <option value="">Нет тарифов, разрешённых к продаже</option>}{sellableTiers.map((tier) => <option value={tier.id} key={tier.id}>{tier.name}</option>)}</select></label>
-          <label className="field"><span className="field__label">Срок аренды</span><select value={String(resolvedBuilderDuration || '')} onChange={(event) => setBuilder((current) => ({ ...current, durationId: event.target.value }))}>{enabledDurations.map((duration) => <option value={duration.id} key={duration.id}>{duration.days} дн.</option>)}</select></label>
-          <label className="field"><span className="field__label">Тип условия</span><select value={String(resolvedBuilderScope || '')} onChange={(event) => setBuilder((current) => ({ ...current, scopeId: event.target.value }))}>{configurableScopes.map((scope) => <option value={scope.id} key={scope.id}>{scope.name}</option>)}</select></label>
+          <label className="field"><span className="field__label">Срок аренды</span><select value={String(resolvedBuilderDuration || '')} onChange={(event) => setBuilder((current) => ({ ...current, durationId: event.target.value }))} disabled={enabledDurations.length === 0}>{enabledDurations.length === 0 && <option value="">Нет включённых сроков</option>}{enabledDurations.map((duration) => <option value={duration.id} key={duration.id}>{duration.days} дн.</option>)}</select></label>
+          <label className="field"><span className="field__label">Тип условия</span><select value={String(resolvedBuilderScope || '')} onChange={(event) => setBuilder((current) => ({ ...current, scopeId: event.target.value }))} disabled={configurableScopes.length === 0}>{configurableScopes.length === 0 && <option value="">Нет включённых типов лимита</option>}{configurableScopes.map((scope) => <option value={scope.id} key={scope.id}>{scope.name}</option>)}</select></label>
           {builderScopeCode === 'any' ? <div className="builder-condition-note"><Icon name="check" /><span><strong>Без гарантии остатка</strong><small>Подойдёт любой доступный аккаунт выбранного тарифа.</small></span></div> : <label className="field"><span className="field__label">Минимальный остаток</span><span className="percent-input percent-input--wide"><input type="number" min="0" max="100" value={builder.minLimit} onChange={(event) => setBuilder((current) => ({ ...current, minLimit: event.target.value }))} /><span>%</span></span></label>}
           <label className="field"><span className="field__label">Цена</span><span className="money-input money-input--wide"><input type="number" min="1" step="1" value={builder.price} onChange={(event) => setBuilder((current) => ({ ...current, price: event.target.value }))} placeholder="0" /><span>₽</span></span></label>
-          <button className="button button--primary price-rule-builder__add" type="button" onClick={() => addRule()} disabled={sellableTiers.length === 0}><Icon name="plus" />Добавить правило</button>
+          <button className="button button--primary price-rule-builder__add" type="button" onClick={() => addRule()} disabled={sellableTiers.length === 0 || enabledDurations.length === 0 || configurableScopes.length === 0}><Icon name="plus" />Добавить правило</button>
         </div>
         <div className="price-presets" aria-label="Быстрые пресеты">
           <span>Быстрые пресеты для выбранного тарифа и срока:</span>
-          <button type="button" onClick={() => addRule('any')}>ANY · без гарантии</button>
-          <button type="button" onClick={() => addRule('codex')}>CODEX · остаток ≥ 50%</button>
+          <button type="button" onClick={() => addRule('any')} disabled={!configurableScopes.some((scope) => scope.code.toLowerCase() === 'any')}>ANY · без гарантии</button>
+          <button type="button" onClick={() => addRule('codex')} disabled={!configurableScopes.some((scope) => scope.code.toLowerCase() === 'codex')}>CODEX · остаток ≥ 50%</button>
         </div>
       </section>
 
       <div className="form-alert form-alert--info"><Icon name="activity" /><span>Длинное окно Free — 30 дней, у всех платных тарифов — 7 дней. У платного плана отдельно может быть короткое 5-часовое окно; при подборе используются фактические окна OpenAI. Гарантию CHAT создать нельзя: OpenAI не отдаёт достоверный остаток сообщений ChatGPT. Для обычного доступа используйте ANY, для измеримой гарантии — CODEX.</span></div>
       {unavailableTierRules > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Правил для тарифов с выключенной продажей: {unavailableTierRules}. Они остаются видимыми и сохраняются в матрице, но новые правила и автоматические лоты для таких тарифов не создаются. Правило можно перевести на доступный тариф или удалить.</span></div>}
       {unavailableDurationRules > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Правил для выключенных сроков: {unavailableDurationRules}. Они сохранены, но соответствующие автоматические лоты приостановлены. Выберите включённый срок или удалите правило.</span></div>}
+      {unavailableScopeRules > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Правил с недоступным типом лимита: {unavailableScopeRules}. Они остаются в матрице, но не участвуют в создании новых лотов. Переведите правило на включённый ANY/CODEX или удалите его.</span></div>}
 
       <section className="panel panel--flush">
         <div className="toolbar">
@@ -275,6 +288,7 @@ export default function Prices() {
             const scope = scopeCode(item.limit_scope_id)
             const currentTier = tiers.find((tier) => tier.id === item.tier_id)
             const currentDuration = durations.find((duration) => duration.id === item.duration_id)
+            const currentScope = scopes.find((candidate) => candidate.id === item.limit_scope_id)
             const currentTierIsFree = currentTier?.code?.toLowerCase() === 'free'
             const currentTierIsSellable = isTierSellable(currentTier)
             const rowTierOptions = currentTier && !sellableTiers.some((tier) => tier.id === currentTier.id)
@@ -283,13 +297,18 @@ export default function Prices() {
             const rowDurationOptions = currentDuration && !enabledDurations.some((duration) => duration.id === currentDuration.id)
               ? [currentDuration, ...enabledDurations]
               : enabledDurations
+            const rowScopeOptions = currentScope && !configurableScopes.some((candidate) => candidate.id === currentScope.id)
+              ? [currentScope, ...configurableScopes]
+              : configurableScopes
+            const scopeUnavailableReason = offerScopeUnavailableReason(currentScope)
+            const currentScopeIsEnabled = scopeUnavailableReason === null
             return <tr key={item.draftId}>
               <td><label className="sr-only" htmlFor={`${item.draftId}-tier`}>Тариф</label><select id={`${item.draftId}-tier`} className="table-select" value={item.tier_id} onChange={(event) => updateItem(item.draftId, { tier_id: Number(event.target.value) })}>{!currentTier && <option value={item.tier_id}>Тариф #{item.tier_id} · нет в каталоге</option>}{rowTierOptions.map((tier) => <option key={tier.id} value={tier.id} disabled={!isTierSellable(tier)}>{tier.name}{isTierSellable(tier) ? '' : ' · продажа выключена'}</option>)}</select>{!currentTierIsSellable && <small className="table-subline text-warning">Правило сохранено, публикация приостановлена</small>}</td>
               <td><label className="sr-only" htmlFor={`${item.draftId}-duration`}>Срок</label><select id={`${item.draftId}-duration`} className="table-select table-select--compact" value={item.duration_id} onChange={(event) => updateItem(item.draftId, { duration_id: Number(event.target.value) })}>{!currentDuration && <option value={item.duration_id}>Срок #{item.duration_id} · нет в каталоге</option>}{rowDurationOptions.map((duration) => <option key={duration.id} value={duration.id} disabled={!duration.is_enabled}>{duration.days} дн.{duration.is_enabled ? '' : ' · выключен'}</option>)}</select>{currentDuration?.is_enabled !== true && <small className="table-subline text-warning">Публикация приостановлена</small>}</td>
-              <td><label className="sr-only" htmlFor={`${item.draftId}-scope`}>Тип лимита</label><select id={`${item.draftId}-scope`} className={`table-select scope-select scope-select--${scope}`} value={item.limit_scope_id} onChange={(event) => updateItem(item.draftId, { limit_scope_id: Number(event.target.value) })}>{scopes.map((candidate) => <option key={candidate.id} value={candidate.id} disabled={candidate.code.toLowerCase() === 'chat'}>{candidate.code.toUpperCase()}</option>)}</select><small className="table-subline">{scopeName(item.limit_scope_id)}</small></td>
-              <td>{scope === 'chat' ? <div className="limit-condition limit-condition--unavailable"><Icon name="warning" size={15} /><span><strong>CHAT недоступен</strong>Остаток не измеряется; переведите правило на ANY/CODEX или удалите.</span></div> : scope === 'any' ? <div className="limit-condition limit-condition--ceilings"><span><strong className="no-guarantee"><Icon name="check" size={14} />Без гарантии</strong>Необязательный внутренний максимум остатка</span>{currentTierIsFree ? <span className="table-subline">У Free нет короткого 5-часового окна</span> : <PercentInput value={item.max_5h_pct} label="Максимум короткого 5-часового окна" onChange={(value) => updateItem(item.draftId, { max_5h_pct: value })} />}<PercentInput value={item.max_weekly_pct} label="Максимум длинного окна (7 или 30 дней)" onChange={(value) => updateItem(item.draftId, { max_weekly_pct: value })} /></div> : <div className="limit-condition"><span>Остаток в наблюдаемом окне не ниже</span><PercentInput value={item.min_limit_pct} label={`Минимальный остаток ${scope.toUpperCase()}`} onChange={(value) => updateItem(item.draftId, { min_limit_pct: value })} /></div>}</td>
+              <td><label className="sr-only" htmlFor={`${item.draftId}-scope`}>Тип лимита</label><select id={`${item.draftId}-scope`} className={`table-select scope-select scope-select--${scope}`} value={item.limit_scope_id} onChange={(event) => updateItem(item.draftId, { limit_scope_id: Number(event.target.value) })}>{!currentScope && <option value={item.limit_scope_id}>Тип #{item.limit_scope_id} · нет в каталоге</option>}{rowScopeOptions.map((candidate) => <option key={candidate.id} value={candidate.id} disabled={!isAvailableOfferScope(candidate)}>{candidate.code.toUpperCase()}{offerScopeUnavailableReason(candidate) ? ` · ${offerScopeUnavailableReason(candidate)}` : ''}</option>)}</select><small className={`table-subline ${currentScopeIsEnabled ? '' : 'text-warning'}`}>{currentScopeIsEnabled ? scopeName(item.limit_scope_id) : `${scopeUnavailableReason}. Правило сохранено, публикация приостановлена`}</small></td>
+              <td>{!currentScopeIsEnabled ? <div className="limit-condition limit-condition--unavailable"><Icon name="warning" size={15} /><span><strong>Тип лимита недоступен</strong>{scopeUnavailableReason}. Переведите правило на ANY/CODEX или удалите.</span></div> : scope === 'any' ? <div className="limit-condition limit-condition--ceilings"><span><strong className="no-guarantee"><Icon name="check" size={14} />Без гарантии</strong>Необязательный внутренний максимум остатка</span>{currentTierIsFree ? <span className="table-subline">У Free нет короткого 5-часового окна</span> : <PercentInput value={item.max_5h_pct} label="Максимум короткого 5-часового окна" onChange={(value) => updateItem(item.draftId, { max_5h_pct: value })} />}<PercentInput value={item.max_weekly_pct} label="Максимум длинного окна (7 или 30 дней)" onChange={(value) => updateItem(item.draftId, { max_weekly_pct: value })} /></div> : <div className="limit-condition"><span>Остаток в наблюдаемом окне не ниже</span><PercentInput value={item.min_limit_pct} label={`Минимальный остаток ${scope.toUpperCase()}`} onChange={(value) => updateItem(item.draftId, { min_limit_pct: value })} /></div>}</td>
               <td><label className="money-input"><input type="number" min="1" step="1" value={item.price} onChange={(event) => updateItem(item.draftId, { price: Number(event.target.value) })} aria-label={`Цена ${tierName(item.tier_id)} ${durationDays(item.duration_id)} дней`} /><span>₽</span></label></td>
-              <td><div className="row-actions row-actions--compact"><button className="icon-button" type="button" onClick={() => duplicateRule(item)} disabled={!currentTierIsSellable || scope === 'chat'} title={currentTierIsSellable && scope !== 'chat' ? 'Дублировать правило' : 'Недоступное правило нельзя дублировать'} aria-label={`Дублировать правило ${tierName(item.tier_id)}`}><Icon name="copy" /></button><button className="icon-button icon-button--danger" type="button" onClick={() => removeRule(item.draftId)} title="Удалить правило" aria-label={`Удалить правило ${tierName(item.tier_id)}`}><Icon name="trash" /></button></div></td>
+              <td><div className="row-actions row-actions--compact"><button className="icon-button" type="button" onClick={() => duplicateRule(item)} disabled={!currentTierIsSellable || !currentScopeIsEnabled} title={currentTierIsSellable && currentScopeIsEnabled ? 'Дублировать правило' : 'Недоступное правило нельзя дублировать'} aria-label={`Дублировать правило ${tierName(item.tier_id)}`}><Icon name="copy" /></button><button className="icon-button icon-button--danger" type="button" onClick={() => removeRule(item.draftId)} title="Удалить правило" aria-label={`Удалить правило ${tierName(item.tier_id)}`}><Icon name="trash" /></button></div></td>
             </tr>
           })}</tbody></table></TableShell>
         )}
