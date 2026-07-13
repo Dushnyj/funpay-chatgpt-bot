@@ -303,9 +303,6 @@ def _resolve_created_offer_id(
     """
     before_ids = {item.offer_id for item in before}
     new_items = [item for item in after if item.offer_id not in before_ids]
-    if len(new_items) == 1:
-        return new_items[0].offer_id
-
     requested_titles = {
         _normalize_offer_title(requested.title_ru),
         _normalize_offer_title(requested.title_en),

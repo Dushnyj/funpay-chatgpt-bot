@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _Base(BaseModel):
@@ -42,6 +42,13 @@ class TierUpdate(BaseModel):
     is_active: bool | None = None
     is_sellable: bool | None = None
 
+    @field_validator("is_active", "is_sellable", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
+
 
 class DurationOut(_Base):
     id: int
@@ -54,6 +61,13 @@ class DurationUpdate(BaseModel):
     id: int = Field(gt=0)
     is_enabled: bool | None = None
     sort_order: int | None = None
+
+    @field_validator("is_enabled", "sort_order", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("field cannot be null")
+        return value
 
 
 class LimitScopeOut(_Base):
@@ -85,6 +99,7 @@ class AccountOut(_Base):
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = None
     status: str
+    operator_status_override: str | None = None
     notes: str | None = None
     plan_raw_type: str | None = None
     plan_source: str | None = None
@@ -110,10 +125,43 @@ class AccountCreate(BaseModel):
 class AccountUpdate(BaseModel):
     subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = Field(default=None, ge=1, le=100)
-    status: Literal[
-        "pending_validation", "validation_failed", "active", "maintenance", "disabled"
-    ] | None = None
+    # A human operator may suspend an account, but cannot certify credentials.
+    # Returning to active always goes through the recheck endpoint.
+    status: Literal["maintenance", "disabled"] | None = None
     notes: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def reject_null_status(cls, value):
+        if value is None:
+            raise ValueError("status cannot be null")
+        return value
+
+
+class AccountCredentialsUpdate(BaseModel):
+    """Write-only credential repair payload.
+
+    Omitted fields stay unchanged. Nullable optional credentials use an
+    explicit ``null`` as the only clear operation, so an accidentally blank
+    form never destroys a stored secret.
+    """
+
+    login: str | None = Field(default=None, min_length=1, max_length=320)
+    password: str | None = None
+    totp_secret: str | None = None
+    email: str | None = Field(default=None, min_length=1, max_length=320)
+    email_password: str | None = None
+
+    @field_validator("login", "email", mode="before")
+    @classmethod
+    def normalize_identity(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self):
+        if not self.model_fields_set:
+            raise ValueError("at least one credential field is required")
+        return self
 
 
 class AccountLimitsOut(_Base):
@@ -131,6 +179,8 @@ class AccountLimitsOut(_Base):
     refresh_status: str
     measured_at: datetime | None = None
     plan_type: str | None = None
+    plan_window_status: str = "unknown"
+    expected_long_window_seconds: int | None = None
 
     @field_validator(
         "codex_primary_resets_at",
@@ -180,7 +230,7 @@ class PriceMatrixItem(BaseModel):
 
 
 class PriceMatrixUpdate(BaseModel):
-    items: list[PriceMatrixItem] = Field(min_length=1, max_length=10_000)
+    items: list[PriceMatrixItem] = Field(max_length=10_000)
 
 
 # --- Templates ---
@@ -194,7 +244,7 @@ class TemplateOut(_Base):
 class TemplateItem(BaseModel):
     key: str = Field(min_length=1, max_length=100)
     lang: Literal["ru", "en"]
-    content: str = Field(min_length=1, max_length=20_000)
+    content: str = Field(min_length=1, max_length=4_000)
 
 
 class TemplateUpdate(BaseModel):
@@ -247,8 +297,14 @@ class OrderOut(_Base):
     tier_id: int | None = None
     duration_id: int | None = None
     limit_scope_id: int | None = None
+    min_limit_pct: int | None = None
+    max_5h_pct: int | None = None
+    max_weekly_pct: int | None = None
     price: int
     status: str
+    fulfillment_attempts: int
+    fulfillment_next_attempt_at: datetime | None = None
+    fulfillment_last_error: str | None = None
     created_at: datetime
 
 
@@ -261,27 +317,58 @@ class RentalOut(_Base):
     tier_id: int
     duration_id: int
     limit_scope_id: int
+    min_limit_pct: int | None = None
+    max_5h_pct: int | None = None
+    max_weekly_pct: int | None = None
     lang: str
     started_at: datetime
     expires_at: datetime
     status: str
     replacement_count: int
+    credentials_delivery_status: str
+    credentials_delivery_template: str
+    credentials_delivery_started_at: datetime | None = None
+    credentials_delivery_next_attempt_at: datetime | None = None
+    credentials_delivered_at: datetime | None = None
+    credentials_delivery_attempts: int
+    credentials_delivery_last_error: str | None = None
+    issued_codex_primary_pct: int | None = None
+    issued_codex_primary_window_seconds: int | None = None
+    issued_codex_primary_resets_at: datetime | None = None
+    issued_codex_secondary_pct: int | None = None
+    issued_codex_secondary_window_seconds: int | None = None
+    issued_codex_secondary_resets_at: datetime | None = None
+    issued_plan_window_status: str | None = None
+    issued_expected_long_window_seconds: int | None = None
+    issued_limits_measured_at: datetime | None = None
 
 
 class RentalPatch(BaseModel):
     status: Literal["active", "expired", "refunded", "replaced"] | None = None
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def reject_null_status(cls, value):
+        if value is None:
+            raise ValueError("status cannot be null")
+        return value
 
 
 # --- Settings ---
 
 class SettingsOut(_Base):
     funpay_node_id: int | None = None
+    graph_configured: bool = False
     auto_bump_enabled: bool
     bump_interval_hours: int
     default_max_active_rentals: int
     funpay_commission_percent: int
     check_interval_minutes: int
     limits_check_interval_minutes: int
+    refresh_recover_concurrency: int
+    refresh_max_attempts: int
+    refresh_retry_delay_minutes: int
+    check_delay_seconds: int
     limits_warn_threshold_pct: int
 
 
@@ -292,7 +379,11 @@ class SettingsUpdate(BaseModel):
     default_max_active_rentals: int | None = Field(default=None, ge=1, le=100)
     funpay_commission_percent: int | None = Field(default=None, ge=0, le=100)
     check_interval_minutes: int | None = Field(default=None, ge=1, le=10_080)
-    limits_check_interval_minutes: int | None = Field(default=None, ge=1, le=10_080)
+    limits_check_interval_minutes: int | None = Field(default=None, ge=1, le=55)
+    refresh_recover_concurrency: int | None = Field(default=None, ge=1, le=20)
+    refresh_max_attempts: int | None = Field(default=None, ge=1, le=20)
+    refresh_retry_delay_minutes: int | None = Field(default=None, ge=1, le=1_440)
+    check_delay_seconds: int | None = Field(default=None, ge=30, le=3_600)
     limits_warn_threshold_pct: int | None = Field(default=None, ge=0, le=100)
 
     @field_validator(
@@ -302,6 +393,10 @@ class SettingsUpdate(BaseModel):
         "funpay_commission_percent",
         "check_interval_minutes",
         "limits_check_interval_minutes",
+        "refresh_recover_concurrency",
+        "refresh_max_attempts",
+        "refresh_retry_delay_minutes",
+        "check_delay_seconds",
         "limits_warn_threshold_pct",
         mode="before",
     )
@@ -326,6 +421,7 @@ class FunPayKeyUpdate(BaseModel):
 
 class FunPayKeyStatus(BaseModel):
     configured: bool
+    connected: bool = False
     last4: str | None = None
 
 

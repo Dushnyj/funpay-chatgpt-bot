@@ -4,6 +4,7 @@ from passlib.hash import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
+from app.api.routers.auth import _login_throttles, _login_throttles_lock
 from app.main import app
 from app.models.settings import SellerSettings
 
@@ -13,6 +14,12 @@ async def client():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="https://test") as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def reset_login_throttles():
+    with _login_throttles_lock:
+        _login_throttles.clear()
 
 
 async def test_login_success(client: AsyncClient, session: AsyncSession):
@@ -33,6 +40,21 @@ async def test_login_wrong_password(client: AsyncClient, session: AsyncSession):
 
     resp = await client.post("/api/auth/login", json={"password": "wrong"})
     assert resp.status_code == 401
+
+
+async def test_login_rejects_oversized_password_before_bcrypt(
+    client: AsyncClient,
+    session: AsyncSession,
+):
+    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    await session.commit()
+
+    response = await client.post(
+        "/api/auth/login",
+        json={"password": "x" * 129},
+    )
+
+    assert response.status_code == 422
 
 
 async def test_login_no_settings_returns_500(client: AsyncClient, session: AsyncSession):
@@ -62,6 +84,46 @@ async def test_login_rate_limit_returns_retry_after(
 
     assert limited.status_code == 429
     assert int(limited.headers["retry-after"]) >= 1
+
+
+async def test_blocked_client_cannot_bypass_throttle_with_correct_guess(
+    client: AsyncClient, session: AsyncSession
+):
+    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    await session.commit()
+
+    for _ in range(5):
+        response = await client.post("/api/auth/login", json={"password": "wrong"})
+        assert response.status_code == 401
+
+    blocked = await client.post(
+        "/api/auth/login", json={"password": "secret123"}
+    )
+
+    assert blocked.status_code == 429
+    assert COOKIE_NAME not in blocked.cookies
+
+
+async def test_throttled_source_does_not_lock_out_another_ip(
+    client: AsyncClient,
+    session: AsyncSession,
+):
+    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    await session.commit()
+    for _ in range(5):
+        assert (await client.post(
+            "/api/auth/login", json={"password": "wrong"}
+        )).status_code == 401
+
+    transport = ASGITransport(app=app, client=("203.0.113.55", 443))
+    async with AsyncClient(transport=transport, base_url="https://test") as other:
+        recovered = await other.post(
+            "/api/auth/login",
+            json={"password": "secret123"},
+        )
+
+    assert recovered.status_code == 200
+    assert COOKIE_NAME in recovered.cookies
 
 
 async def test_change_password_revokes_old_cookie_and_allows_new_login(

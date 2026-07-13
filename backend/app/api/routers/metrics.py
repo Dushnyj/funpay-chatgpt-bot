@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import case, func, or_, select
@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import MetricsOut
-from app.models.account import Account
+from app.models.account import Account, AccountLimits
+from app.models.catalog import SubscriptionTier
 from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
 
@@ -61,12 +62,23 @@ async def get_metrics(request: Request, session: AsyncSession = Depends(get_db_s
         await session.execute(
             select(func.coalesce(func.sum(free_capacity), 0))
             .select_from(Account)
+            .join(AccountLimits, AccountLimits.account_id == Account.id)
+            .join(SubscriptionTier, SubscriptionTier.id == Account.tier_id)
             .outerjoin(active_by_account, active_by_account.c.account_id == Account.id)
             .where(
                 Account.status == "active",
+                Account.operator_status_override.is_(None),
+                SubscriptionTier.is_active.is_(True),
+                SubscriptionTier.is_sellable.is_(True),
+                AccountLimits.refresh_status == "ok",
+                AccountLimits.plan_window_status == "ok",
+                AccountLimits.measured_at >= now - timedelta(hours=1),
                 or_(
-                    Account.subscription_expires_at.is_(None),
                     Account.subscription_expires_at > now,
+                    (
+                        (SubscriptionTier.code == "free")
+                        & Account.subscription_expires_at.is_(None)
+                    ),
                 ),
             )
         )

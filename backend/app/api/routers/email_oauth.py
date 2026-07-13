@@ -26,6 +26,7 @@ from app.services.email_oauth import (
 
 router = APIRouter(tags=["email-oauth"])
 _check_job_queue = CheckJobQueue()
+_CALLBACK_BODY_LIMIT = 16_384
 
 
 class EmailOAuthStartOut(BaseModel):
@@ -91,8 +92,8 @@ async def microsoft_email_oauth_callback(
     session: AsyncSession = Depends(get_db_session),
 ):
     content_type = request.headers.get("content-type", "").split(";", 1)[0]
-    body = await request.body()
-    if content_type != "application/x-www-form-urlencoded" or len(body) > 16_384:
+    body = await _read_bounded_body(request, _CALLBACK_BODY_LIMIT)
+    if content_type != "application/x-www-form-urlencoded" or body is None:
         return _accounts_redirect("failed", "invalid_state")
     try:
         form = parse_qs(body.decode("utf-8"), keep_blank_values=True)
@@ -171,10 +172,15 @@ async def microsoft_email_oauth_callback(
             superseded_by="email_oauth_connected",
         )
         job_id = job.id
+        rerun_requested = False
     except ActiveJobConflict as exc:
         # A published worker lease is already validating this account. Keep
-        # the new credential, but never start a competing browser flow.
+        # the new credential, but never start a competing browser flow. The
+        # current worker will consume this durable follow-up flag after it
+        # terminalizes its lease.
         job_id = exc.job_id
+        account.validation_rerun_requested = True
+        rerun_requested = True
     account.status = "pending_validation"
     session.add(
         AuditLog(
@@ -184,6 +190,7 @@ async def microsoft_email_oauth_callback(
                 "actor": "admin",
                 "provider": "microsoft_graph",
                 "job_id": job_id,
+                "rerun_requested": rerun_requested,
             },
         )
     )
@@ -193,3 +200,24 @@ async def microsoft_email_oauth_callback(
         await session.rollback()
         return _accounts_redirect("failed", "storage_failed")
     return _accounts_redirect("connected")
+
+
+async def _read_bounded_body(request: Request, limit: int) -> bytes | None:
+    """Read a small form body without first buffering an unbounded request."""
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > limit:
+                return None
+        except ValueError:
+            return None
+
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)

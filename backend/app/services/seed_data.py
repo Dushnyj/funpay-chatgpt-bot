@@ -18,7 +18,10 @@ DEFAULT_LIMIT_SCOPES: tuple[tuple[str, str], ...] = (
 
 # Полный перечень ключей из спеки (секция MessageTemplate).
 # Каждый ключ имеет ru и en варианты с плейсхолдерами для str.format.
-DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+# These are the exact defaults shipped before exact OpenAI windows were added.
+# On bootstrap only byte-for-byte matches are upgraded; operator-edited content
+# is never overwritten.
+LEGACY_LIMIT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
     "welcome": {
         "ru": (
             "✅ Заказ выполнен. ChatGPT {tier} на {days} дн.:\n\n"
@@ -40,18 +43,6 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
             "⚠️ Limits are shared for the account, updated dynamically.\n\n"
             "📱 To log in: !code | Help: !help | Replace: !replace"
         ),
-    },
-    "code_success": {
-        "ru": "🔑 Ваш код: {code}\n⏱ Действителен 30 секунд.\nПодписка активна ещё: {expires_in}",
-        "en": "🔑 Your code: {code}\n⏱ Valid for 30 seconds.\nSubscription active: {expires_in}",
-    },
-    "code_expired": {
-        "ru": "❌ Доступ закончился. Для продления — новый заказ.",
-        "en": "❌ Access expired. To extend — place a new order.",
-    },
-    "code_rate_limited": {
-        "ru": "⏳ Подождите {retry_in_sec} сек. перед запросом нового кода.",
-        "en": "⏳ Wait {retry_in_sec} sec. before requesting a new code.",
     },
     "subscription": {
         "ru": (
@@ -88,6 +79,114 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
             "ChatGPT {tier}, {days} days. Subscription until {expires_at}.\n\n"
             "📊 Limits: Chat 5h — {chat_5h}% / weekly — {chat_weekly}%\n"
             "           Codex 5h — {codex_5h}% / weekly — {codex_weekly}%\n\n"
+            "📱 For login code: !code"
+        ),
+    },
+}
+
+
+DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+    "welcome": {
+        "ru": (
+            "✅ Заказ выполнен. ChatGPT {tier} на {days} дн.:\n\n"
+            "Логин: {login}\n"
+            "Пароль: {password}\n"
+            "Подписка активна до: {expires_at}\n\n"
+            "📊 Лимиты:\n"
+            "• Chat: 5 ч — {chat_5h}% / 7 дн. — {chat_weekly}%\n"
+            "• Codex: {codex_primary_limit}; окно {codex_primary_window}; "
+            "сброс {codex_primary_reset}\n"
+            "• Codex доп.: {codex_secondary_limit}; окно "
+            "{codex_secondary_window}; сброс {codex_secondary_reset}\n\n"
+            "⚠️ Лимиты общие для аккаунта, обновляются динамически.\n\n"
+            "📱 Для входа: !код | Помощь: !помощь | Замена: !замена"
+        ),
+        "en": (
+            "✅ Order completed. ChatGPT {tier} for {days} days:\n\n"
+            "Login: {login}\n"
+            "Password: {password}\n"
+            "Subscription active until: {expires_at}\n\n"
+            "📊 Limits:\n"
+            "• Chat: 5h — {chat_5h}% / 7d — {chat_weekly}%\n"
+            "• Codex: {codex_primary_limit}; window {codex_primary_window}; "
+            "resets {codex_primary_reset}\n"
+            "• Codex secondary: {codex_secondary_limit}; window "
+            "{codex_secondary_window}; resets {codex_secondary_reset}\n\n"
+            "⚠️ Limits are shared for the account, updated dynamically.\n\n"
+            "📱 To log in: !code | Help: !help | Replace: !replace"
+        ),
+    },
+    "code_success": {
+        "ru": "🔑 Ваш код: {code}\n⏱ Действителен 30 секунд.\nПодписка активна ещё: {expires_in}",
+        "en": "🔑 Your code: {code}\n⏱ Valid for 30 seconds.\nSubscription active: {expires_in}",
+    },
+    "code_expired": {
+        "ru": "❌ Доступ закончился. Для продления — новый заказ.",
+        "en": "❌ Access expired. To extend — place a new order.",
+    },
+    "rental_ambiguous": {
+        "ru": (
+            "⚠️ В этом чате несколько активных заказов. "
+            "Откройте нужный заказ на FunPay и повторите команду из него."
+        ),
+        "en": (
+            "⚠️ This chat has multiple active orders. Open the required "
+            "FunPay order and repeat the command from that order."
+        ),
+    },
+    "code_rate_limited": {
+        "ru": "⏳ Подождите {retry_in_sec} сек. перед запросом нового кода.",
+        "en": "⏳ Wait {retry_in_sec} sec. before requesting a new code.",
+    },
+    "subscription": {
+        "ru": (
+            "📊 ChatGPT {tier}\n"
+            "Подписка до: {expires_at}\n"
+            "Осталось: {expires_in}\n\n"
+            "Лимиты:\n"
+            "• Chat: 5 ч — {chat_5h}%, 7 дн. — {chat_weekly}%\n"
+            "• Codex: {codex_primary_limit}; окно {codex_primary_window}; "
+            "сброс {codex_primary_reset}\n"
+            "• Codex доп.: {codex_secondary_limit}; окно "
+            "{codex_secondary_window}; сброс {codex_secondary_reset}"
+        ),
+        "en": (
+            "📊 ChatGPT {tier}\n"
+            "Subscription until: {expires_at}\n"
+            "Remaining: {expires_in}\n\n"
+            "Limits:\n"
+            "• Chat: 5h — {chat_5h}%, 7d — {chat_weekly}%\n"
+            "• Codex: {codex_primary_limit}; window {codex_primary_window}; "
+            "resets {codex_primary_reset}\n"
+            "• Codex secondary: {codex_secondary_limit}; window "
+            "{codex_secondary_window}; resets {codex_secondary_reset}"
+        ),
+    },
+    "replace_success": {
+        "ru": (
+            "🔄 Замена выполнена. Новые данные:\n\n"
+            "Логин: {login}\n"
+            "Пароль: {password}\n"
+            "ChatGPT {tier}, {days} дн. Подписка до {expires_at}.\n\n"
+            "📊 Лимиты:\n"
+            "• Chat: 5 ч — {chat_5h}% / 7 дн. — {chat_weekly}%\n"
+            "• Codex: {codex_primary_limit}; окно {codex_primary_window}; "
+            "сброс {codex_primary_reset}\n"
+            "• Codex доп.: {codex_secondary_limit}; окно "
+            "{codex_secondary_window}; сброс {codex_secondary_reset}\n\n"
+            "📱 Для кода входа: !код"
+        ),
+        "en": (
+            "🔄 Replacement done. New credentials:\n\n"
+            "Login: {login}\n"
+            "Password: {password}\n"
+            "ChatGPT {tier}, {days} days. Subscription until {expires_at}.\n\n"
+            "📊 Limits:\n"
+            "• Chat: 5h — {chat_5h}% / 7d — {chat_weekly}%\n"
+            "• Codex: {codex_primary_limit}; window {codex_primary_window}; "
+            "resets {codex_primary_reset}\n"
+            "• Codex secondary: {codex_secondary_limit}; window "
+            "{codex_secondary_window}; resets {codex_secondary_reset}\n\n"
             "📱 For login code: !code"
         ),
     },
@@ -199,21 +298,27 @@ async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
 async def seed_message_templates(
     session: AsyncSession, *, commit: bool = True
 ) -> None:
-    """Заполняет таблицу MessageTemplate дефолтными значениями, если их нет.
+    """Create missing templates and safely upgrade exact legacy defaults.
 
-    Идемпотентна: существующие шаблоны не перезаписываются, чтобы
-    ручные правки оператора сохранялись при повторном запуске.
+    Operator-edited content is preserved. A stored template is upgraded only
+    when it is byte-for-byte equal to the old bundled default that described
+    Codex limits as fixed 5-hour/weekly windows.
     """
     for key, translations in DEFAULT_MESSAGE_TEMPLATES.items():
         for lang, content in translations.items():
-            existing = await session.execute(
+            result = await session.execute(
                 select(MessageTemplate).where(
                     MessageTemplate.key == key,
                     MessageTemplate.lang == lang,
                 )
             )
-            if existing.scalar_one_or_none() is None:
+            existing = result.scalar_one_or_none()
+            if existing is None:
                 session.add(MessageTemplate(key=key, lang=lang, content=content))
+                continue
+            legacy_content = LEGACY_LIMIT_MESSAGE_TEMPLATES.get(key, {}).get(lang)
+            if legacy_content is not None and existing.content == legacy_content:
+                existing.content = content
     if commit:
         await session.commit()
     else:

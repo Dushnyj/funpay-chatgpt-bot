@@ -1,5 +1,114 @@
-import type { ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { Icon, type IconName } from './Icon'
+
+const FOCUSABLE = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
+
+let openModalCount = 0
+let rootHadInert = false
+let rootAriaHidden: string | null = null
+let bodyOverflow = ''
+
+export function ModalOverlay({
+  children,
+  onClose,
+  canClose = true,
+  closeOnBackdrop = true,
+}: {
+  children: ReactNode
+  onClose: () => void
+  canClose?: boolean
+  closeOnBackdrop?: boolean
+}) {
+  const overlayRef = useRef<HTMLDivElement>(null)
+  const onCloseRef = useRef(onClose)
+  const canCloseRef = useRef(canClose)
+  onCloseRef.current = onClose
+  canCloseRef.current = canClose
+
+  useEffect(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const root = document.getElementById('root')
+
+    if (openModalCount === 0) {
+      rootHadInert = root?.hasAttribute('inert') ?? false
+      rootAriaHidden = root?.getAttribute('aria-hidden') ?? null
+      bodyOverflow = document.body.style.overflow
+      if (root) {
+        root.setAttribute('inert', '')
+        root.setAttribute('aria-hidden', 'true')
+      }
+      document.body.style.overflow = 'hidden'
+    }
+    openModalCount += 1
+
+    const focusable = () => Array.from(overlayRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [])
+      .filter((item) => !item.hasAttribute('disabled') && item.getAttribute('aria-hidden') !== 'true')
+    const preferred = overlayRef.current?.querySelector<HTMLElement>('[data-autofocus]')
+    window.requestAnimationFrame(() => (preferred ?? focusable()[0] ?? overlayRef.current)?.focus())
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (canCloseRef.current) onCloseRef.current()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const items = focusable()
+      if (items.length === 0) {
+        event.preventDefault()
+        overlayRef.current?.focus()
+        return
+      }
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown)
+      openModalCount = Math.max(0, openModalCount - 1)
+      if (openModalCount === 0) {
+        if (root) {
+          if (rootHadInert) root.setAttribute('inert', '')
+          else root.removeAttribute('inert')
+          if (rootAriaHidden === null) root.removeAttribute('aria-hidden')
+          else root.setAttribute('aria-hidden', rootAriaHidden)
+        }
+        document.body.style.overflow = bodyOverflow
+      }
+      previousFocus?.focus()
+    }
+  }, [])
+
+  return createPortal(
+    <div
+      ref={overlayRef}
+      className="modal-overlay"
+      role="presentation"
+      tabIndex={-1}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && closeOnBackdrop && canClose) onClose()
+      }}
+    >
+      {children}
+    </div>,
+    document.body,
+  )
+}
 
 export function PageHeader({
   eyebrow,

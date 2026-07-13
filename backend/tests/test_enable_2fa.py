@@ -15,7 +15,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from app.integrations.playwright.enable_2fa import Enable2FAError, enable_2fa
+from app.integrations.playwright.enable_2fa import (
+    Enable2FAError,
+    _wait_for_2fa_confirmation,
+    enable_2fa,
+)
 
 
 SECRET = "JBSWY3DPEHPK3PXP"
@@ -44,6 +48,7 @@ def _make_selector_chain(*, click_ok=True, wait_for_ok=True, fill_ok=True,
         else _async_raises(PlaywrightTimeoutError("timeout") if not click_raises else RuntimeError())
     )
     element.screenshot = AsyncMock(return_value=b"fake-qr-png") if screenshot_ok else _async_raises(RuntimeError)
+    element.is_visible = AsyncMock(return_value=False)
     wrapper = MagicMock()
     wrapper.first = element
     return wrapper
@@ -213,3 +218,15 @@ async def test_enable_2fa_passes_email_provider_to_login():
     args, kwargs = mock_login.call_args
     # _login(page, login, password, totp_secret, timeout_ms, email_provider)
     assert args[5] is provider or kwargs.get("email_provider") is provider
+
+
+async def test_enable_2fa_rejected_code_is_not_treated_as_success():
+    page = MagicMock()
+    page.text_content = AsyncMock(return_value="Invalid code. Try again.")
+    code_input = MagicMock()
+    code_input.is_visible = AsyncMock(return_value=True)
+
+    with pytest.raises(Enable2FAError, match="отклонил") as error:
+        await _wait_for_2fa_confirmation(page, code_input, timeout_ms=500)
+
+    assert error.value.code == "setup_2fa_code_rejected"

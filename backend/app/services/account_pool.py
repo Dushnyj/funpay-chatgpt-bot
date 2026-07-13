@@ -9,6 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.models.rental import Rental
+from app.services.limit_eligibility import (
+    apply_limit_scope_filters,
+    observed_codex_primary,
+    observed_codex_secondary,
+)
 
 
 _LIMITS_FRESH_THRESHOLD = timedelta(hours=1)
@@ -74,7 +79,10 @@ class AccountPool:
             .outerjoin(active_rentals, active_rentals.c.account_id == Account.id)
             .where(
                 Account.status == "active",
+                Account.operator_status_override.is_(None),
                 Account.tier_id == criteria.tier_id,
+                SubscriptionTier.is_active.is_(True),
+                SubscriptionTier.is_sellable.is_(True),
                 or_(
                     Account.subscription_expires_at >= required_expires_at,
                     and_(
@@ -84,6 +92,7 @@ class AccountPool:
                 ),
                 AccountLimits.measured_at >= fresh_cutoff,
                 AccountLimits.refresh_status == "ok",
+                AccountLimits.plan_window_status == "ok",
                 func.coalesce(
                     Account.max_active_rentals, default_max_active_rentals
                 )
@@ -93,45 +102,27 @@ class AccountPool:
         if exclude_account_id is not None:
             stmt = stmt.where(Account.id != exclude_account_id)
 
+        stmt = apply_limit_scope_filters(
+            stmt,
+            scope=criteria.scope,
+            min_limit_pct=criteria.min_limit_pct,
+            max_short_pct=criteria.max_5h_pct,
+            max_long_pct=criteria.max_weekly_pct,
+        )
         if criteria.scope == "any":
-            if criteria.max_5h_pct is not None:
-                stmt = stmt.where(
-                    AccountLimits.chat_5h_remaining_pct <= criteria.max_5h_pct,
-                    AccountLimits.codex_5h_remaining_pct <= criteria.max_5h_pct,
-                )
-            if criteria.max_weekly_pct is not None:
-                stmt = stmt.where(
-                    AccountLimits.chat_weekly_remaining_pct <= criteria.max_weekly_pct,
-                    AccountLimits.codex_weekly_remaining_pct <= criteria.max_weekly_pct,
-                )
             stmt = stmt.order_by(Account.subscription_expires_at.asc())
         elif criteria.scope == "chat":
-            if criteria.min_limit_pct is not None:
-                stmt = stmt.where(
-                    AccountLimits.chat_5h_remaining_pct >= criteria.min_limit_pct,
-                    AccountLimits.chat_weekly_remaining_pct >= criteria.min_limit_pct,
-                )
             stmt = stmt.order_by(
                 _lower_limit(
                     AccountLimits.chat_5h_remaining_pct,
                     AccountLimits.chat_weekly_remaining_pct,
                 ).desc()
             )
-        else:  # codex
-            if criteria.min_limit_pct is not None:
-                stmt = stmt.where(
-                    AccountLimits.codex_primary_remaining_pct
-                    >= criteria.min_limit_pct,
-                    or_(
-                        AccountLimits.codex_secondary_remaining_pct.is_(None),
-                        AccountLimits.codex_secondary_remaining_pct
-                        >= criteria.min_limit_pct,
-                    ),
-                )
+        else:  # codex (unknown scopes were made unsellable above)
             stmt = stmt.order_by(
                 _lower_optional_limit(
-                    AccountLimits.codex_primary_remaining_pct,
-                    AccountLimits.codex_secondary_remaining_pct,
+                    observed_codex_primary(),
+                    observed_codex_secondary(),
                 ).desc()
             )
 

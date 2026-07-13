@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from jose import JWTError, jwt
+import jwt
 from passlib.hash import bcrypt
 
 from app.config import get_settings
@@ -55,5 +55,5 @@ def decode_access_token_claims(token: str) -> AccessTokenClaims | None:
         if not isinstance(subject, str) or not isinstance(session_version, int):
             return None
         return AccessTokenClaims(subject=subject, session_version=session_version)
-    except JWTError:
+    except jwt.PyJWTError:
         return None

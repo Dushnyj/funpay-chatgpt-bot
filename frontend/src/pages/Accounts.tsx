@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useStartDeviceAuth } from '../api/accounts'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useRepairAccountCredentials, useStartDeviceAuth, useUpdateAccount } from '../api/accounts'
 import { useTiers } from '../api/catalog'
 import { api, ApiError } from '../api/client'
+import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
-import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
-import type { Account, DeviceAuthSession, DeviceAuthStatus, TotpExport } from '../types/api'
+import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
+import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpExport } from '../types/api'
 import { formatDate, formatDateTime } from '../utils/format'
 
 export default function Accounts() {
   const accountsQuery = useAccounts()
   const tiersQuery = useTiers()
+  const settingsQuery = useSettings()
   const deleteAccount = useDeleteAccount()
   const recheckAccount = useRecheckAccount()
   const startDeviceAuthMutation = useStartDeviceAuth()
@@ -19,6 +21,8 @@ export default function Accounts() {
   const [status, setStatus] = useState('all')
   const [totpModal, setTotpModal] = useState<{ account: Account; data: TotpExport } | null>(null)
   const [totpLoading, setTotpLoading] = useState<number | null>(null)
+  const [editTarget, setEditTarget] = useState<Account | null>(null)
+  const [credentialTarget, setCredentialTarget] = useState<Account | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Account | null>(null)
   const [actionError, setActionError] = useState('')
   const [actionSuccess, setActionSuccess] = useState('')
@@ -29,6 +33,7 @@ export default function Accounts() {
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])
   const tiers = tiersQuery.data ?? []
+  const graphConfigured = settingsQuery.data?.graph_configured === true
   const filteredAccounts = useMemo(() => {
     const query = search.trim().toLowerCase()
     return accounts.filter((account) => {
@@ -142,6 +147,10 @@ export default function Accounts() {
   const connectOutlook = async (account: Account) => {
     setActionError('')
     setActionSuccess('')
+    if (!graphConfigured) {
+      setActionError('Microsoft Graph не настроен на сервере. Добавьте Client ID, Client Secret и callback URL, затем перезапустите приложение.')
+      return
+    }
     setEmailOAuthTarget(account.id)
     try {
       const oauth = await startMicrosoftEmailOAuth(account.id)
@@ -177,6 +186,14 @@ export default function Accounts() {
 
       {actionError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{actionError}</span></div>}
       {actionSuccess && <div className="form-alert form-alert--success" role="status"><Icon name="check" /><span>{actionSuccess}</span></div>}
+      {!settingsQuery.isLoading && (
+        <div className={`form-alert ${graphConfigured ? 'form-alert--success' : 'form-alert--warning'}`} role="status">
+          <Icon name={graphConfigured ? 'check' : 'warning'} />
+          <span>{graphConfigured
+            ? 'Microsoft Graph настроен: Outlook можно подключать безопасно, без хранения пароля почты.'
+            : 'Microsoft Graph не настроен: Outlook OAuth временно недоступен. Обычный TOTP и другие способы добавления аккаунта продолжают работать.'}</span>
+        </div>
+      )}
       {hasDeviceAuthCandidate && !actionSuccess && (
         <div className="form-alert form-alert--info"><Icon name="activity" /><span>Проверка через браузер — основной способ. Перед первым входом включите в ChatGPT: <strong>Настройки → Безопасность и вход → Авторизация кода устройства для Codex</strong>. «Повторить автоматически» запускает headless-вход, который защита OpenAI может заблокировать.</span></div>
       )}
@@ -212,7 +229,7 @@ export default function Accounts() {
         ) : (
           <TableShell>
             <table className="data-table accounts-table">
-              <thead><tr><th>Аккаунт</th><th>Определённый план</th><th>Подписка</th><th>Лимит аренд</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
+              <thead><tr><th>Аккаунт</th><th>План и окно лимита</th><th>Подписка</th><th>Лимит аренд</th><th>Проверка</th><th><span className="sr-only">Действия</span></th></tr></thead>
               <tbody>
                 {filteredAccounts.map((account) => {
                   const totpUnavailable = account.status !== 'active'
@@ -221,14 +238,14 @@ export default function Accounts() {
                     : 'Экспортировать TOTP'
                   return (
                     <tr key={account.id}>
-                    <td>
+                    <td data-label="Аккаунт">
                       <div className="identity-cell"><span className="identity-avatar">{account.login.slice(0, 1).toUpperCase()}</span><span><strong>{account.login}</strong><small>{account.email ?? 'Email для восстановления не задан'}</small>{isOutlookAccount(account) && <small className={account.email_oauth_connected ? 'text-success' : 'text-warning'}>{account.email_oauth_connected ? 'Outlook OAuth подключён' : 'Outlook OAuth не подключён'}</small>}</span></div>
                     </td>
-                    <td><PlanDetection account={account} tierName={tierName(account.tier_id)} /></td>
-                    <td>{account.subscription_expires_at ? formatDate(account.subscription_expires_at) : isFreePlan(account, tiers) ? 'Без срока' : '—'}</td>
-                    <td>{account.max_active_rentals ?? 'По умолчанию'}</td>
-                    <td><ValidationStatus account={account} /></td>
-                    <td>
+                    <td data-label="План и лимит"><PlanDetection account={account} tierName={tierName(account.tier_id)} expectedLongWindowSeconds={expectedCodexLongWindowSeconds(account, tiers)} /></td>
+                    <td data-label="Подписка">{account.subscription_expires_at ? formatDate(account.subscription_expires_at) : isFreePlan(account, tiers) ? 'Без срока' : '—'}</td>
+                    <td data-label="Лимит аренд">{account.max_active_rentals ?? 'По умолчанию'}</td>
+                    <td data-label="Проверка"><ValidationStatus account={account} /></td>
+                    <td data-label="Действия">
                       <div className="row-actions">
                         {isDeviceAuthEligible(account) && (
                           <button className="button button--primary button--compact" onClick={() => startDeviceAuth(account)} disabled={deviceAuthTarget === account.id} aria-label={`Проверить ${account.login} через браузер`}>
@@ -236,8 +253,8 @@ export default function Accounts() {
                           </button>
                         )}
                         {isOutlookAccount(account) && (
-                          <button className={`button button--compact ${account.email_oauth_connected ? 'button--secondary' : 'button--primary'}`} onClick={() => connectOutlook(account)} disabled={emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} Outlook для ${account.login}`} title="Безопасный доступ к кодам почты через Microsoft OAuth">
-                            {emailOAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name={account.email_oauth_connected ? 'refresh' : 'shield'} size={15} />}{account.email_oauth_connected ? 'Outlook' : 'Почта OAuth'}
+                          <button className={`button button--compact ${account.email_oauth_connected ? 'button--secondary' : 'button--primary'}`} onClick={() => connectOutlook(account)} disabled={!graphConfigured || emailOAuthTarget === account.id} aria-label={`${account.email_oauth_connected ? 'Переподключить' : 'Подключить'} Outlook для ${account.login}`} title={graphConfigured ? 'Безопасный доступ к кодам почты через Microsoft OAuth' : 'Microsoft Graph не настроен на сервере'}>
+                            {emailOAuthTarget === account.id ? <span className={`spinner ${account.email_oauth_connected ? '' : 'spinner--light'}`} /> : <Icon name={account.email_oauth_connected ? 'refresh' : 'shield'} size={15} />}{account.email_oauth_connected ? 'Outlook' : 'Почта OAuth'}
                           </button>
                         )}
                         {!isValidationInProgress(account) && (
@@ -245,6 +262,12 @@ export default function Accounts() {
                             {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
                           </button>
                         )}
+                        <button className="icon-button" onClick={() => setCredentialTarget(account)} aria-label={`Исправить данные входа ${account.login}`} title="Исправить логин, пароль, TOTP или почту">
+                          <Icon name="shield" />
+                        </button>
+                        <button className="icon-button" onClick={() => setEditTarget(account)} aria-label={`Редактировать параметры ${account.login}`} title="Редактировать срок, ёмкость и статус">
+                          <Icon name="settings" />
+                        </button>
                         <span className="action-help" title={totpHint} tabIndex={totpUnavailable ? 0 : undefined} aria-label={totpUnavailable ? totpHint : undefined}>
                           <button className="icon-button" onClick={() => exportTotp(account)} disabled={totpLoading === account.id || totpUnavailable} aria-label={totpUnavailable ? `Экспорт TOTP для ${account.login} недоступен: аккаунт должен пройти проверку` : `Экспорт TOTP для ${account.login}`}>
                             {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" />}
@@ -264,7 +287,7 @@ export default function Accounts() {
         )}
       </section>
 
-      {showForm && <AddAccountDialog onClose={() => setShowForm(false)} />}
+      {showForm && <AddAccountDialog graphConfigured={graphConfigured} onClose={() => setShowForm(false)} />}
       {totpModal && <TotpDialog modal={totpModal} onClose={() => setTotpModal(null)} />}
       {deviceAuthModal && (
         <DeviceAuthDialog
@@ -273,8 +296,10 @@ export default function Accounts() {
           onCompleted={completeDeviceAuth}
         />
       )}
+      {credentialTarget && <RepairCredentialsDialog account={credentialTarget} onClose={() => setCredentialTarget(null)} onSaved={() => { setCredentialTarget(null); setActionError(''); setActionSuccess('Данные входа обновлены. Аккаунт поставлен на обязательную повторную проверку.') }} />}
+      {editTarget && <EditAccountDialog account={editTarget} onClose={() => setEditTarget(null)} onSaved={() => { setEditTarget(null); setActionError(''); setActionSuccess('Операторские параметры аккаунта сохранены.') }} />}
       {deleteTarget && (
-        <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setDeleteTarget(null)}>
+        <ModalOverlay onClose={() => setDeleteTarget(null)}>
           <div className="modal modal--compact" role="alertdialog" aria-modal="true" aria-labelledby="delete-account-title">
             <div className="modal__danger-icon"><Icon name="trash" size={22} /></div>
             <h2 id="delete-account-title">Удалить аккаунт?</h2>
@@ -284,7 +309,7 @@ export default function Accounts() {
               <button className="button button--danger" onClick={confirmDelete} disabled={deleteAccount.isPending}>{deleteAccount.isPending ? 'Удаляем…' : 'Удалить'}</button>
             </div>
           </div>
-        </div>
+        </ModalOverlay>
       )}
     </div>
   )
@@ -310,12 +335,13 @@ function isValidationInProgress(account: Account) {
 }
 
 function validationState(account: Account) {
+  if (account.operator_status_override) return account.operator_status_override
   if (account.validation_job?.status === 'failed' || account.status === 'validation_failed') return 'validation_failed'
   if (isValidationInProgress(account)) return 'detecting'
   return account.status
 }
 
-function PlanDetection({ account, tierName }: { account: Account; tierName: string }) {
+function PlanDetection({ account, tierName, expectedLongWindowSeconds }: { account: Account; tierName: string; expectedLongWindowSeconds: number | null }) {
   const details = [
     account.plan_raw_type ? `raw: ${account.plan_raw_type}` : null,
     account.plan_source ? `источник: ${humanizePlanSource(account.plan_source)}` : null,
@@ -327,27 +353,59 @@ function PlanDetection({ account, tierName }: { account: Account; tierName: stri
       <span className={`soft-badge ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName}</span>
       {details.length > 0 && <small>{details.join(' · ')}</small>}
       {account.plan_detected_at && <small>Определён {formatDate(account.plan_detected_at)}</small>}
-      <ObservedLimits account={account} />
+      <PlanWindowContract account={account} expectedLongWindowSeconds={expectedLongWindowSeconds} />
+      <ObservedLimits account={account} expectedLongWindowSeconds={expectedLongWindowSeconds} />
     </div>
   )
 }
 
-function ObservedLimits({ account }: { account: Account }) {
+function PlanWindowContract({ account, expectedLongWindowSeconds }: { account: Account; expectedLongWindowSeconds: number | null }) {
+  const status = account.limits?.plan_window_status ?? 'unknown'
+  const expected = account.limits?.expected_long_window_seconds ?? expectedLongWindowSeconds
+  const expectedLabel = expected == null ? null : formatObservedWindow(expected)
+  const planKind = expected === 30 * 86_400 ? 'Free' : expected == null ? null : 'платный тариф'
+
+  const label = status === 'ok'
+    ? 'Длинное окно подтверждено'
+    : status === 'mismatch'
+      ? 'Окно не совпало'
+      : 'Окно ещё не проверено'
+  const description = status === 'mismatch'
+    ? `${expectedLabel ? `Ожидалось длинное окно ${expectedLabel}. ` : ''}Аккаунт исключён из выдачи до успешной повторной проверки.`
+    : status === 'ok'
+      ? `Длинное окно Codex: ${expectedLabel ?? 'определено OpenAI'}${planKind ? ` · ${planKind}` : ''}.`
+      : expectedLabel
+        ? `Ожидается свежий замер длинного окна ${expectedLabel}${planKind ? ` · ${planKind}` : ''}.`
+        : 'Сначала система должна определить тариф и получить свежие окна Codex.'
+
+  return (
+    <div className={`plan-window-contract plan-window-contract--${status}`}>
+      <StatusBadge value={status} label={label} />
+      <small>{description}</small>
+    </div>
+  )
+}
+
+function ObservedLimits({ account, expectedLongWindowSeconds }: { account: Account; expectedLongWindowSeconds: number | null }) {
   const limits = account.limits
   if (!limits?.measured_at) return null
 
   const measuredAt = new Date(limits.measured_at)
   const stale = limits.refresh_status !== 'ok'
     || Number.isNaN(measuredAt.getTime())
-    || Date.now() - measuredAt.getTime() > 15 * 60 * 1_000
+    || Date.now() - measuredAt.getTime() > 60 * 60 * 1_000
+
+  const expected = limits.expected_long_window_seconds ?? expectedLongWindowSeconds
 
   const windows = [
     {
+      seconds: limits.codex_primary_window_seconds,
       label: formatObservedWindow(limits.codex_primary_window_seconds),
       remaining: limits.codex_primary_remaining_pct,
       resetsAt: limits.codex_primary_resets_at,
     },
     {
+      seconds: limits.codex_secondary_window_seconds,
       label: formatObservedWindow(limits.codex_secondary_window_seconds),
       remaining: limits.codex_secondary_remaining_pct,
       resetsAt: limits.codex_secondary_resets_at,
@@ -358,10 +416,10 @@ function ObservedLimits({ account }: { account: Account }) {
 
   return (
     <div className={`observed-limits ${stale ? 'observed-limits--stale' : ''}`}>
-      <small className="observed-limits__meta">Codex · замер {formatDateTime(limits.measured_at)}{stale ? ' · данные устарели' : ''}</small>
+      <small className="observed-limits__meta">Фактические окна Codex от OpenAI · замер {formatDateTime(limits.measured_at)}{stale ? ' · данные устарели' : ''}</small>
       {windows.map((window, index) => (
         <span key={`${window.label}-${index}`}>
-          <strong>Окно {window.label}:</strong> {window.remaining == null ? 'остаток неизвестен' : `осталось ${window.remaining}%`}
+          <strong>{observedWindowKind(window.seconds, expected)} {window.label}:</strong> {window.remaining == null ? 'остаток неизвестен' : `осталось ${window.remaining}%`}
           {window.resetsAt && <small>сброс {formatDateTime(window.resetsAt)}</small>}
         </span>
       ))}
@@ -378,6 +436,12 @@ function formatObservedWindow(seconds: number | null) {
   if (seconds % 3_600 === 0) return `${seconds / 3_600} ч`
   if (seconds % 60 === 0) return `${seconds / 60} мин`
   return `${seconds} сек`
+}
+
+function observedWindowKind(seconds: number | null, expectedLongWindowSeconds: number | null) {
+  if (seconds != null && expectedLongWindowSeconds != null && seconds === expectedLongWindowSeconds) return 'Длинное окно'
+  if (seconds != null && seconds <= 6 * 3_600) return 'Короткое окно'
+  return 'Наблюдаемое окно'
 }
 
 function humanizePlanSource(source: string) {
@@ -490,7 +554,165 @@ function humanizeEmailOAuthError(reason: string | null) {
   return labels[reason ?? ''] ?? 'Не удалось подключить Outlook через Microsoft OAuth.'
 }
 
-function AddAccountDialog({ onClose }: { onClose: () => void }) {
+function accountStatusLabel(status: string) {
+  const labels: Record<string, string> = {
+    active: 'активен',
+    disabled: 'отключён',
+    maintenance: 'обслуживание',
+    pending_validation: 'проверяется',
+    validation_failed: 'ошибка проверки',
+  }
+  return labels[status] ?? status.replaceAll('_', ' ')
+}
+
+function RepairCredentialsDialog({ account, onClose, onSaved }: { account: Account; onClose: () => void; onSaved: () => void }) {
+  const repairCredentials = useRepairAccountCredentials()
+  const [error, setError] = useState('')
+  const [form, setForm] = useState({
+    login: '',
+    password: '',
+    totpSecret: '',
+    email: '',
+    emailPassword: '',
+    clearTotp: false,
+    clearEmail: false,
+    clearEmailPassword: false,
+  })
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setError('')
+    const body: AccountCredentialsUpdate = {}
+    const login = form.login.trim()
+    const email = form.email.trim()
+    const totpSecret = form.totpSecret.trim().replaceAll(' ', '')
+
+    if (login) body.login = login
+    if (form.password) body.password = form.password
+    if (form.clearTotp) body.totp_secret = null
+    else if (totpSecret) body.totp_secret = totpSecret
+    if (form.clearEmail) {
+      body.email = null
+      body.email_password = null
+    } else {
+      if (email) body.email = email
+      if (form.clearEmailPassword) body.email_password = null
+      else if (form.emailPassword) body.email_password = form.emailPassword
+    }
+
+    if (Object.keys(body).length === 0) {
+      setError('Заполните хотя бы одно новое значение или явно выберите, что нужно очистить.')
+      return
+    }
+
+    try {
+      await repairCredentials.mutateAsync({ id: account.id, ...body })
+      onSaved()
+    } catch (cause) {
+      setError(cause instanceof ApiError ? cause.message : 'Не удалось обновить данные входа')
+    }
+  }
+
+  return (
+    <ModalOverlay onClose={onClose}>
+      <div className="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="repair-credentials-title">
+        <div className="modal__header">
+          <div><span className="eyebrow">Безопасное исправление</span><h2 id="repair-credentials-title">Данные входа {account.login}</h2><p>Заполните только то, что нужно заменить. Сохранённые пароли и TOTP никогда не подставляются обратно в форму.</p></div>
+          <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>
+        </div>
+        <form className="form-stack" onSubmit={submit}>
+          {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>Пустое поле означает «не менять». После сохранения аккаунт станет недоступен для выдачи до полной повторной проверки.</span></div>
+          {account.email_oauth_connected && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>При смене или удалении email текущее подключение Microsoft OAuth будет сброшено. Новый Outlook потребуется подключить заново.</span></div>}
+
+          <div className="form-grid">
+            <label className="field"><span className="field__label">Новый логин ChatGPT</span><input data-autofocus value={form.login} onChange={(event) => setForm((current) => ({ ...current, login: event.target.value }))} placeholder={`Сейчас: ${account.login}`} autoComplete="off" /><span className="field__hint">Оставьте пустым, чтобы не менять.</span></label>
+            <label className="field"><span className="field__label">Новый пароль ChatGPT</span><input type="password" value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} placeholder="Не изменять" autoComplete="new-password" /><span className="field__hint">Текущее значение скрыто и недоступно через API.</span></label>
+          </div>
+
+          <div className="form-grid">
+            <div className="credential-repair-field">
+              <label className="field"><span className="field__label">Новый TOTP setup key</span><input value={form.totpSecret} onChange={(event) => setForm((current) => ({ ...current, totpSecret: event.target.value.toUpperCase() }))} placeholder="Не изменять" autoComplete="off" disabled={form.clearTotp} /><span className="field__hint">Base32-ключ, не одноразовый шестизначный код.</span></label>
+              <label className="credential-clear"><input type="checkbox" checked={form.clearTotp} onChange={(event) => setForm((current) => ({ ...current, clearTotp: event.target.checked }))} /><span>Очистить сохранённый TOTP</span></label>
+            </div>
+            <div className="credential-repair-field">
+              <label className="field"><span className="field__label">Новый email</span><input type="email" value={form.email} onChange={(event) => setForm((current) => ({ ...current, email: event.target.value }))} placeholder={account.email ? `Сейчас: ${account.email}` : 'Не задан'} autoComplete="off" disabled={form.clearEmail} /></label>
+              <label className="credential-clear"><input type="checkbox" checked={form.clearEmail} onChange={(event) => setForm((current) => ({ ...current, clearEmail: event.target.checked }))} /><span>Удалить email и доступ к почте</span></label>
+            </div>
+          </div>
+
+          <div className="credential-repair-field">
+            <label className="field"><span className="field__label">Новый пароль почты или пароль приложения</span><input type="password" value={form.emailPassword} onChange={(event) => setForm((current) => ({ ...current, emailPassword: event.target.value }))} placeholder="Не изменять" autoComplete="new-password" disabled={form.clearEmail || form.clearEmailPassword} /><span className="field__hint">Для Outlook предпочтительнее Microsoft OAuth; обычный пароль не подставляется и не отображается.</span></label>
+            <label className="credential-clear"><input type="checkbox" checked={form.clearEmail || form.clearEmailPassword} disabled={form.clearEmail} onChange={(event) => setForm((current) => ({ ...current, clearEmailPassword: event.target.checked }))} /><span>Очистить сохранённый пароль почты</span></label>
+          </div>
+
+          <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={repairCredentials.isPending}>{repairCredentials.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <><Icon name="shield" />Сохранить и перепроверить</>}</button></div>
+        </form>
+      </div>
+    </ModalOverlay>
+  )
+}
+
+function EditAccountDialog({ account, onClose, onSaved }: { account: Account; onClose: () => void; onSaved: () => void }) {
+  const updateAccount = useUpdateAccount()
+  const [error, setError] = useState('')
+  const [form, setForm] = useState({
+    expiresAt: toDateTimeLocal(account.subscription_expires_at),
+    maxRentals: account.max_active_rentals == null ? '' : String(account.max_active_rentals),
+    operatorStatus: (account.operator_status_override ?? '') as '' | 'maintenance' | 'disabled',
+    notes: account.notes ?? '',
+  })
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setError('')
+    const maxRentals = form.maxRentals === '' ? null : Number(form.maxRentals)
+    if (maxRentals !== null && (!Number.isInteger(maxRentals) || maxRentals < 1 || maxRentals > 100)) {
+      setError('Лимит одновременных аренд должен быть от 1 до 100 или пустым для системного значения.')
+      return
+    }
+    const expiresAt = form.expiresAt ? new Date(form.expiresAt) : null
+    if (expiresAt && Number.isNaN(expiresAt.getTime())) {
+      setError('Укажите корректные дату и время окончания подписки.')
+      return
+    }
+
+    try {
+      const safeStatus = form.operatorStatus
+      await updateAccount.mutateAsync({
+        id: account.id,
+        subscription_expires_at: expiresAt?.toISOString() ?? null,
+        max_active_rentals: maxRentals,
+        ...(safeStatus ? { status: safeStatus } : {}),
+        notes: form.notes.trim() || null,
+      })
+      onSaved()
+    } catch (cause) {
+      setError(cause instanceof ApiError ? cause.message : 'Не удалось сохранить параметры аккаунта')
+    }
+  }
+
+  return (
+    <ModalOverlay onClose={onClose}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="edit-account-title">
+        <div className="modal__header"><div><span className="eyebrow">Операторские параметры</span><h2 id="edit-account-title">Настроить {account.login}</h2><p>Тариф здесь не меняется: Free, Go, Plus и Pro определяются только автоматической проверкой OpenAI.</p></div><button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button></div>
+        <form className="form-stack" onSubmit={submit}>
+          {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для платного тарифа дата окончания служит проверенным fallback, если OpenAI не вернул её сам. Для Free оставьте поле пустым.</span></div>
+          <label className="field"><span className="field__label">Подписка активна до</span><input data-autofocus type="datetime-local" value={form.expiresAt} onChange={(event) => setForm((current) => ({ ...current, expiresAt: event.target.value }))} /><span className="field__hint">Пустое значение означает, что ручной fallback не задан.</span></label>
+          <div className="form-grid">
+            <label className="field"><span className="field__label">Одновременных аренд</span><input type="number" min="1" max="100" value={form.maxRentals} onChange={(event) => setForm((current) => ({ ...current, maxRentals: event.target.value }))} placeholder="По умолчанию" /></label>
+            <label className="field"><span className="field__label">Ручная приостановка</span><select value={form.operatorStatus} onChange={(event) => setForm((current) => ({ ...current, operatorStatus: event.target.value as '' | 'maintenance' | 'disabled' }))}><option value="">Не менять текущий статус</option><option value="maintenance">Перевести на обслуживание</option><option value="disabled">Отключить аккаунт</option></select><span className="field__hint">Сейчас: {accountStatusLabel(account.status)}. Возврат в работу выполняется только повторной проверкой аккаунта.</span></label>
+          </div>
+          <label className="field"><span className="field__label">Заметка оператора</span><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} maxLength={4000} placeholder="Причина ручной даты, обслуживание или другой контекст" /></label>
+          <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={updateAccount.isPending}>{updateAccount.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <><Icon name="check" />Сохранить</>}</button></div>
+        </form>
+      </div>
+    </ModalOverlay>
+  )
+}
+
+function AddAccountDialog({ graphConfigured, onClose }: { graphConfigured: boolean; onClose: () => void }) {
   const createAccount = useCreateAccount()
   const [mode, setMode] = useState<'totp' | 'outlook' | 'email'>('totp')
   const [error, setError] = useState('')
@@ -513,6 +735,10 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
     }
     if (mode === 'outlook' && !isOutlookAddress(form.email)) {
       setError('Для Microsoft OAuth укажите адрес Outlook, Hotmail, Live или MSN.')
+      return
+    }
+    if (mode === 'outlook' && !graphConfigured) {
+      setError('Microsoft Graph не настроен на сервере. Выберите TOTP или настройку через email.')
       return
     }
     setSubmitting(true)
@@ -544,7 +770,7 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <ModalOverlay onClose={onClose}>
       <div className="modal modal--wide" role="dialog" aria-modal="true" aria-labelledby="add-account-title">
         <div className="modal__header">
           <div><span className="eyebrow">Новый ресурс</span><h2 id="add-account-title">Добавить ChatGPT-аккаунт</h2><p>Секреты будут зашифрованы перед сохранением.</p></div>
@@ -553,7 +779,7 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
         <form onSubmit={submit} className="form-stack">
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
           <div className="form-grid">
-            <label className="field"><span className="field__label">Логин ChatGPT</span><input value={form.login} onChange={(event) => setForm({ ...form, login: event.target.value })} placeholder="name@example.com" autoComplete="off" required /></label>
+            <label className="field"><span className="field__label">Логин ChatGPT</span><input data-autofocus value={form.login} onChange={(event) => setForm({ ...form, login: event.target.value })} placeholder="name@example.com" autoComplete="off" required /></label>
             <label className="field"><span className="field__label">Пароль ChatGPT</span><input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Пароль аккаунта" autoComplete="new-password" required /></label>
           </div>
 
@@ -563,10 +789,12 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
             <legend>Как настроить двухфакторную защиту</legend>
             <div className="segmented-control">
               <button type="button" className={mode === 'totp' ? 'active' : ''} onClick={() => setMode('totp')}><Icon name="key" />TOTP уже включён</button>
-              <button type="button" className={mode === 'outlook' ? 'active' : ''} onClick={() => setMode('outlook')}><Icon name="shield" />Outlook OAuth</button>
+              <button type="button" className={mode === 'outlook' ? 'active' : ''} onClick={() => setMode('outlook')} disabled={!graphConfigured} title={graphConfigured ? 'Подключить Outlook через Microsoft Graph' : 'Microsoft Graph не настроен'}><Icon name="shield" />Outlook OAuth</button>
               <button type="button" className={mode === 'email' ? 'active' : ''} onClick={() => setMode('email')}><Icon name="shield" />Настроить через email</button>
             </div>
           </fieldset>
+
+          {!graphConfigured && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Outlook OAuth появится после настройки Microsoft Graph на сервере. До этого используйте TOTP setup key или другой поддерживаемый способ доступа к почте.</span></div>}
 
           {mode === 'totp' ? (
             <label className="field"><span className="field__label">TOTP setup key</span><input value={form.totp_secret} onChange={(event) => setForm({ ...form, totp_secret: event.target.value.toUpperCase().replaceAll(' ', '') })} placeholder="JBSWY3DPEHPK3PXP" autoComplete="off" /><span className="field__hint">Base32-ключ из настроек 2FA. Не QR-код и не одноразовый шестизначный код.</span></label>
@@ -583,18 +811,12 @@ function AddAccountDialog({ onClose }: { onClose: () => void }) {
           <div className="modal__actions"><button type="button" className="button button--secondary" onClick={onClose}>Отмена</button><button type="submit" className="button button--primary" disabled={submitting}>{submitting ? <><span className="spinner spinner--light" />Сохраняем…</> : <>{createdOutlookAccountId === null ? 'Добавить аккаунт' : 'Повторить OAuth'}<Icon name="arrow-right" /></>}</button></div>
         </form>
       </div>
-    </div>
+    </ModalOverlay>
   )
 }
 
 function TotpDialog({ modal, onClose }: { modal: { account: Account; data: TotpExport }; onClose: () => void }) {
   const [copied, setCopied] = useState<'secret' | 'uri' | null>(null)
-
-  useEffect(() => {
-    const handler = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
 
   const copy = async (kind: 'secret' | 'uri', value: string) => {
     await navigator.clipboard.writeText(value)
@@ -603,7 +825,7 @@ function TotpDialog({ modal, onClose }: { modal: { account: Account; data: TotpE
   }
 
   return (
-    <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+    <ModalOverlay onClose={onClose}>
       <div className="modal totp-dialog" role="dialog" aria-modal="true" aria-labelledby="totp-title">
         <div className="modal__header"><div><span className="eyebrow">Чувствительные данные</span><h2 id="totp-title">TOTP для {modal.account.login}</h2></div><button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button></div>
         <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Любой, кто получит этот ключ или QR-код, сможет генерировать коды входа. Не отправляйте его покупателю.</span></div>
@@ -612,7 +834,7 @@ function TotpDialog({ modal, onClose }: { modal: { account: Account; data: TotpE
         <label className="field"><span className="field__label">otpauth URI</span><span className="copy-field"><input readOnly value={modal.data.otpauth_uri} /><button type="button" onClick={() => copy('uri', modal.data.otpauth_uri)}><Icon name={copied === 'uri' ? 'check' : 'copy'} />{copied === 'uri' ? 'Скопировано' : 'Копировать'}</button></span></label>
         <div className="modal__actions"><button className="button button--primary" onClick={onClose}>Готово</button></div>
       </div>
-    </div>
+    </ModalOverlay>
   )
 }
 
@@ -629,7 +851,6 @@ function DeviceAuthDialog({
   const [pollError, setPollError] = useState('')
   const [copied, setCopied] = useState(false)
   const [copyError, setCopyError] = useState('')
-  const dialogRef = useRef<HTMLDivElement>(null)
   const intervalMs = Math.max(1, modal.session.interval_seconds) * 1_000
 
   useEffect(() => {
@@ -665,37 +886,6 @@ function DeviceAuthDialog({
     }
   }, [intervalMs, modal.account.id, modal.session.session_id, onCompleted])
 
-  useEffect(() => {
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    const dialog = dialogRef.current
-    const focusable = () => Array.from(dialog?.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])') ?? [])
-    focusable()[0]?.focus()
-
-    const handler = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        if (result.status !== 'pending') onClose()
-        return
-      }
-      if (event.key !== 'Tab') return
-      const items = focusable()
-      if (items.length === 0) return
-      const first = items[0]
-      const last = items[items.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    window.addEventListener('keydown', handler)
-    return () => {
-      window.removeEventListener('keydown', handler)
-      previousFocus?.focus()
-    }
-  }, [onClose, result.status])
-
   const copyCode = async () => {
     try {
       await navigator.clipboard.writeText(modal.session.user_code)
@@ -713,8 +903,8 @@ function DeviceAuthDialog({
     : result.error_detail ?? humanizeDeviceAuthError(result.error_code ?? '')
 
   return (
-    <div className="modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && result.status !== 'pending' && onClose()}>
-      <div ref={dialogRef} className="modal device-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="device-auth-title" aria-describedby="device-auth-description">
+    <ModalOverlay onClose={onClose} canClose={result.status !== 'pending'} closeOnBackdrop={result.status !== 'pending'}>
+      <div className="modal device-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="device-auth-title" aria-describedby="device-auth-description">
         <div className="modal__header">
           <div><span className="eyebrow">Проверка с вашим участием</span><h2 id="device-auth-title">Подтвердите вход в браузере</h2><p id="device-auth-description">Страница входа открыта в новой вкладке. Аккаунт обновится автоматически после подтверждения.</p></div>
           {result.status !== 'pending' && <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>}
@@ -746,7 +936,7 @@ function DeviceAuthDialog({
           <a className="button button--primary" href={modal.session.verification_url} target="_blank" rel="noreferrer"><Icon name="external" />Открыть страницу входа</a>
         </div>
       </div>
-    </div>
+    </ModalOverlay>
   )
 }
 
@@ -756,6 +946,13 @@ function isFreePlan(account: Account, tiers: Array<{ id: number; code?: string }
   return candidates.some((value) => value != null && ['free', 'chatgpt_free', 'chatgptfreeplan'].includes(value.toLowerCase()))
 }
 
+function expectedCodexLongWindowSeconds(account: Account, tiers: Array<{ id: number; code?: string }>) {
+  if (account.limits?.expected_long_window_seconds != null) return account.limits.expected_long_window_seconds
+  if (isFreePlan(account, tiers)) return 30 * 86_400
+  if (account.tier_id !== null) return 7 * 86_400
+  return null
+}
+
 function isOutlookAddress(value: string | null | undefined) {
   if (!value || !value.includes('@')) return false
   return ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'].includes(value.trim().toLowerCase().split('@').pop() ?? '')
@@ -763,6 +960,14 @@ function isOutlookAddress(value: string | null | undefined) {
 
 function isOutlookAccount(account: Account) {
   return isOutlookAddress(account.email)
+}
+
+function toDateTimeLocal(value: string | null) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
 function formatDeviceAuthExpiry(value: string) {

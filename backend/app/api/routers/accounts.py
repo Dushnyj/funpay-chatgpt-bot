@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import (
     AccountCreate,
+    AccountCredentialsUpdate,
     AccountLimitsOut,
     AccountOut,
     AccountUpdate,
@@ -251,7 +252,12 @@ async def recheck_account(
     account_id: int,
     session: AsyncSession = Depends(get_db_session),
 ):
-    account = await session.get(Account, account_id)
+    # Serialize manual state changes with allocation and credential repair.
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == account_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     try:
@@ -267,6 +273,7 @@ async def recheck_account(
             status_code=409,
             detail=f"Validation job {exc.job_type} is already running",
         ) from exc
+    account.operator_status_override = None
     account.status = "pending_validation"
     session.add(
         AuditLog(
@@ -291,7 +298,12 @@ async def start_device_auth(
     account_id: int,
     session: AsyncSession = Depends(get_db_session),
 ):
-    account = await session.get(Account, account_id)
+    # Serialize the transition to pending validation with account allocation.
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == account_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     try:
@@ -355,13 +367,156 @@ async def update_account(account_id: int, req: AccountUpdate, session: AsyncSess
     account = await session.get(Account, account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
-    for field, value in req.model_dump(exclude_unset=True).items():
+    changes = req.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(account, field, value)
+    if "status" in changes:
+        account.operator_status_override = changes["status"]
     await session.commit()
     await session.refresh(account)
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
     return _account_out(account, jobs.get(account.id), email_oauth)
+
+
+@router.patch(
+    "/{account_id}/credentials",
+    response_model=AccountOut,
+    status_code=202,
+)
+async def update_account_credentials(
+    account_id: int,
+    req: AccountCredentialsUpdate,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Replace write-only credentials and force a fresh validation pass."""
+
+    # The Account row is also the allocator's serialization primitive. Lock it
+    # before checking rentals so a concurrent purchase cannot appear between
+    # the guard and the credential update commit.
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == account_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    active_rental = await session.scalar(
+        select(Rental.id).where(
+            Rental.account_id == account_id,
+            Rental.status.in_(["active", "expiry_pending"]),
+        ).limit(1)
+    )
+    if active_rental is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Account credentials cannot be changed during an active rental",
+        )
+    email_oauth = await session.get(EmailOAuthCredential, account.id)
+
+    changes = req.model_dump(exclude_unset=True)
+    if changes.get("login", ...) is None:
+        raise HTTPException(status_code=422, detail="Login cannot be cleared")
+    if changes.get("password", ...) is None:
+        raise HTTPException(status_code=422, detail="Password cannot be cleared")
+    for field, limit in (
+        ("password", 4096),
+        ("totp_secret", 256),
+        ("email_password", 4096),
+    ):
+        value = changes.get(field)
+        if value is not None and (not value or len(value) > limit):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid {field.replace('_', ' ')} value",
+            )
+
+    resulting_email = changes.get("email", account.email)
+    if changes.get("email_password") is not None and resulting_email is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Email password requires an email address",
+        )
+
+    changed_fields = set(changes)
+    if "login" in changes:
+        account.login = changes["login"]
+    if "password" in changes:
+        account.password_encrypted = changes["password"]
+    if "totp_secret" in changes:
+        account.totp_secret_encrypted = changes["totp_secret"] or ""
+
+    old_email = account.email.strip().casefold() if account.email else None
+    new_email = resulting_email.strip().casefold() if resulting_email else None
+    email_changed = old_email != new_email
+    if "email" in changes:
+        account.email = changes["email"]
+    if "email_password" in changes:
+        account.email_password_encrypted = changes["email_password"]
+    elif email_changed:
+        # A password for the previous mailbox must never be tried against a
+        # newly supplied address.
+        account.email_password_encrypted = None
+        changed_fields.add("email_password")
+
+    if email_changed and email_oauth is not None:
+        await session.delete(email_oauth)
+        email_oauth = None
+        changed_fields.add("email_oauth")
+
+    # Surface a duplicate login before queue queries can trigger an implicit
+    # autoflush. The final commit remains guarded for a concurrent duplicate.
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Login already exists")
+
+    account.operator_status_override = None
+    account.status = "pending_validation"
+    try:
+        job = await _check_job_queue.enqueue_exclusive(
+            session,
+            account.id,
+            priority="manual",
+            job_type="full_validation",
+            superseded_by="credential_repair",
+        )
+    except ActiveJobConflict as exc:
+        # The running worker owns a snapshot of the previous credentials. Let
+        # it finish, but require exactly one follow-up validation afterward.
+        account.validation_rerun_requested = True
+        job = await session.get(AccountCheckJob, exc.job_id)
+        if job is None:  # Defensive: the queue row is durable in normal use.
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="Validation is already running")
+        rerun_requested = True
+    else:
+        account.validation_rerun_requested = False
+        rerun_requested = False
+
+    session.add(
+        AuditLog(
+            event_type="account_credentials_updated",
+            account_id=account.id,
+            metadata_={
+                "actor": "admin",
+                "changed_fields": sorted(changed_fields),
+                "job_id": job.id,
+                "rerun_requested": rerun_requested,
+            },
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Login already exists")
+
+    await session.refresh(account)
+    await session.refresh(job)
+    return _account_out(account, job, email_oauth)
 
 
 @router.delete("/{account_id}", status_code=204)

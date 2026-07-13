@@ -158,6 +158,8 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
 )
 
 PLANS_BY_CODE = {plan.code: plan for plan in SYSTEM_SUBSCRIPTION_PLANS}
+FREE_LONG_WINDOW_SECONDS = 30 * 24 * 60 * 60
+PAID_LONG_WINDOW_SECONDS = 7 * 24 * 60 * 60
 _PLANS_BY_ALIAS = {
     alias: plan
     for plan in SYSTEM_SUBSCRIPTION_PLANS
@@ -212,3 +214,39 @@ def plan_for_raw(raw: str | None) -> SubscriptionPlanDefinition | None:
     if not cleaned:
         return None
     return _PLANS_BY_ALIAS.get(_normalise_raw(cleaned))
+
+
+def expected_long_window_seconds(plan_code: str) -> int:
+    if plan_code not in PLANS_BY_CODE:
+        raise ValueError(f"Unsupported subscription plan code: {plan_code}")
+    return (
+        FREE_LONG_WINDOW_SECONDS
+        if plan_code == "free"
+        else PAID_LONG_WINDOW_SECONDS
+    )
+
+
+def validate_plan_window_contract(
+    plan_code: str,
+    primary_window_seconds: int | None,
+    secondary_window_seconds: int | None,
+) -> tuple[bool, int]:
+    """Validate the observed long Codex window for a resolved plan.
+
+    Paid accounts commonly expose a 5-hour primary window and a 7-day
+    secondary window. Free currently exposes the 30-day window as primary.
+    The contract therefore searches both exact observed windows instead of
+    assigning product meaning to OpenAI's positional names.
+    """
+
+    expected = expected_long_window_seconds(plan_code)
+    observed = {
+        value
+        for value in (primary_window_seconds, secondary_window_seconds)
+        if value is not None and value > 0
+    }
+    if expected not in observed:
+        return False, expected
+    if plan_code != "free" and FREE_LONG_WINDOW_SECONDS in observed:
+        return False, expected
+    return True, expected

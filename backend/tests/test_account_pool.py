@@ -11,7 +11,9 @@ from app.services.account_pool import AccountPool, AccountCriteria
 
 
 async def _seed_tier_ds(session: AsyncSession):
-    tier = SubscriptionTier(name="Plus", is_active=True)
+    tier = SubscriptionTier(
+        code="plus", name="Plus", is_active=True, is_sellable=True,
+    )
     session.add(tier)
     duration = Duration(days=7, is_enabled=True, sort_order=10)
     session.add(duration)
@@ -57,6 +59,11 @@ async def _add_account(
         codex_weekly_remaining_pct=codex_weekly,
         measured_at=datetime.now(timezone.utc),
         refresh_status=refresh_status,
+        plan_type=tier.code or "plus",
+        plan_window_status="ok",
+        expected_long_window_seconds=(
+            30 * 24 * 60 * 60 if tier.code == "free" else 7 * 24 * 60 * 60
+        ),
     )
     session.add(limits)
     await session.flush()
@@ -102,6 +109,33 @@ async def test_acquire_filters_out_expired_subscription(session: AsyncSession):
         min_limit_pct=None, max_5h_pct=None, max_weekly_pct=None,
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
+    assert result is None
+
+
+async def test_operator_override_blocks_late_validation_status_race(
+    session: AsyncSession,
+):
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    # Simulate a late validation commit that wrote status=active after the
+    # operator had already persisted a maintenance override.
+    account.operator_status_override = "maintenance"
+    account.status = "active"
+    await session.flush()
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_days=duration.days,
+            scope="any",
+            min_limit_pct=None,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
     assert result is None
 
 
@@ -304,3 +338,118 @@ async def test_acquire_excluding_does_not_mutate_excluded_account(session: Async
 
     assert result is not None and result.id == candidate.id
     assert excluded.status == "active"
+
+
+@pytest.mark.parametrize("tier_flag", ["is_active", "is_sellable"])
+async def test_acquire_honours_operator_tier_switch(
+    session: AsyncSession,
+    tier_flag: str,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    await _add_account(session, tier)
+    setattr(tier, tier_flag, False)
+    await session.flush()
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_days=duration.days,
+            scope="any",
+            min_limit_pct=None,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+    assert result is None
+
+
+@pytest.mark.parametrize("window_status", ["unknown", "mismatch"])
+async def test_acquire_rejects_unverified_plan_window(
+    session: AsyncSession,
+    window_status: str,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.plan_window_status = window_status
+    await session.flush()
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_days=duration.days,
+            scope="any",
+            min_limit_pct=None,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+    assert result is None
+
+
+async def test_any_ceilings_use_free_long_window_not_primary_position(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    tier.code = "free"
+    account = await _add_account(session, tier, expires_in_days=None)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_5h_remaining_pct = None
+    limits.codex_weekly_remaining_pct = None
+    limits.codex_primary_remaining_pct = 80
+    limits.codex_primary_window_seconds = 30 * 24 * 60 * 60
+    limits.codex_secondary_remaining_pct = None
+    limits.codex_secondary_window_seconds = None
+    limits.expected_long_window_seconds = 30 * 24 * 60 * 60
+
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_days=duration.days,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=30,
+        max_weekly_pct=90,
+    )
+    # Free has no 5-hour observation, so an explicit short-window condition
+    # must fail closed instead of treating NULL as a match.
+    assert await AccountPool().acquire(session, criteria, 1) is None
+
+    long_only = AccountCriteria(**{**criteria.__dict__, "max_5h_pct": None})
+    assert await AccountPool().acquire(session, long_only, 1) is not None
+    long_only = AccountCriteria(
+        **{**long_only.__dict__, "max_weekly_pct": 70}
+    )
+    assert await AccountPool().acquire(session, long_only, 1) is None
+
+
+async def test_any_ceilings_use_paid_five_hour_and_seven_day_semantics(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_primary_remaining_pct = 20
+    limits.codex_primary_window_seconds = 5 * 60 * 60
+    limits.codex_secondary_remaining_pct = 80
+    limits.codex_secondary_window_seconds = 7 * 24 * 60 * 60
+    limits.expected_long_window_seconds = 7 * 24 * 60 * 60
+    # ChatGPT allowance is deliberately unknown in production and must not
+    # contaminate an exact Codex-window semantics test.
+    limits.chat_5h_remaining_pct = None
+    limits.chat_weekly_remaining_pct = None
+
+    allowed = AccountCriteria(
+        tier_id=tier.id,
+        duration_days=duration.days,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=30,
+        max_weekly_pct=90,
+    )
+    assert await AccountPool().acquire(session, allowed, 1) is not None
+    blocked = AccountCriteria(**{**allowed.__dict__, "max_5h_pct": 10})
+    assert await AccountPool().acquire(session, blocked, 1) is None

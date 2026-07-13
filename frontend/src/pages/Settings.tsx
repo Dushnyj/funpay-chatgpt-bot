@@ -23,8 +23,12 @@ const DEFAULT_SETTINGS: SettingsType = {
   bump_interval_hours: 4,
   default_max_active_rentals: 1,
   funpay_commission_percent: 15,
-  check_interval_minutes: 10,
+  check_interval_minutes: 1440,
   limits_check_interval_minutes: 5,
+  refresh_recover_concurrency: 3,
+  refresh_max_attempts: 3,
+  refresh_retry_delay_minutes: 5,
+  check_delay_seconds: 45,
   limits_warn_threshold_pct: 20,
 }
 
@@ -77,8 +81,35 @@ export default function Settings() {
       setError('FunPay Node ID должен быть положительным числом или пустым.')
       return
     }
-    if (draft.default_max_active_rentals < 1 || draft.funpay_commission_percent < 0 || draft.funpay_commission_percent > 100 || draft.check_interval_minutes < 1 || draft.limits_check_interval_minutes < 1 || draft.bump_interval_hours < 1 || draft.limits_warn_threshold_pct < 0 || draft.limits_warn_threshold_pct > 100) {
-      setError('Проверьте диапазоны: интервалы и лимит аренд должны быть больше нуля, проценты — от 0 до 100.')
+    if (draft.limits_check_interval_minutes < 1 || draft.limits_check_interval_minutes > 55) {
+      setError('Замер лимитов должен выполняться каждые 1–55 минут: пятиминутный запас оставляет время очереди до часовой границы свежести.')
+      return
+    }
+    if (
+      draft.default_max_active_rentals < 1
+      || draft.funpay_commission_percent < 0
+      || draft.funpay_commission_percent > 100
+      || draft.check_interval_minutes < 1
+      || draft.check_interval_minutes > 10_080
+      || draft.bump_interval_hours < 1
+      || draft.bump_interval_hours > 168
+      || draft.limits_warn_threshold_pct < 0
+      || draft.limits_warn_threshold_pct > 100
+    ) {
+      setError('Проверьте основные интервалы и лимит аренд; проценты должны быть от 0 до 100.')
+      return
+    }
+    if (
+      draft.refresh_recover_concurrency < 1
+      || draft.refresh_recover_concurrency > 20
+      || draft.refresh_max_attempts < 1
+      || draft.refresh_max_attempts > 20
+      || draft.refresh_retry_delay_minutes < 1
+      || draft.refresh_retry_delay_minutes > 1_440
+      || draft.check_delay_seconds < 30
+      || draft.check_delay_seconds > 3_600
+    ) {
+      setError('Восстановление проверок: параллельность и попытки — от 1 до 20, пауза — до 1440 минут, опрос очереди — от 30 до 3600 секунд.')
       return
     }
     try {
@@ -109,7 +140,7 @@ export default function Settings() {
       await setFunPayKey.mutateAsync(goldenKey.trim())
       setGoldenKey('')
       setFunPayKey.reset()
-      setSuccess('Golden key сохранён. FunPay-подключение перезапускается с новым ключом.')
+      setSuccess('Golden key проверен, сохранён и подключён. Предыдущее соединение заменено без простоя.')
     } catch (cause) {
       setError(errorMessage(cause, 'Не удалось сохранить Golden key'))
     }
@@ -210,7 +241,7 @@ export default function Settings() {
             <StatusBadge value={metricsQuery.data?.bot_status ?? 'unknown'} />
           </div>
           <div className="integration-grid">
-            <label className="field"><span className="field__label">Golden key</span><input type="password" autoComplete="off" value={goldenKey} onChange={(event) => setGoldenKey(event.target.value)} placeholder={funPayKeyQuery.data?.configured ? `Настроен ••••${funPayKeyQuery.data.last4 ?? ''}` : 'Вставьте golden_key из cookies FunPay'} /><span className="field__hint">Ключ передаётся только write-only запросом, хранится зашифрованно и никогда не возвращается в браузер.</span></label>
+            <label className="field"><span className="field__label">Golden key</span><input type="password" autoComplete="off" value={goldenKey} onChange={(event) => setGoldenKey(event.target.value)} placeholder={funPayKeyQuery.data?.configured ? `${funPayKeyQuery.data.connected ? 'Подключён' : 'Настроен, но не подключён'} ••••${funPayKeyQuery.data.last4 ?? ''}` : 'Вставьте golden_key из cookies FunPay'} /><span className="field__hint">Новый ключ сначала проверяется; неверный ключ не отключит текущее рабочее соединение. Значение хранится зашифрованно и не возвращается в браузер.</span></label>
             <label className="field"><span className="field__label">FunPay Node ID</span><input type="number" min="1" value={draft.funpay_node_id ?? ''} onChange={(event) => change('funpay_node_id', event.target.value === '' ? null : Number(event.target.value))} placeholder="Например, 1234" /><span className="field__hint">Категория, в которой бот создаёт и обновляет лоты.</span></label>
           </div>
           <div className="integration-actions"><button className="button button--primary" onClick={saveFunPayKey} disabled={!goldenKey.trim() || setFunPayKey.isPending}><Icon name="key" />{setFunPayKey.isPending ? 'Подключаем…' : 'Сохранить ключ'}</button>{funPayKeyQuery.data?.configured && <button className="button button--secondary" onClick={removeFunPayKey} disabled={clearFunPayKey.isPending}>Удалить ключ</button>}<span className={metricsQuery.data?.bot_status === 'connected' ? 'integration-note--ok' : ''}><Icon name={metricsQuery.data?.bot_status === 'connected' ? 'check' : 'warning'} size={15} />{metricsQuery.data?.bot_status === 'connected' ? 'FunPay принимает события' : 'После сохранения проверяется подключение'}</span></div>
@@ -221,9 +252,18 @@ export default function Settings() {
         <div className="settings-section__intro"><div className="settings-section__icon"><Icon name="clock" /></div><div><h2>Автоматизация</h2><p>Частота проверок, замеров лимитов и поднятия лотов.</p></div></div>
         <div className="settings-card">
           <div className="form-grid form-grid--3">
-            <NumberField label="Проверка аккаунтов" suffix="мин" min={1} value={draft.check_interval_minutes} onChange={(value) => change('check_interval_minutes', value)} hint="Полная фоновая проверка" />
-            <NumberField label="Замер лимитов" suffix="мин" min={1} value={draft.limits_check_interval_minutes} onChange={(value) => change('limits_check_interval_minutes', value)} hint="Обновление usage API" />
-            <NumberField label="Интервал bump" suffix="ч" min={1} value={draft.bump_interval_hours} onChange={(value) => change('bump_interval_hours', value)} hint="Cooldown поднятия категории" />
+            <NumberField label="Проверка аккаунтов" suffix="мин" min={1} max={10_080} value={draft.check_interval_minutes} onChange={(value) => change('check_interval_minutes', value)} hint="Полный вход; по умолчанию раз в сутки" />
+            <NumberField label="Замер лимитов" suffix="мин" min={1} max={55} value={draft.limits_check_interval_minutes} onChange={(value) => change('limits_check_interval_minutes', value)} hint="1–55 мин; запас 5 минут до часовой границы свежести" />
+            <NumberField label="Интервал bump" suffix="ч" min={1} max={168} value={draft.bump_interval_hours} onChange={(value) => change('bump_interval_hours', value)} hint="Cooldown поднятия категории" />
+          </div>
+          <div className="settings-card__subsection">
+            <div className="settings-card__subsection-head"><strong>Восстановление фоновых проверок</strong><span>Ограничивает нагрузку и повторяет временно неудачные проверки без ручного вмешательства.</span></div>
+            <div className="form-grid form-grid--3">
+              <NumberField label="Параллельных задач" suffix="шт" min={1} max={20} value={draft.refresh_recover_concurrency} onChange={(value) => change('refresh_recover_concurrency', value)} hint="Одновременные проверки восстановления" />
+              <NumberField label="Попыток на задачу" suffix="шт" min={1} max={20} value={draft.refresh_max_attempts} onChange={(value) => change('refresh_max_attempts', value)} hint="После лимита задача помечается ошибкой" />
+              <NumberField label="Пауза между попытками" suffix="мин" min={1} max={1_440} value={draft.refresh_retry_delay_minutes} onChange={(value) => change('refresh_retry_delay_minutes', value)} hint="Задержка перед повторным запуском" />
+              <NumberField label="Опрос очереди" suffix="сек" min={30} max={3_600} value={draft.check_delay_seconds} onChange={(value) => change('check_delay_seconds', value)} hint="Как часто запускать обработчик проверок" />
+            </div>
           </div>
           <label className="switch-row"><span><strong>Автоматически поднимать лоты</strong><small>Пытаться выполнять бесплатный bump после истечения cooldown</small></span><input type="checkbox" checked={draft.auto_bump_enabled} onChange={(event) => change('auto_bump_enabled', event.target.checked)} /><span className="switch" /></label>
         </div>

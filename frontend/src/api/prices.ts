@@ -11,6 +11,10 @@ export function useUpdatePrices() {
   return useMutation({
     mutationFn: (items: PriceMatrixItem[]) =>
       api.put<{ updated: number }>('/prices', { items }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['prices'] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['prices'] })
+      void qc.invalidateQueries({ queryKey: ['lots'] })
+      void qc.invalidateQueries({ queryKey: ['metrics'] })
+    },
   })
 }

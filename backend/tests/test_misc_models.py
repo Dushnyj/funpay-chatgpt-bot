@@ -32,7 +32,7 @@ async def test_seller_settings_singleton(session):
     fetched = await session.get(SellerSettings, s.id)
     assert fetched.default_max_active_rentals == 1  # default
     assert fetched.funpay_commission_percent == 15
-    assert fetched.check_interval_minutes == 10
+    assert fetched.check_interval_minutes == 1440
     assert fetched.limits_check_interval_minutes == 5
 
 

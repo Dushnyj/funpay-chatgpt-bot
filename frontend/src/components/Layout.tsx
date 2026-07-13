@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useLogout } from '../api/auth'
 import { useMetrics } from '../api/metrics'
@@ -42,11 +42,53 @@ export default function Layout() {
   const location = useLocation()
   const logout = useLogout()
   const { data: metrics } = useMetrics()
+  const sidebarRef = useRef<HTMLElement>(null)
+  const workspaceRef = useRef<HTMLDivElement>(null)
+  const menuButtonRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     setMobileOpen(false)
     window.scrollTo(0, 0)
   }, [location.pathname])
+
+  useEffect(() => {
+    if (!mobileOpen) return
+    const workspace = workspaceRef.current
+    const sidebar = sidebarRef.current
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : menuButtonRef.current
+    const focusable = () => Array.from(sidebar?.querySelectorAll<HTMLElement>('a[href], button:not([disabled])') ?? [])
+    previousFocus?.blur()
+    workspace?.setAttribute('inert', '')
+    workspace?.setAttribute('aria-hidden', 'true')
+    const focusTimer = window.setTimeout(() => focusable()[0]?.focus(), 0)
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMobileOpen(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const items = focusable()
+      if (items.length === 0) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.clearTimeout(focusTimer)
+      document.removeEventListener('keydown', handleKeyDown)
+      workspace?.removeAttribute('inert')
+      workspace?.removeAttribute('aria-hidden')
+      previousFocus?.focus()
+    }
+  }, [mobileOpen])
 
   const handleLogout = async () => {
     await logout.mutateAsync()
@@ -59,8 +101,10 @@ export default function Layout() {
         className={`sidebar-backdrop ${mobileOpen ? 'sidebar-backdrop--visible' : ''}`}
         onClick={() => setMobileOpen(false)}
         aria-label="Закрыть меню"
+        aria-hidden={!mobileOpen}
+        tabIndex={mobileOpen ? 0 : -1}
       />
-      <aside className={`sidebar ${mobileOpen ? 'sidebar--open' : ''}`}>
+      <aside ref={sidebarRef} id="app-sidebar" className={`sidebar ${mobileOpen ? 'sidebar--open' : ''}`}>
         <div className="brand">
           <div className="brand__mark"><span>F</span></div>
           <div>
@@ -98,9 +142,9 @@ export default function Layout() {
         </button>
       </aside>
 
-      <div className="workspace">
+      <div ref={workspaceRef} className="workspace">
         <header className="topbar">
-          <button className="icon-button topbar__menu" onClick={() => setMobileOpen(true)} aria-label="Открыть меню">
+          <button ref={menuButtonRef} className="icon-button topbar__menu" onClick={() => setMobileOpen(true)} aria-label="Открыть меню" aria-expanded={mobileOpen} aria-controls="app-sidebar">
             <Icon name="menu" size={21} />
           </button>
           <div className="topbar__context">

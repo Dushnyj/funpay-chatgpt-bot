@@ -15,6 +15,7 @@ from app.services.subscription_plans import (
     PlanSignal,
     ResolvedSubscriptionPlan,
     resolve_subscription_plan,
+    validate_plan_window_contract,
 )
 
 # access_token считается свежим, если истекает не раньше чем через это время
@@ -29,6 +30,8 @@ class MeasureResult(enum.Enum):
     OK = "ok"
     REFRESH_FAILED = "refresh_failed"
     BACKEND_ERROR = "backend_error"
+    PLAN_DETECTION_FAILED = "plan_detection_failed"
+    PLAN_WINDOW_MISMATCH = "plan_window_mismatch"
 
 
 async def measure_account_limits(
@@ -124,7 +127,23 @@ async def measure_account_limits(
         )
     )
     await _store_resolved_plan(session, account, limits, resolved_plan)
-    if metadata.has_active_subscription is True:
+    window_contract_ok = True
+    plan_detection_ok = resolved_plan.code is not None
+    if resolved_plan.code is None:
+        limits.plan_window_status = "unknown"
+        limits.expected_long_window_seconds = None
+    else:
+        window_contract_ok, expected_window = validate_plan_window_contract(
+            resolved_plan.code,
+            usage.primary_window_seconds,
+            usage.secondary_window_seconds,
+        )
+        limits.expected_long_window_seconds = expected_window
+        limits.plan_window_status = "ok" if window_contract_ok else "mismatch"
+    if (
+        metadata.has_active_subscription is True
+        and metadata.subscription_expires_at is not None
+    ):
         limits.subscription_expires_at = metadata.subscription_expires_at
         account.subscription_expires_at = metadata.subscription_expires_at
     elif metadata.has_active_subscription is False:
@@ -140,6 +159,10 @@ async def measure_account_limits(
     limits.refresh_failed_at = None
 
     await session.commit()
+    if not plan_detection_ok:
+        return MeasureResult.PLAN_DETECTION_FAILED
+    if not window_contract_ok:
+        return MeasureResult.PLAN_WINDOW_MISMATCH
     return MeasureResult.OK
 
 
@@ -230,7 +253,6 @@ async def _do_refresh(session: AsyncSession, limits: AccountLimits) -> str | Non
     except RefreshFailedError:
         limits.refresh_status = "expired"
         limits.refresh_failed_at = datetime.now(timezone.utc)
-        limits.refresh_recover_attempts += 1
         await session.commit()
         return None
 

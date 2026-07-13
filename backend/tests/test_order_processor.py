@@ -35,7 +35,7 @@ def gateway() -> FakeChatGateway:
         chat_id=100,
         buyer_id=200,
         subcategory_id=55,
-        title="ChatGPT Plus 7d",
+        title="Plus 7d",
         price=599.0,
     ))
     return gw
@@ -87,6 +87,29 @@ async def test_process_new_sale_idempotent(session: AsyncSession, gateway: FakeC
     assert len(result.scalars().all()) == 1
 
 
+async def test_process_new_sale_rejects_unmatched_sole_subcategory_lot(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    await _seed_catalog_and_lot(session)
+    gateway.set_order(OrderInfo(
+        order_id="ord-mismatch",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Completely different offer",
+        price=1.0,
+    ))
+
+    with pytest.raises(LotNotFoundError):
+        await OrderProcessor().process_new_sale(
+            session,
+            gateway,
+            order_id="ord-mismatch",
+        )
+
+
 async def test_process_new_sale_no_matching_lot_raises(
     session: AsyncSession, gateway: FakeChatGateway,
 ):
@@ -111,6 +134,35 @@ async def test_process_sale_refunded_marks_refunded(session: AsyncSession, gatew
     assert order.status == "refunded"
 
 
+async def test_late_close_cannot_resurrect_refunded_order(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    await _seed_catalog_and_lot(session)
+    proc = OrderProcessor()
+    await proc.process_new_sale(session, gateway, order_id="ord-1")
+    await proc.process_sale_refunded(session, order_id="ord-1")
+
+    order = await proc.process_sale_closed(session, order_id="ord-1")
+
+    assert order.status == "refunded"
+
+
+async def test_late_close_cannot_cancel_pending_refund_revoke(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    await _seed_catalog_and_lot(session)
+    proc = OrderProcessor()
+    order = await proc.process_new_sale(session, gateway, order_id="ord-1")
+    order.status = "refund_pending"
+    await session.flush()
+
+    closed = await proc.process_sale_closed(session, order_id="ord-1")
+
+    assert closed.status == "refund_pending"
+
+
 async def test_process_sale_closed_unknown_order_raises(session: AsyncSession):
     proc = OrderProcessor()
     with pytest.raises(KeyError):
@@ -126,6 +178,30 @@ async def test_process_new_sale_records_tier_duration_scope(
     assert order.tier_id is not None
     assert order.duration_id is not None
     assert order.limit_scope_id is not None
+
+
+async def test_process_new_sale_records_english_offer_locale(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    lot_id = await _seed_catalog_and_lot(session)
+    lot = await session.get(Lot, lot_id)
+    assert lot is not None
+    lot.title_ru = "Plus на 7 дней"
+    lot.title_en = "Plus for 7 days"
+    gateway.set_order(OrderInfo(
+        order_id="ord-en",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Plus for 7 days",
+        price=599.0,
+    ))
+
+    order = await OrderProcessor().process_new_sale(session, gateway, "ord-en")
+
+    assert order.buyer_locale == "en"
 
 
 async def test_process_new_sale_prefers_remote_offer_id(
@@ -154,7 +230,7 @@ async def test_process_new_sale_prefers_remote_offer_id(
     assert order.lot_id == second.id
 
 
-async def test_process_new_sale_uses_unique_price_fallback(
+async def test_process_new_sale_requires_matching_title_and_price_fallback(
     session: AsyncSession, gateway: FakeChatGateway,
 ):
     first_id = await _seed_catalog_and_lot(session)
@@ -169,7 +245,7 @@ async def test_process_new_sale_uses_unique_price_fallback(
     await session.flush()
     gateway.set_order(OrderInfo(
         order_id="ord-price", status=SaleStatus.PAID, chat_id=100,
-        buyer_id=200, subcategory_id=55, title="unknown", price=699,
+        buyer_id=200, subcategory_id=55, title="Other", price=699,
     ))
 
     order = await OrderProcessor().process_new_sale(session, gateway, "ord-price")
@@ -185,7 +261,7 @@ async def test_process_new_sale_rejects_ambiguous_multi_lot_fallback(
     session.add(Lot(
         funpay_node_id=55, tier_id=first.tier_id, duration_id=first.duration_id,
         limit_scope_id=first.limit_scope_id, price=599,
-        title_ru="Duplicate", title_en="Duplicate", status="active",
+        title_ru="Plus 7d", title_en="Plus 7d", status="active",
         auto_created=False, config_key="ambiguous-second",
     ))
     await session.flush()

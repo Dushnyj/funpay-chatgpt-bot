@@ -30,3 +30,17 @@ def test_settings_out_excludes_admin_hash():
     assert "admin_password_hash" not in fields
     assert "funpay_session_key" not in fields
     assert "telegram_bot_token" not in fields
+
+
+def test_rental_out_exposes_complete_issued_limit_snapshot():
+    assert {
+        "issued_codex_primary_pct",
+        "issued_codex_primary_window_seconds",
+        "issued_codex_primary_resets_at",
+        "issued_codex_secondary_pct",
+        "issued_codex_secondary_window_seconds",
+        "issued_codex_secondary_resets_at",
+        "issued_plan_window_status",
+        "issued_expected_long_window_seconds",
+        "issued_limits_measured_at",
+    } <= set(RentalOut.model_fields)

@@ -62,6 +62,7 @@ class ValidationCode(str, enum.Enum):
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
     EMAIL_AUTH_FAILED = "email_auth_failed"
     EMAIL_CODE_NOT_FOUND = "email_code_not_found"
+    EMAIL_CODE_REJECTED = "email_code_rejected"
     EMAIL_PROVIDER_UNSUPPORTED = "email_provider_unsupported"
     EMAIL_CONNECTION_FAILED = "email_connection_failed"
     EMAIL_SECURITY_CHALLENGE = "email_security_challenge"
@@ -73,6 +74,8 @@ class ValidationCode(str, enum.Enum):
     SETUP_2FA_QR_INVALID = "setup_2fa_qr_invalid"
     TOKEN_EXCHANGE_FAILED = "token_exchange_failed"
     MEASURE_FAILED = "measure_failed"
+    PLAN_DETECTION_FAILED = "plan_detection_failed"
+    PLAN_WINDOW_MISMATCH = "plan_window_mismatch"
     INTERNAL_ERROR = "internal_error"
 
 
@@ -193,7 +196,10 @@ async def _build_email_provider(
                 credential.refresh_token_encrypted = refresh_token
                 credential.updated_at = datetime.now(timezone.utc)
                 try:
-                    await session.commit()
+                    # The caller owns the transaction and may be holding row
+                    # locks that enforce rental/replacement invariants.  A
+                    # provider callback must never release those locks.
+                    await session.flush()
                 except Exception:
                     await session.rollback()
                     raise
@@ -202,7 +208,7 @@ async def _build_email_provider(
                 credential.status = "reauthorization_required"
                 credential.updated_at = datetime.now(timezone.utc)
                 try:
-                    await session.commit()
+                    await session.flush()
                 except Exception:
                     await session.rollback()
                     raise
@@ -245,7 +251,11 @@ async def _preflight_email_provider(provider: EmailProvider) -> None:
 
 
 def _from_oauth_error(exc: OAuthLoginError) -> AccountValidationError:
-    return AccountValidationError(exc.stage, exc.code.value, exc.detail)
+    try:
+        code: ValidationCode | str = ValidationCode(exc.code.value)
+    except ValueError:
+        code = exc.code.value
+    return AccountValidationError(exc.stage, code, exc.detail)
 
 
 async def _validate_with_existing_totp(
@@ -321,6 +331,12 @@ async def _save_tokens_and_measure(
     tokens,
 ) -> ValidationOutcome:
     claims = parse_id_token(tokens.id_token) if tokens.id_token else IdTokenClaims()
+    if not _identity_matches(account, claims.email):
+        raise AccountValidationError(
+            ValidationStage.LOGIN,
+            ValidationCode.INVALID_CREDENTIALS,
+            "OpenAI подтвердил другой аккаунт.",
+        )
 
     limits = await session.get(AccountLimits, account.id)
     if limits is None:
@@ -332,6 +348,7 @@ async def _save_tokens_and_measure(
     limits.account_id_openai = claims.account_id
     limits.refresh_status = "ok"
     limits.refresh_recover_attempts = 0
+    limits.refresh_last_recover_at = None
 
     if claims.subscription_expires_at:
         account.subscription_expires_at = claims.subscription_expires_at
@@ -350,6 +367,18 @@ async def _save_tokens_and_measure(
             ValidationCode.MEASURE_FAILED,
             "Вход выполнен, но лимиты аккаунта получить не удалось.",
         ) from exc
+    if result is MeasureResult.PLAN_DETECTION_FAILED:
+        raise AccountValidationError(
+            ValidationStage.LIMIT_MEASUREMENT,
+            ValidationCode.PLAN_DETECTION_FAILED,
+            "OpenAI не вернул однозначный поддерживаемый тариф аккаунта.",
+        )
+    if result is MeasureResult.PLAN_WINDOW_MISMATCH:
+        raise AccountValidationError(
+            ValidationStage.LIMIT_MEASUREMENT,
+            ValidationCode.PLAN_WINDOW_MISMATCH,
+            "Тариф определён, но длительность лимита не соответствует плану.",
+        )
     if result is not MeasureResult.OK:
         raise AccountValidationError(
             ValidationStage.LIMIT_MEASUREMENT,
@@ -357,6 +386,22 @@ async def _save_tokens_and_measure(
             "Вход выполнен, но лимиты аккаунта получить не удалось.",
         )
 
-    account.status = "active"
+    # Re-read durable operator intent after the network/browser work. An admin
+    # may have paused the account in another transaction while validation was
+    # running; that decision must win over a late successful response.
+    await session.refresh(account, attribute_names=["operator_status_override"])
+    account.status = account.operator_status_override or "active"
+    account.chatgpt_last_check_at = datetime.now(timezone.utc)
     await session.flush()
     return ValidationOutcome.OK
+
+
+def _identity_matches(account: Account, token_email: str | None) -> bool:
+    if not token_email:
+        return False
+    expected = {
+        value.strip().casefold()
+        for value in (account.login, account.email)
+        if value and "@" in value
+    }
+    return token_email.strip().casefold() in expected

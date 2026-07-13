@@ -171,6 +171,33 @@ async def test_engine_07_create_rejects_ambiguous_offer_id():
         await FunPayChatGateway(bot).save_offer_fields(fields)
 
 
+async def test_engine_07_create_rejects_unrelated_sole_delta():
+    fields = OfferFieldsDTO(
+        offer_id=0,
+        subcategory_id=55,
+        title_ru="Нужный лот",
+        title_en="Expected lot",
+        desc_ru="",
+        desc_en="",
+        price=199,
+        active=True,
+        auto_delivery=False,
+    )
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(side_effect=[
+            SimpleNamespace(offers={}),
+            SimpleNamespace(offers={
+                77: _preview(77, "Unrelated concurrent offer", 1),
+            }),
+        ]),
+        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        save_offer_fields=AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(FunPayOfferResolutionError):
+        await FunPayChatGateway(bot).save_offer_fields(fields)
+
+
 async def test_engine_07_false_save_result_is_an_api_error():
     bot = SimpleNamespace(
         get_my_offers_page=AsyncMock(return_value=SimpleNamespace(offers={})),

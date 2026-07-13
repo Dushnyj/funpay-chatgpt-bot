@@ -60,7 +60,7 @@ class CommandRouter:
             sender_id=sender_id,
             text=text,
             order_id=order_id,
-            lang=lang,
+            lang=parsed.lang if parsed is not None else lang,
             gateway=gateway,
             parsed=parsed,
         )

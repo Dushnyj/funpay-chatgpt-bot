@@ -36,6 +36,8 @@ export interface LimitScope {
 export interface AccountLimits {
   account_id: number
   plan_type?: string | null
+  plan_window_status: 'unknown' | 'ok' | 'mismatch'
+  expected_long_window_seconds: number | null
   chat_5h_remaining_pct: number | null
   chat_weekly_remaining_pct: number | null
   codex_5h_remaining_pct: number | null
@@ -58,6 +60,7 @@ export interface Account {
   subscription_expires_at: string | null
   max_active_rentals: number | null
   status: string
+  operator_status_override?: 'maintenance' | 'disabled' | null
   notes: string | null
   plan_raw_type?: string | null
   plan_source?: string | null
@@ -96,6 +99,21 @@ export interface AccountCreate {
   subscription_expires_at?: string
   max_active_rentals?: number
   notes?: string
+}
+
+export interface AccountUpdate {
+  subscription_expires_at?: string | null
+  max_active_rentals?: number | null
+  status?: 'maintenance' | 'disabled'
+  notes?: string | null
+}
+
+export interface AccountCredentialsUpdate {
+  login?: string
+  password?: string
+  totp_secret?: string | null
+  email?: string | null
+  email_password?: string | null
 }
 
 export interface TotpExport {
@@ -154,6 +172,33 @@ export interface Lot {
   auto_created: boolean
 }
 
+export interface LotCreate {
+  funpay_node_id?: number
+  tier_id: number
+  duration_id: number
+  limit_scope_id: number
+  min_limit_pct?: number
+  max_5h_pct?: number
+  max_weekly_pct?: number
+  price: number
+  title_ru: string
+  title_en: string
+  description_ru?: string
+  description_en?: string
+}
+
+export interface LotStatusUpdate {
+  status: 'active' | 'paused'
+}
+
+export interface LotSyncResult {
+  status?: string
+  created?: number
+  updated?: number
+  paused?: number
+  total?: number
+}
+
 export interface Order {
   id: number
   funpay_order_id: string
@@ -164,8 +209,14 @@ export interface Order {
   tier_id: number | null
   duration_id: number | null
   limit_scope_id: number | null
+  min_limit_pct: number | null
+  max_5h_pct: number | null
+  max_weekly_pct: number | null
   price: number
   status: string
+  fulfillment_attempts: number
+  fulfillment_next_attempt_at: string | null
+  fulfillment_last_error: string | null
   created_at: string
 }
 
@@ -178,11 +229,30 @@ export interface Rental {
   tier_id: number
   duration_id: number
   limit_scope_id: number
+  min_limit_pct: number | null
+  max_5h_pct: number | null
+  max_weekly_pct: number | null
   lang: string
   started_at: string
   expires_at: string
   status: string
   replacement_count: number
+  credentials_delivery_status: 'sending' | 'sent' | 'failed' | 'manual'
+  credentials_delivery_template: string
+  credentials_delivery_started_at: string | null
+  credentials_delivery_next_attempt_at: string | null
+  credentials_delivered_at: string | null
+  credentials_delivery_attempts: number
+  credentials_delivery_last_error: string | null
+  issued_codex_primary_pct: number | null
+  issued_codex_primary_window_seconds: number | null
+  issued_codex_primary_resets_at: string | null
+  issued_codex_secondary_pct: number | null
+  issued_codex_secondary_window_seconds: number | null
+  issued_codex_secondary_resets_at: string | null
+  issued_plan_window_status: string | null
+  issued_expected_long_window_seconds: number | null
+  issued_limits_measured_at: string | null
 }
 
 export interface Settings {
@@ -193,7 +263,12 @@ export interface Settings {
   funpay_commission_percent: number
   check_interval_minutes: number
   limits_check_interval_minutes: number
+  refresh_recover_concurrency: number
+  refresh_max_attempts: number
+  refresh_retry_delay_minutes: number
+  check_delay_seconds: number
   limits_warn_threshold_pct: number
+  graph_configured?: boolean
 }
 
 export interface Metrics {
@@ -207,6 +282,7 @@ export interface Metrics {
 
 export interface FunPayKeyStatus {
   configured: boolean
+  connected: boolean
   last4: string | null
 }
 

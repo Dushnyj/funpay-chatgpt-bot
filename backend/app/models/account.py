@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -29,6 +29,17 @@ class Account(Base):
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     max_active_rentals: Mapped[int | None] = mapped_column(Integer, default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending_validation")
+    # Durable operator intent is separate from validation status. Browser jobs
+    # may finish after an operator pauses an account; allocation always checks
+    # this override so a late success cannot make it sellable again.
+    operator_status_override: Mapped[str | None] = mapped_column(
+        String(16), default=None
+    )
+    # When OAuth data arrives while another validation owns the account, that
+    # worker must enqueue one follow-up pass after releasing its lease.
+    validation_rerun_requested: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
     chatgpt_last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     notes: Mapped[str | None] = mapped_column(default=None)
 
@@ -60,6 +71,14 @@ class AccountLimits(Base):
         DateTime(timezone=True), default=None
     )
     plan_type: Mapped[str | None] = mapped_column(default=None)
+    plan_window_status: Mapped[str] = mapped_column(String(24), default="unknown")
+    expected_long_window_seconds: Mapped[int | None] = mapped_column(default=None)
+    low_limit_warning_fingerprint: Mapped[str | None] = mapped_column(
+        String(160), default=None
+    )
+    low_limit_warned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     refresh_status: Mapped[str] = mapped_column(String(16), default="ok")

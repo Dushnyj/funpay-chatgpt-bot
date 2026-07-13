@@ -3,6 +3,7 @@ from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import FakeChatGateway
+from app.integrations.funpay.types import OfferInfo
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.lot import Lot
 from app.services.lot_sync import (
@@ -95,6 +96,29 @@ async def test_sync_updates_existing_offer(session: AsyncSession, gateway: FakeC
     assert gateway.saved_offers[100].active is False
 
 
+async def test_sync_recovers_exact_unclaimed_remote_offer_instead_of_duplicating(
+    session: AsyncSession, gateway: FakeChatGateway,
+):
+    lot = await _make_lot(session)
+    await session.commit()
+    gateway.set_my_offers(55, [OfferInfo(
+        offer_id=777,
+        subcategory_id=55,
+        title=lot.title_ru,
+        price=float(lot.price),
+        active=True,
+        auto_delivery=False,
+    )])
+
+    funpay_id = await LotSyncService().sync_lot(
+        session, gateway, lot.id, active=True,
+    )
+
+    assert funpay_id == 777
+    assert lot.funpay_id == "777"
+    assert set(gateway.saved_offers) == {777}
+
+
 async def test_sync_pause_uses_set_offer_active(session: AsyncSession, gateway: FakeChatGateway):
     lot = await _make_lot(session)
     lot.funpay_id = "200"
@@ -120,3 +144,19 @@ async def test_pause_lot_without_funpay_id_raises(session: AsyncSession, gateway
     svc = LotSyncService()
     with pytest.raises(LotNotPublishedError):
         await svc.pause_lot(session, gateway, lot.id)
+
+
+async def test_pause_failure_does_not_change_local_status(session: AsyncSession):
+    class RejectingGateway(FakeChatGateway):
+        async def set_offer_active(self, offer_id: int, active: bool) -> bool:
+            self.activity_changes.append((offer_id, active))
+            return False
+
+    lot = await _make_lot(session)
+    lot.funpay_id = "400"
+    await session.flush()
+
+    with pytest.raises(RuntimeError, match="did not pause"):
+        await LotSyncService().pause_lot(session, RejectingGateway(), lot.id)
+
+    assert lot.status == "active"

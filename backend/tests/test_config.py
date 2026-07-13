@@ -8,7 +8,7 @@ def test_settings_loads_from_env():
     settings = Settings()
     assert "sqlite" in settings.database_url
     assert settings.encryption_key
-    assert settings.secret_key == "test-secret"
+    assert settings.secret_key == "test-secret-key-at-least-32-bytes-long"
 
 
 def test_settings_validates_encryption_key(monkeypatch):

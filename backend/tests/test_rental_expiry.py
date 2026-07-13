@@ -100,6 +100,32 @@ async def test_expire_skips_already_expired(session: AsyncSession):
     assert len(gateway.sent_messages) == 0
 
 
+@pytest.mark.parametrize("order_status", ["refund_pending", "refunded"])
+async def test_expire_never_races_refund_owned_rental(
+    session: AsyncSession,
+    order_status: str,
+):
+    rental = await _make_rental(
+        session,
+        expires_delta=timedelta(seconds=-1),
+    )
+    order = await session.get(Order, rental.order_id)
+    assert order is not None
+    order.status = order_status
+    await session.flush()
+    kick = FakeKickService()
+
+    expired = await RentalExpiryService(kick_service=kick).expire_overdue(
+        session,
+        FakeChatGateway(),
+    )
+
+    await session.refresh(rental)
+    assert expired == []
+    assert rental.status == "active"
+    assert kick.account_ids == []
+
+
 async def test_expire_sends_to_correct_chat(session: AsyncSession):
     from app.services.seed_data import seed_message_templates
     await seed_message_templates(session)

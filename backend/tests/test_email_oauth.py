@@ -265,3 +265,18 @@ async def test_callback_email_mismatch_never_stores_token_or_leaks_it(
     )
     assert "mismatch" not in callback.text
     assert await session.get(EmailOAuthCredential, account.id) is None
+
+
+async def test_callback_rejects_oversized_body_without_valid_state():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as public:
+        response = await public.post(
+            "/api/email-oauth/microsoft/callback",
+            content=b"state=" + b"x" * 20_000,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "/accounts?email_oauth=failed&reason=invalid_state"
+    )

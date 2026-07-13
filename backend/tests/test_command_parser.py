@@ -17,12 +17,14 @@ def test_parse_code_ru(parser: CommandParser):
     assert result is not None
     assert result.command is CommandType.CODE
     assert result.argument is None
+    assert result.lang == "ru"
 
 
 def test_parse_code_en(parser: CommandParser):
     result = parser.parse("!code")
     assert result is not None
     assert result.command is CommandType.CODE
+    assert result.lang == "en"
 
 
 def test_parse_case_insensitive(parser: CommandParser):

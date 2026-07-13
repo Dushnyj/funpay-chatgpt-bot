@@ -53,9 +53,30 @@ async def test_notify_account_unavailable(notifier: TelegramNotifier):
 async def test_notify_low_limits(notifier: TelegramNotifier):
     with patch.object(notifier, "_bot") as mock_bot:
         mock_bot.send_message = AsyncMock()
-        await notifier.notify_low_limits(account_login="acc1", chat_weekly=18)
+        sent = await notifier.notify_low_limits(
+            account_login="acc1",
+            remaining_pct=18,
+            window_label="30 дней",
+        )
         _, kwargs = mock_bot.send_message.call_args
+        assert sent is True
         assert "18" in kwargs["text"]
+        assert "30 дней" in kwargs["text"]
+
+
+async def test_notify_seller_called_includes_admin_chat_context(
+    notifier: TelegramNotifier,
+):
+    with patch.object(notifier, "_bot") as mock_bot:
+        mock_bot.send_message = AsyncMock()
+        await notifier.notify_seller_called(
+            "buyer-1", funpay_chat_id="42", order_id="ABC"
+        )
+        _, kwargs = mock_bot.send_message.call_args
+        assert "buyer-1" in kwargs["text"]
+        assert "42" in kwargs["text"]
+        assert "ABC" in kwargs["text"]
+        assert "Чаты" in kwargs["text"]
 
 
 async def test_disabled_when_no_token():

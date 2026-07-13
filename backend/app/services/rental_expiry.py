@@ -10,7 +10,7 @@ from app.integrations.funpay.gateway import ChatGateway
 from app.models.account import Account
 from app.models.audit import AuditLog
 from app.models.catalog import Duration, SubscriptionTier
-from app.models.rental import Rental
+from app.models.rental import Order, Rental
 from app.services.kick_service import KickService
 from app.services.messages import render_message
 
@@ -38,10 +38,15 @@ class RentalExpiryService:
         """
         now = datetime.now(timezone.utc)
         result = await session.execute(
-            select(Rental).where(
+            select(Rental)
+            .join(Order, Order.id == Rental.order_id)
+            .where(
                 Rental.status.in_(["active", "expiry_pending"]),
                 Rental.expires_at <= now,
+                Order.status.notin_(["refund_pending", "refunded"]),
             )
+            .order_by(Rental.id)
+            .with_for_update(skip_locked=True)
         )
         overdue = result.scalars().all()
         newly_overdue = [rental for rental in overdue if rental.status == "active"]
@@ -62,7 +67,10 @@ class RentalExpiryService:
                 session, gateway, account_id,
             )
         for rental in overdue:
-            if revoked[rental.account_id]:
+            if (
+                rental.status == "expiry_pending"
+                and revoked[rental.account_id]
+            ):
                 rental.status = "expired"
 
         if gateway is not None:

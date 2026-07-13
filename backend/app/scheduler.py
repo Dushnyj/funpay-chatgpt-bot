@@ -8,7 +8,7 @@ from typing import Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class ScheduledTask:
     """Периодическая задача: callback вызывается каждые interval секунд."""
 
@@ -26,6 +26,7 @@ class Scheduler:
     def __init__(self) -> None:
         self._tasks: dict[str, ScheduledTask] = {}
         self._loops: dict[str, asyncio.Task] = {}
+        self._wakeups: dict[str, asyncio.Event] = {}
         self._running = False
 
     @property
@@ -33,10 +34,28 @@ class Scheduler:
         return self._running
 
     def register(self, name: str, task: ScheduledTask) -> None:
+        """Register a task or update its callback/interval at runtime.
+
+        Updating a live task wakes its current delay without cancelling a
+        callback that may be in the middle of a database or network operation.
+        """
+        current = self._tasks.get(name)
+        if (
+            current is not None
+            and current.callback == task.callback
+            and current.interval == task.interval
+        ):
+            return
         self._tasks[name] = task
+        if self._running and name in self._loops:
+            self._wakeups[name].set()
+        elif self._running:
+            self._wakeups[name] = asyncio.Event()
+            self._loops[name] = asyncio.create_task(self._run_loop(name))
 
     def unregister(self, name: str) -> None:
         self._tasks.pop(name, None)
+        self._wakeups.pop(name, None)
         loop = self._loops.pop(name, None)
         if loop is not None:
             loop.cancel()
@@ -45,8 +64,9 @@ class Scheduler:
         if self._running:
             return
         self._running = True
-        for name, task in self._tasks.items():
-            self._loops[name] = asyncio.create_task(self._run_loop(name, task))
+        for name in self._tasks:
+            self._wakeups[name] = asyncio.Event()
+            self._loops[name] = asyncio.create_task(self._run_loop(name))
 
     async def stop(self) -> None:
         self._running = False
@@ -58,13 +78,23 @@ class Scheduler:
             except (asyncio.CancelledError, Exception):
                 pass
         self._loops.clear()
+        self._wakeups.clear()
 
-    async def _run_loop(self, name: str, task: ScheduledTask) -> None:
-        while self._running:
+    async def _run_loop(self, name: str) -> None:
+        while self._running and name in self._tasks:
+            task = self._tasks[name]
             try:
                 await task.callback()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Scheduled task '%s' failed", name)
-            await asyncio.sleep(task.interval)
+            wakeup = self._wakeups.get(name)
+            if wakeup is None:
+                return
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=task.interval)
+            except TimeoutError:
+                pass
+            else:
+                wakeup.clear()

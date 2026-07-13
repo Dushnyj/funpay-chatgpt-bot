@@ -3,6 +3,7 @@ import base64
 import json
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.integrations.openai.device_auth import DeviceAuthorization, DeviceCode
@@ -86,8 +87,24 @@ async def test_device_auth_success_verifies_identity(
     result = await manager.poll(session, account, auth_session.id)
     assert result.status == "completed"
     job = await session.get(AccountCheckJob, result.job_id)
-    assert job is not None and job.status == "done" and job.result == "ok"
-    assert account.status == "active"
+    assert (
+        job is not None
+        and job.status == "done"
+        and job.result == "tokens_connected"
+    )
+    assert account.status == "pending_validation"
+    credential_jobs = list(
+        (
+            await session.execute(
+                select(AccountCheckJob).where(
+                    AccountCheckJob.account_id == account.id,
+                    AccountCheckJob.job_type == "full_validation",
+                )
+            )
+        ).scalars()
+    )
+    assert len(credential_jobs) == 1
+    assert credential_jobs[0].status == "pending"
 
 
 async def test_device_auth_rejects_another_openai_account(
@@ -116,6 +133,52 @@ async def test_device_auth_rejects_another_openai_account(
     assert result.status == "failed"
     assert result.error_code == "invalid_credentials"
     assert account.status == "validation_failed"
+
+
+async def test_device_auth_failure_hands_credential_update_to_followup_job(
+    session: AsyncSession,
+    monkeypatch,
+):
+    account = await _account(session)
+    manager = AccountDeviceAuthManager()
+
+    async def fake_request():
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    async def fake_poll(*_args):
+        return DeviceAuthorization("code", "verifier", "challenge")
+
+    async def fake_exchange(_authorization):
+        return RefreshedTokens("access", "refresh", _id_token("other@example.com"))
+
+    monkeypatch.setattr("app.services.account_device_auth.request_device_code", fake_request)
+    monkeypatch.setattr("app.services.account_device_auth.poll_device_authorization", fake_poll)
+    monkeypatch.setattr("app.services.account_device_auth.exchange_device_authorization", fake_exchange)
+
+    auth_session = await manager.start(session, account)
+    account.validation_rerun_requested = True
+    await session.commit()
+    auth_session.next_poll_at = datetime.now(timezone.utc)
+
+    result = await manager.poll(session, account, auth_session.id)
+
+    assert result.status == "failed"
+    await session.refresh(account)
+    assert account.status == "pending_validation"
+    assert account.validation_rerun_requested is False
+    jobs = list(
+        (
+            await session.execute(
+                select(AccountCheckJob)
+                .where(AccountCheckJob.account_id == account.id)
+                .order_by(AccountCheckJob.id)
+            )
+        ).scalars()
+    )
+    assert [(job.status, job.job_type) for job in jobs] == [
+        ("failed", "device_auth"),
+        ("pending", "full_validation"),
+    ]
 
 
 async def test_device_auth_supersedes_pending_full_validation_and_previous_device_job(
@@ -245,8 +308,25 @@ async def test_background_poll_completes_without_frontend_status_requests(
     async with session_factory() as background_session:
         job = await background_session.get(AccountCheckJob, auth_session.job_id)
         stored_account = await background_session.get(Account, account.id)
-    assert job is not None and job.status == "done" and job.result == "ok"
-    assert stored_account is not None and stored_account.status == "active"
+    assert (
+        job is not None
+        and job.status == "done"
+        and job.result == "tokens_connected"
+    )
+    assert stored_account is not None and stored_account.status == "pending_validation"
+    async with session_factory() as background_session:
+        credential_jobs = list(
+            (
+                await background_session.execute(
+                    select(AccountCheckJob).where(
+                        AccountCheckJob.account_id == account.id,
+                        AccountCheckJob.job_type == "full_validation",
+                    )
+                )
+            ).scalars()
+        )
+    assert len(credential_jobs) == 1
+    assert credential_jobs[0].status == "pending"
     await manager.shutdown()
 
 

@@ -59,7 +59,7 @@ class OrderProcessor:
             funpay_order_id=info.order_id,
             funpay_chat_id=str(info.chat_id),
             buyer_funpay_id=str(info.buyer_id),
-            buyer_locale="ru",
+            buyer_locale=_infer_buyer_locale(info.title, lot),
             lot_id=lot.id,
             tier_id=lot.tier_id,
             duration_id=lot.duration_id,
@@ -79,7 +79,12 @@ class OrderProcessor:
         session: AsyncSession,
         order_id: str,
     ) -> Order:
-        order = await self._get_order_or_raise(session, order_id)
+        order = await self._get_order_or_raise(session, order_id, for_update=True)
+        # Refund and revoke states are terminal/monotonic. FunPay callbacks may
+        # be duplicated or reordered, so a delayed close must never resurrect
+        # a refunded order or cancel a pending credential revocation.
+        if order.status in {"refunded", "refund_pending"}:
+            return order
         order.status = "completed"
         await session.flush()
         return order
@@ -89,11 +94,11 @@ class OrderProcessor:
         session: AsyncSession,
         order_id: str,
     ) -> Order:
-        order = await self._get_order_or_raise(session, order_id)
+        order = await self._get_order_or_raise(session, order_id, for_update=True)
         rental_result = await session.execute(
             select(Rental).where(
                 Rental.order_id == order.id,
-                Rental.status == "active",
+                Rental.status.in_(["active", "expiry_pending"]),
             ).with_for_update()
         )
         rental = rental_result.scalar_one_or_none()
@@ -149,8 +154,22 @@ class OrderProcessor:
         )
         return result.scalar_one_or_none()
 
-    async def _get_order_or_raise(self, session: AsyncSession, order_id: str) -> Order:
-        order = await self._find_order(session, order_id)
+    async def _get_order_or_raise(
+        self,
+        session: AsyncSession,
+        order_id: str,
+        *,
+        for_update: bool = False,
+    ) -> Order:
+        if for_update:
+            result = await session.execute(
+                select(Order)
+                .where(Order.funpay_order_id == order_id)
+                .with_for_update()
+            )
+            order = result.scalar_one_or_none()
+        else:
+            order = await self._find_order(session, order_id)
         if order is None:
             raise KeyError(f"Order {order_id} not found")
         return order
@@ -185,29 +204,40 @@ class OrderProcessor:
             )
         )
         candidates = list(result.scalars().all())
-        if len(candidates) == 1:
-            return candidates[0]
+        if not candidates:
+            return None
 
         title = _normalize_title(info.title)
         if title:
-            titled = [
+            candidates = [
                 lot for lot in candidates
                 if title in {_normalize_title(lot.title_ru), _normalize_title(lot.title_en)}
             ]
-            if len(titled) == 1:
-                return titled[0]
-            if titled:
-                candidates = titled
+        else:
+            # The stock parser normally lacks a stable offer id. Without a
+            # title there is no safe way to bind a purchase to a local lot.
+            return None
 
         if info.price is not None:
-            priced = [
+            candidates = [
                 lot for lot in candidates
                 if math.isclose(float(lot.price), float(info.price), abs_tol=0.01)
             ]
-            if len(priced) == 1:
-                return priced[0]
-        return None
+        else:
+            return None
+        return candidates[0] if len(candidates) == 1 else None
 
 
 def _normalize_title(value: str | None) -> str:
     return " ".join((value or "").casefold().split())
+
+
+def _infer_buyer_locale(remote_title: str | None, lot: Lot) -> str:
+    """Use the localized offer title FunPay returned for the paid order."""
+
+    title = _normalize_title(remote_title)
+    ru = _normalize_title(lot.title_ru)
+    en = _normalize_title(lot.title_en)
+    if title and en and en != ru and title == en:
+        return "en"
+    return "ru"

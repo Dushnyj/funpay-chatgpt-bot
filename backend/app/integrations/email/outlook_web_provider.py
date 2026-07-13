@@ -22,6 +22,7 @@ from playwright.async_api import (
 from app.integrations.email.provider import (
     EmailErrorCode,
     EmailProviderError,
+    FreshVerificationCode,
     parse_verification_code,
 )
 
@@ -52,6 +53,11 @@ _ROW_SELECTOR_CANDIDATES = (
     "[role='option']",
     "[role='row']",
 )
+_INBOX_FOLDER_PATTERN = re.compile(r"inbox|входящие", re.IGNORECASE)
+_JUNK_FOLDER_PATTERN = re.compile(
+    r"junk email|junk|spam|нежелательная почта|спам",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +65,10 @@ class _MessageSnapshot:
     key: str
     text: str
     locator: Locator
+    received_at: datetime | None = None
+    fingerprint: str | None = None
+    folder: str = "inbox"
+    tab_pattern: str | None = None
 
 
 def is_outlook_address(email: str) -> bool:
@@ -72,13 +82,12 @@ def _normalise_text(text: str) -> str:
 
 def _looks_like_openai_code_message(text: str) -> bool:
     normalised = _normalise_text(text)
-    has_transactional_sender = _OPENAI_SENDER_MARKERS[0] in normalised
     has_sender = any(marker in normalised for marker in _OPENAI_SENDER_MARKERS)
-    has_openai_name = "openai" in normalised
     has_code_subject = any(marker in normalised for marker in _OPENAI_SUBJECT_MARKERS)
-    return has_transactional_sender or (
-        has_code_subject and (has_sender or has_openai_name)
-    )
+    # A display name alone is attacker-controlled and is not enough to treat a
+    # row as an OpenAI login message.  Outlook Web is a compatibility fallback;
+    # fail closed unless the visible sender address and a code subject agree.
+    return has_sender and has_code_subject
 
 
 def _message_fingerprint(payload: dict[str, Any]) -> str:
@@ -97,6 +106,37 @@ def _message_fingerprint(payload: dict[str, Any]) -> str:
     )
     semantic = _normalise_text(str(payload.get("text") or ""))
     return hashlib.sha256(f"{stable}|{semantic}".encode()).hexdigest()
+
+
+def _received_at(payload: dict[str, Any]) -> datetime | None:
+    """Parse only an explicit timezone-aware HTML ``time[datetime]`` value."""
+    for candidate in str(payload.get("datetime") or "").split("|"):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            value = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if value.tzinfo is not None:
+            return value.astimezone(UTC)
+    return None
+
+
+def _fresh_message_fingerprint(
+    payload: dict[str, Any],
+    received_at: datetime,
+) -> str | None:
+    # DOM element ids may change between mailbox sessions. At least one
+    # Outlook item/conversation id is required for durable per-rental dedupe.
+    stable_ids = "|".join(
+        str(payload.get(name) or "")
+        for name in ("item_id", "conversation_id")
+    )
+    if not stable_ids.replace("|", ""):
+        return None
+    material = f"outlook-web|{stable_ids}|{received_at.isoformat()}"
+    return hashlib.sha256(material.encode()).hexdigest()
 
 
 class OutlookWebProvider:
@@ -205,6 +245,63 @@ class OutlookWebProvider:
         finally:
             # Microsoft cookies are needed only between preflight and fetch.
             self._storage_state = None
+
+    async def fetch_fresh_verification_code(
+        self,
+        *,
+        not_before: datetime,
+        timeout: float = 10.0,
+    ) -> FreshVerificationCode:
+        """Read a provably recent mailbox code without taking a new baseline."""
+        cutoff = (
+            not_before.replace(tzinfo=UTC)
+            if not_before.tzinfo is None
+            else not_before.astimezone(UTC)
+        )
+        deadline = time.monotonic() + timeout
+        try:
+            async with self._mailbox_session() as (page, _context):
+                while True:
+                    snapshots = sorted(
+                        await self._scan_all_folders(page),
+                        key=lambda item: item.received_at or datetime.min.replace(tzinfo=UTC),
+                        reverse=True,
+                    )
+                    for snapshot in snapshots:
+                        if (
+                            snapshot.received_at is None
+                            or snapshot.fingerprint is None
+                            or snapshot.received_at < cutoff
+                        ):
+                            continue
+                        code = await self._read_code(page, snapshot)
+                        if code is not None:
+                            return FreshVerificationCode(
+                                code=code,
+                                received_at=snapshot.received_at,
+                                fingerprint=snapshot.fingerprint,
+                            )
+
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EmailProviderError(
+                            EmailErrorCode.NO_CODE,
+                            "Свежее письмо с кодом OpenAI не найдено.",
+                        )
+                    await asyncio.sleep(min(self._poll_interval_s, remaining))
+        except EmailProviderError:
+            raise
+        except (PlaywrightTimeoutError, asyncio.TimeoutError) as exc:
+            raise EmailProviderError(
+                EmailErrorCode.TIMEOUT,
+                "Outlook Web не ответил при чтении свежего письма.",
+            ) from exc
+        except Exception as exc:
+            logger.warning("Outlook Web fresh-code lookup failed", exc_info=False)
+            raise EmailProviderError(
+                EmailErrorCode.CONNECTION_FAILED,
+                "Не удалось прочитать свежее письмо через Outlook Web.",
+            ) from exc
 
     @asynccontextmanager
     async def _mailbox_session(
@@ -452,6 +549,7 @@ class OutlookWebProvider:
 
     async def _scan_all_folders(self, page: Page) -> list[_MessageSnapshot]:
         snapshots: list[_MessageSnapshot] = []
+        await self._open_mail_folder(page, _INBOX_FOLDER_PATTERN)
         visited_tab = False
         for pattern in (
             re.compile(r"other|другие", re.IGNORECASE),
@@ -463,15 +561,52 @@ class OutlookWebProvider:
             visited_tab = True
             await tab.click()
             await asyncio.sleep(0.35)
-            snapshots.extend(await self._visible_openai_messages(page))
+            snapshots.extend(
+                await self._visible_openai_messages(
+                    page,
+                    folder="inbox",
+                    tab_pattern=pattern.pattern,
+                )
+            )
 
         if not visited_tab:
-            snapshots.extend(await self._visible_openai_messages(page))
+            snapshots.extend(
+                await self._visible_openai_messages(page, folder="inbox")
+            )
+
+        junk_opened = await self._open_mail_folder(page, _JUNK_FOLDER_PATTERN)
+        if junk_opened:
+            snapshots.extend(
+                await self._visible_openai_messages(page, folder="junk")
+            )
+            # Polling must start every pass from Inbox; otherwise a second
+            # scan would inspect Junk twice and silently stop checking Inbox.
+            await self._open_mail_folder(page, _INBOX_FOLDER_PATTERN)
 
         # The same DOM row can be visible through nested selectors; keep one.
         return list({snapshot.key: snapshot for snapshot in snapshots}.values())
 
-    async def _visible_openai_messages(self, page: Page) -> list[_MessageSnapshot]:
+    async def _open_mail_folder(self, page: Page, name_pattern: re.Pattern) -> bool:
+        """Open an Outlook folder through its accessible navigation item."""
+        for role in ("treeitem", "link", "button"):
+            item = page.get_by_role(role, name=name_pattern).first
+            try:
+                if not await item.is_visible():
+                    continue
+                await item.click(timeout=5_000)
+                await asyncio.sleep(0.35)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+        return False
+
+    async def _visible_openai_messages(
+        self,
+        page: Page,
+        *,
+        folder: str = "inbox",
+        tab_pattern: str | None = None,
+    ) -> list[_MessageSnapshot]:
         payloads: list[dict[str, Any]] = await page.evaluate(
             """(selectors) => {
                 for (const selector of selectors) {
@@ -515,16 +650,62 @@ class OutlookWebProvider:
                     key=_message_fingerprint(payload),
                     text=text,
                     locator=page.locator(selector).nth(dom_index),
+                    received_at=(received_at := _received_at(payload)),
+                    fingerprint=(
+                        _fresh_message_fingerprint(payload, received_at)
+                        if received_at is not None
+                        else None
+                    ),
+                    folder=folder,
+                    tab_pattern=tab_pattern,
                 )
             )
         return snapshots
+
+    async def _restore_snapshot(
+        self,
+        page: Page,
+        snapshot: _MessageSnapshot,
+    ) -> _MessageSnapshot | None:
+        """Reopen the captured view and bind the action to the same row.
+
+        Playwright locators are lazy.  Retaining an ``nth()`` locator while
+        moving between Inbox tabs and Junk can otherwise make the later click
+        target a different row in the final view.
+        """
+
+        folder_pattern = (
+            _JUNK_FOLDER_PATTERN if snapshot.folder == "junk" else _INBOX_FOLDER_PATTERN
+        )
+        if not await self._open_mail_folder(page, folder_pattern):
+            return None
+
+        if snapshot.tab_pattern is not None:
+            tab = page.get_by_role(
+                "tab",
+                name=re.compile(snapshot.tab_pattern, re.IGNORECASE),
+            ).first
+            if not await tab.is_visible():
+                return None
+            await tab.click()
+            await asyncio.sleep(0.35)
+
+        current = await self._visible_openai_messages(
+            page,
+            folder=snapshot.folder,
+            tab_pattern=snapshot.tab_pattern,
+        )
+        return next((item for item in current if item.key == snapshot.key), None)
 
     async def _read_code(
         self,
         page: Page,
         snapshot: _MessageSnapshot,
     ) -> str | None:
-        await snapshot.locator.click(timeout=10_000)
+        current = await self._restore_snapshot(page, snapshot)
+        if current is None:
+            return None
+        await current.locator.click(timeout=10_000)
         await asyncio.sleep(0.5)
 
         body_parts: list[str] = []
@@ -538,7 +719,7 @@ class OutlookWebProvider:
             if await locator.count():
                 body_parts.extend(await locator.all_inner_texts())
 
-        combined = "\n".join((snapshot.text, *body_parts))
+        combined = "\n".join((current.text, *body_parts))
         if not _looks_like_openai_code_message(combined):
             return None
         return parse_verification_code(combined)

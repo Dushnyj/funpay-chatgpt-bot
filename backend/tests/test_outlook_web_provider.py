@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,7 +36,6 @@ def test_does_not_treat_custom_exchange_domain_as_outlook_web():
     "text",
     [
         "OpenAI <noreply@tm.openai.com> Your temporary ChatGPT code",
-        "OpenAI Ваш временный код ChatGPT",
         "noreply@openai.com Verification code",
     ],
 )
@@ -49,6 +49,7 @@ def test_identifies_openai_login_mail(text):
         "Newsletter ChatGPT weekly update",
         "Microsoft account security code 123456",
         "OpenAI product announcement",
+        "OpenAI Ваш временный код ChatGPT",
     ],
 )
 def test_rejects_non_code_mail(text):
@@ -135,6 +136,189 @@ async def test_fetch_without_preflight_never_returns_stale_code():
     with pytest.raises(EmailProviderError) as error:
         await provider.fetch_verification_code(timeout=0)
     assert error.value.code is EmailErrorCode.CONNECTION_FAILED
+
+
+async def test_fresh_fetch_reads_timestamped_message_without_preflight(monkeypatch):
+    provider = OutlookWebProvider(
+        "user@hotmail.com",
+        "password",
+        poll_interval_s=0,
+    )
+    page = MagicMock()
+    context = MagicMock()
+    received_at = datetime(2026, 7, 13, 10, tzinfo=timezone.utc)
+    fresh = _MessageSnapshot(
+        "fresh-key",
+        "OpenAI fresh code",
+        MagicMock(),
+        received_at=received_at,
+        fingerprint="f" * 64,
+    )
+
+    @asynccontextmanager
+    async def mailbox_session():
+        yield page, context
+
+    monkeypatch.setattr(provider, "_mailbox_session", mailbox_session)
+    monkeypatch.setattr(
+        provider,
+        "_scan_all_folders",
+        AsyncMock(return_value=[fresh]),
+    )
+    monkeypatch.setattr(provider, "_read_code", AsyncMock(return_value="654321"))
+
+    result = await provider.fetch_fresh_verification_code(
+        not_before=datetime(2026, 7, 13, 9, 59, tzinfo=timezone.utc),
+        timeout=0,
+    )
+
+    assert result.code == "654321"
+    assert result.received_at == received_at
+    assert result.fingerprint == "f" * 64
+
+
+async def test_fresh_fetch_skips_snapshot_without_proven_timestamp(monkeypatch):
+    provider = OutlookWebProvider(
+        "user@hotmail.com",
+        "password",
+        poll_interval_s=0,
+    )
+    page = MagicMock()
+    context = MagicMock()
+    unproven = _MessageSnapshot(
+        "unknown-time",
+        "OpenAI code 111111",
+        MagicMock(),
+    )
+
+    @asynccontextmanager
+    async def mailbox_session():
+        yield page, context
+
+    read_code = AsyncMock(return_value="111111")
+    monkeypatch.setattr(provider, "_mailbox_session", mailbox_session)
+    monkeypatch.setattr(
+        provider,
+        "_scan_all_folders",
+        AsyncMock(return_value=[unproven]),
+    )
+    monkeypatch.setattr(provider, "_read_code", read_code)
+
+    with pytest.raises(EmailProviderError) as error:
+        await provider.fetch_fresh_verification_code(
+            not_before=datetime(2026, 7, 13, 9, 59, tzinfo=timezone.utc),
+            timeout=0,
+        )
+    assert error.value.code is EmailErrorCode.NO_CODE
+    read_code.assert_not_awaited()
+
+
+async def test_fresh_fetch_finds_code_only_in_junk_email(monkeypatch):
+    provider = OutlookWebProvider(
+        "user@hotmail.com",
+        "password",
+        poll_interval_s=0,
+    )
+    page = MagicMock()
+    context = MagicMock()
+    current_folder = {"name": "inbox"}
+    opened_folders: list[str] = []
+    scanned_folders: list[str] = []
+    received_at = datetime(2026, 7, 13, 10, tzinfo=timezone.utc)
+    junk_message = _MessageSnapshot(
+        "junk-only",
+        "OpenAI fresh code",
+        MagicMock(),
+        received_at=received_at,
+        fingerprint="j" * 64,
+    )
+
+    def get_by_role(role, *, name):
+        locator = MagicMock()
+        locator.first = locator
+        pattern = name.pattern.lower()
+        folder = None
+        if role == "treeitem" and "inbox" in pattern:
+            folder = "inbox"
+        elif role == "treeitem" and "junk" in pattern:
+            folder = "junk"
+        locator.is_visible = AsyncMock(return_value=folder is not None)
+
+        async def click(**_kwargs):
+            assert folder is not None
+            current_folder["name"] = folder
+            opened_folders.append(folder)
+
+        locator.click = AsyncMock(side_effect=click)
+        return locator
+
+    async def visible_openai_messages(_page, **_view):
+        folder = current_folder["name"]
+        scanned_folders.append(folder)
+        return [junk_message] if folder == "junk" else []
+
+    @asynccontextmanager
+    async def mailbox_session():
+        yield page, context
+
+    page.get_by_role.side_effect = get_by_role
+    read_code = AsyncMock(return_value="515253")
+    monkeypatch.setattr(provider, "_mailbox_session", mailbox_session)
+    monkeypatch.setattr(
+        provider,
+        "_visible_openai_messages",
+        visible_openai_messages,
+    )
+    monkeypatch.setattr(provider, "_read_code", read_code)
+    monkeypatch.setattr(
+        "app.integrations.email.outlook_web_provider.asyncio.sleep",
+        AsyncMock(),
+    )
+
+    result = await provider.fetch_fresh_verification_code(
+        not_before=datetime(2026, 7, 13, 9, 59, tzinfo=timezone.utc),
+        timeout=0,
+    )
+
+    assert result.code == "515253"
+    assert result.received_at == received_at
+    assert opened_folders == ["inbox", "junk", "inbox"]
+    assert scanned_folders == ["inbox", "junk"]
+    assert current_folder["name"] == "inbox"
+    read_code.assert_awaited_once_with(page, junk_message)
+
+
+async def test_read_code_rebinds_locator_to_captured_mailbox_view(monkeypatch):
+    provider = OutlookWebProvider("user@hotmail.com", "password")
+    page = MagicMock()
+    stale_locator = MagicMock()
+    stale_locator.click = AsyncMock()
+    live_locator = MagicMock()
+    live_locator.click = AsyncMock()
+    stored = _MessageSnapshot(
+        "same-message",
+        "noreply@openai.com Verification code 123456",
+        stale_locator,
+        folder="junk",
+    )
+    current = _MessageSnapshot(
+        "same-message",
+        "noreply@openai.com Verification code 654321",
+        live_locator,
+        folder="junk",
+    )
+    empty_body = MagicMock()
+    empty_body.count = AsyncMock(return_value=0)
+    page.locator.return_value = empty_body
+    monkeypatch.setattr(provider, "_restore_snapshot", AsyncMock(return_value=current))
+    monkeypatch.setattr(
+        "app.integrations.email.outlook_web_provider.asyncio.sleep",
+        AsyncMock(),
+    )
+
+    assert await provider._read_code(page, stored) == "654321"
+    stale_locator.click.assert_not_awaited()
+    live_locator.click.assert_awaited_once_with(timeout=10_000)
 
 
 async def test_security_challenge_is_typed_and_secret_free():

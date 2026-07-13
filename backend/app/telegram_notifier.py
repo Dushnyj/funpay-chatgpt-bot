@@ -43,12 +43,13 @@ class TelegramNotifier:
     @classmethod
     async def from_settings(cls, session: AsyncSession) -> TelegramNotifier | None:
         token, chat_id = await get_effective_telegram_config(session)
-        if not token:
+        if not token or not chat_id:
             return None
-        return cls(
-            bot_token=token,
-            seller_chat_id=chat_id,
-        )
+        try:
+            return cls(bot_token=token, seller_chat_id=chat_id)
+        except Exception:
+            logger.exception("Invalid Telegram notification configuration")
+            return None
 
     async def send_test(self) -> None:
         """Send a test notification and surface errors to the settings API."""
@@ -59,13 +60,15 @@ class TelegramNotifier:
             text="✅ FunPay Bot: Telegram notifications are configured.",
         )
 
-    async def notify(self, text: str) -> None:
+    async def notify(self, text: str) -> bool:
         if self._bot is None or not self._seller_chat_id:
-            return
+            return False
         try:
             await self._bot.send_message(chat_id=self._seller_chat_id, text=text)
+            return True
         except Exception:
             logger.exception("Telegram notify failed")
+            return False
 
     async def notify_new_order(self, order_id: str, desc: str, price: int) -> None:
         await self.notify(f"🆕 Новый заказ #{order_id}: {desc}, {price}₽")
@@ -85,11 +88,39 @@ class TelegramNotifier:
     async def notify_account_unavailable(self, account_login: str, reason: str) -> None:
         await self.notify(f"🔴 Аккаунт {account_login} недоступен ({reason})")
 
-    async def notify_low_limits(self, account_login: str, chat_weekly: int) -> None:
-        await self.notify(f"📊 Лимиты аккаунта {account_login} упали ниже порога (chat weekly: {chat_weekly}%)")
+    async def notify_low_limits(
+        self,
+        account_login: str,
+        *,
+        remaining_pct: int,
+        window_label: str,
+    ) -> bool:
+        return await self.notify(
+            f"📊 Длинный лимит Codex аккаунта {account_login} "
+            f"({window_label}) снизился до {remaining_pct}%"
+        )
 
-    async def notify_seller_called(self, buyer_id: str) -> None:
-        await self.notify(f"📢 Покупатель {buyer_id} вызывает продавца")
+    async def notify_seller_called(
+        self,
+        buyer_id: str,
+        *,
+        funpay_chat_id: str | None = None,
+        order_id: str | None = None,
+    ) -> None:
+        context = []
+        if funpay_chat_id:
+            context.append(f"чат FunPay #{funpay_chat_id}")
+        if order_id:
+            context.append(f"заказ #{order_id}")
+        suffix = f" ({', '.join(context)})" if context else ""
+        await self.notify(
+            f"📢 Покупатель {buyer_id} вызывает продавца{suffix}. "
+            "Ответьте ему в разделе «Чаты» админ-панели."
+        )
+
+    async def notify_order_refunded(self, order_id: str, *, pending: bool) -> None:
+        state = "ожидает подтверждённого выхода из аккаунта" if pending else "возвращён"
+        await self.notify(f"↩️ Заказ #{order_id}: {state}")
 
     async def notify_bump_failed(self, lot_id: int) -> None:
         await self.notify(f"❌ Bump лота #{lot_id} не удался")

@@ -335,6 +335,7 @@ async def test_measure_refresh_failed_sets_status(session, httpx_mock):
     reloaded = await session.get(AccountLimits, acc.id)
     assert reloaded.refresh_status == "expired"
     assert reloaded.refresh_failed_at is not None
+    assert reloaded.refresh_recover_attempts == 0
 
 
 @pytest.mark.asyncio
@@ -373,12 +374,24 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     httpx_mock.add_response(
         url="https://chatgpt.com/backend-api/wham/usage",
         method="GET",
-        json={"plan_type": "plus", "rate_limit": None},
+        json={
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18000,
+                },
+                "secondary_window": {
+                    "used_percent": 30,
+                    "limit_window_seconds": 604800,
+                },
+            },
+        },
     )
     httpx_mock.add_response(
         url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
         method="GET",
-        json={"accounts": {"acc-1": {"account": {"plan_type": "plus"}, "entitlement": {"expires_at": None}}}},
+        json={"accounts": {"acc-1": {"account": {"plan_type": "plus"}, "entitlement": {"has_active_subscription": True, "expires_at": None}}}},
     )
 
     result = await measure_account_limits(session, acc.id)
@@ -434,7 +447,10 @@ async def test_measure_conflicting_plan_signals_clear_sellable_tier(session, htt
         },
     )
 
-    assert await measure_account_limits(session, acc.id) == MeasureResult.OK
+    assert (
+        await measure_account_limits(session, acc.id)
+        == MeasureResult.PLAN_DETECTION_FAILED
+    )
     await session.refresh(acc)
     limits = await session.get(AccountLimits, acc.id)
     assert acc.tier_id is None
@@ -465,7 +481,19 @@ async def test_measure_uses_id_token_plan_as_conservative_fallback(session, http
     httpx_mock.add_response(
         url="https://chatgpt.com/backend-api/wham/usage",
         method="GET",
-        json={"plan_type": None, "rate_limit": None},
+        json={
+            "plan_type": None,
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18000,
+                },
+                "secondary_window": {
+                    "used_percent": 30,
+                    "limit_window_seconds": 604800,
+                },
+            },
+        },
     )
     httpx_mock.add_response(
         url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",

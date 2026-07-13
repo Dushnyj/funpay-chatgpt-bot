@@ -9,6 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import PriceMatrixItem
 from app.models.lot import PriceMatrix
+from app.services.offer_configuration import (
+    OfferConfigurationError,
+    validate_offer_configurations,
+)
 
 router = APIRouter(prefix="/api/prices", tags=["prices"], dependencies=[Depends(get_current_user)])
 
@@ -18,7 +22,7 @@ class PriceUpdateResponse(BaseModel):
 
 
 class PriceUpdateRequest(BaseModel):
-    items: list[PriceMatrixItem] = Field(min_length=1, max_length=10_000)
+    items: list[PriceMatrixItem] = Field(max_length=10_000)
 
 
 @router.get("", response_model=list[PriceMatrixItem])
@@ -40,6 +44,18 @@ async def update_prices(
     request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
+    try:
+        # A full-matrix save must preserve existing rows for a temporarily
+        # paused tariff. Lot reconciliation keeps them offline until the tier
+        # is sellable again; manual lot creation remains strict.
+        await validate_offer_configurations(
+            session,
+            req.items,
+            require_sellable_tier=False,
+            require_enabled_duration=False,
+        )
+    except OfferConfigurationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     await session.execute(delete(PriceMatrix))
     for item in req.items:
         session.add(PriceMatrix(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,17 @@ from app.models.rental import Order
 
 class ConversationNotFoundError(LookupError):
     pass
+
+
+_LOGIN_CODE_RE = re.compile(
+    r"(?i)(\b(?:TOTP(?:\s*\([^)]*\))?|Email OTP OpenAI|OpenAI email OTP)"
+    r"\s*:\s*)\d{6}\b"
+)
+
+
+def _redact_login_codes(text: str) -> str:
+    """Prevent buyer TOTP/email OTP values from entering local chat history."""
+    return _LOGIN_CODE_RE.sub(r"\1[скрыто]", text)
 
 
 class ChatService:
@@ -29,6 +41,9 @@ class ChatService:
     ) -> tuple[ChatMessage, bool]:
         source_id = str(message.message_id)
         conversation = await self._find_or_create_conversation(session, message)
+        stored_text = _redact_login_codes(message.text or "") if message.from_me else (
+            message.text or ""
+        )
         existing = await session.scalar(
             select(ChatMessage).where(
                 ChatMessage.conversation_id == conversation.id,
@@ -42,15 +57,26 @@ class ChatService:
         # stored the returned message ID. Merge that echo into the pending
         # outbox row instead of creating a duplicate outgoing bubble.
         if message.from_me:
-            pending = await session.scalar(
+            pending_candidates = list(
+                (
+                    await session.execute(
                 select(ChatMessage)
                 .where(
                     ChatMessage.conversation_id == conversation.id,
                     ChatMessage.direction == "outgoing",
                     ChatMessage.delivery_status == "pending",
-                    ChatMessage.text == (message.text or ""),
                 )
                 .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                        .limit(20)
+                    )
+                ).scalars()
+            )
+            # Fernet is randomized, so encrypted text cannot be compared in
+            # SQL. Decrypt only a bounded pending outbox window and compare in
+            # memory instead.
+            pending = next(
+                (item for item in pending_candidates if item.text == stored_text),
+                None,
             )
             if pending is not None:
                 pending.funpay_message_id = source_id
@@ -66,7 +92,7 @@ class ChatService:
             funpay_message_id=source_id,
             direction=direction,
             sender_funpay_id=str(message.sender_id) if message.sender_id is not None else None,
-            text=message.text or "",
+            text=stored_text,
             delivery_status="sent" if message.from_me else "received",
             is_read=message.from_me,
             created_at=created_at,
@@ -137,16 +163,17 @@ class ChatService:
         text: str,
     ) -> ChatMessage:
         created_at = datetime.now(timezone.utc)
+        stored_text = _redact_login_codes(text)
         message = ChatMessage(
             conversation_id=conversation.id,
             direction="outgoing",
-            text=text,
+            text=stored_text,
             delivery_status="pending",
             is_read=True,
             created_at=created_at,
         )
         session.add(message)
-        self._set_last_message(conversation, text, "outgoing", created_at)
+        self._set_last_message(conversation, stored_text, "outgoing", created_at)
         await session.flush()
         return message
 

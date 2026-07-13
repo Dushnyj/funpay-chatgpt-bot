@@ -129,7 +129,14 @@ export default function Dashboard() {
           <Link className="text-link" to="/orders">Все сделки <Icon name="arrow-right" size={15} /></Link>
         </div>
         {ordersQuery.isLoading ? <LoadingState label="Загружаем заказы" /> : recentOrders.length === 0 ? (
-          <EmptyState icon="deals" title="Заказов пока нет" description="После подключения FunPay новые сделки появятся здесь автоматически." />
+          <EmptyState
+            icon="deals"
+            title="Заказов пока нет"
+            description={connected
+              ? 'FunPay подключён. Проверьте, что хотя бы один лот активен; первый оплаченный заказ появится здесь автоматически.'
+              : 'Сначала подключите FunPay и опубликуйте лоты. До этого панель не сможет получать реальные заказы.'}
+            action={<Link className="button button--secondary" to={connected ? '/lots' : '/settings'}>{connected ? 'Проверить лоты' : 'Настроить FunPay'}<Icon name="arrow-right" /></Link>}
+          />
         ) : (
           <TableShell>
             <table className="data-table">

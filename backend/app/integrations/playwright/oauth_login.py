@@ -22,13 +22,16 @@ _SCOPE = "openid profile email offline_access"
 
 # Окно ожидания email-code / 2FA input после ввода пароля (сек)
 _POST_PASSWORD_CODE_WAIT_S = 5.0
+_PASSWORD_OR_CODE_WAIT_MS = 10_000
 
 
 class OAuthErrorCode(str, enum.Enum):
     INVALID_CREDENTIALS = "invalid_credentials"
+    INVALID_TOTP = "invalid_totp"
     CLOUDFLARE_CHALLENGE = "cloudflare_challenge"
     EMAIL_AUTH_FAILED = "email_auth_failed"
     EMAIL_CODE_NOT_FOUND = "email_code_not_found"
+    EMAIL_CODE_REJECTED = "email_code_rejected"
     EMAIL_PROVIDER_UNSUPPORTED = "email_provider_unsupported"
     EMAIL_CONNECTION_FAILED = "email_connection_failed"
     EMAIL_SECURITY_CHALLENGE = "email_security_challenge"
@@ -132,13 +135,95 @@ async def _code_step_kind(page: Page) -> str:
     """Best-effort distinction between email verification and TOTP forms."""
     url = str(getattr(page, "url", "") or "").lower()
     text = await _page_text(page)
-    totp_markers = ("authenticator", "two-factor", "2fa", "one-time password")
-    email_markers = ("check your email", "sent a code", "email verification")
-    if any(marker in url or marker in text for marker in totp_markers):
+    totp_url_markers = ("/mfa", "totp", "authenticator")
+    totp_text_markers = (
+        "authenticator",
+        "authentication app",
+        "two-factor",
+        "two factor",
+        "2fa",
+        "one-time password",
+        "code from your app",
+        "код из приложения",
+        "двухфактор",
+        "приложения для проверки подлинности",
+    )
+    email_url_markers = ("email-code", "email_code", "email-verification")
+    email_text_markers = (
+        "check your email",
+        "sent a code",
+        "email verification",
+        "code to your email",
+        "code to the email",
+        "проверьте почту",
+        "отправили код",
+        "код из письма",
+        "код на вашу почту",
+    )
+    if any(marker in url for marker in totp_url_markers) or any(
+        marker in text for marker in totp_text_markers
+    ):
         return "totp"
-    if any(marker in url or marker in text for marker in email_markers):
+    if any(marker in url for marker in email_url_markers) or any(
+        marker in text for marker in email_text_markers
+    ):
         return "email"
     return "unknown"
+
+
+async def _raise_if_code_rejected(page: Page, code_input, *, kind: str) -> None:
+    """Turn a remaining code form into a precise validation error.
+
+    The same selector is used for email OTP and TOTP. When an accepted email
+    code advances to TOTP, classification changes to ``totp`` and is allowed.
+    A remaining input is terminal only alongside an explicit rejection marker;
+    an unclassified slow transition stays a retryable callback timeout.
+    """
+    try:
+        await code_input.wait_for(state="hidden", timeout=2_500)
+        return
+    except PlaywrightTimeoutError:
+        pass
+
+    text = await _page_text(page)
+    rejected_markers = (
+        "invalid code",
+        "invalid authentication code",
+        "invalid verification code",
+        "incorrect code",
+        "incorrect verification code",
+        "wrong code",
+        "wrong verification code",
+        "code is invalid",
+        "code you entered is incorrect",
+        "that code is incorrect",
+        "code has expired",
+        "expired code",
+        "неверный код",
+        "неправильный код",
+        "код недействителен",
+        "срок действия кода истек",
+    )
+    current_kind = await _code_step_kind(page)
+    explicitly_rejected = any(marker in text for marker in rejected_markers)
+
+    if kind == "email" and current_kind == "totp" and not explicitly_rejected:
+        return
+    if not explicitly_rejected:
+        # A slow or changed UI is transient. The outer OAuth callback timeout
+        # remains retryable; only an explicit rejection is terminal.
+        return
+    if kind == "totp":
+        raise OAuthLoginError(
+            "OpenAI отклонил TOTP-код.",
+            code=OAuthErrorCode.INVALID_TOTP,
+            stage="totp",
+        )
+    raise OAuthLoginError(
+        "OpenAI отклонил код из письма.",
+        code=OAuthErrorCode.EMAIL_CODE_REJECTED,
+        stage="email_code",
+    )
 
 
 def _generate_pkce() -> tuple[str, str]:
@@ -227,77 +312,100 @@ async def _do_post_password_steps(
     1. **Email-code** — логин с нового IP/device. Код приходит на почту, читаем через email_provider.
     2. **2FA TOTP** — если включена. Генерируем из totp_secret.
 
-    Оба поля — `input[name="code"]`. Различаем по контексту: email-code появляется первым
-    (сразу после пароля), 2FA — после. Стратегия: ждём появления поля.
-      - Если задан email_provider → запрашиваем email-code, fill, Continue.
-      - Затем снова ждём поле; если задан totp_secret → генерируем TOTP, fill, Continue.
+    Оба поля используют один numeric-селектор, поэтому перед вводом любого
+    значения видимая страница обязательно классифицируется. Наличие локально
+    настроенной почты или TOTP не используется как признак типа формы.
 
     Если код не появился — аккаунт без подтверждений, ничего не делаем.
     """
-    # Шаг 1: потенциальный email-code (появляется первым после пароля).
-    await raise_if_cloudflare(page, "post_password")
-    pending_totp_input = None
-    if email_provider is not None:
+    # Ожидается не более двух форм: email-code, затем TOTP. Каждая форма
+    # классифицируется отдельно до заполнения общего numeric input.
+    for _ in range(2):
+        await raise_if_cloudflare(page, "post_password")
         code_input = page.locator('input[name="code"], input[inputmode="numeric"]').first
         try:
             await code_input.wait_for(timeout=int(timeout_s * 1000))
         except PlaywrightTimeoutError:
-            # Поля нет → email-code не требуется. Переходим к проверке 2FA.
-            code_input = None
+            # Поля нет — аккаунт уже прошёл все необходимые подтверждения.
+            return
 
-        if code_input is not None:
-            if totp_secret and await _code_step_kind(page) == "totp":
-                pending_totp_input = code_input
-            else:
-                if email_preflight_error is not None:
-                    exc = email_preflight_error
-                    try:
-                        code = OAuthErrorCode(exc.code.value)
-                    except ValueError:
-                        code = OAuthErrorCode.EMAIL_CONNECTION_FAILED
-                    raise OAuthLoginError(
-                        exc.detail,
-                        code=code,
-                        stage="email_code",
-                    ) from exc
-                try:
-                    email_code = await email_provider.fetch_verification_code()
-                except EmailProviderError as exc:
-                    try:
-                        code = OAuthErrorCode(exc.code.value)
-                    except ValueError:
-                        code = OAuthErrorCode.EMAIL_CONNECTION_FAILED
-                    raise OAuthLoginError(
-                        exc.detail,
-                        code=code,
-                        stage="email_code",
-                    ) from exc
-                if not email_code:
-                    raise OAuthLoginError(
-                        "Новое письмо с кодом OpenAI не найдено.",
-                        code=OAuthErrorCode.EMAIL_CODE_NOT_FOUND,
-                        stage="email_code",
-                    )
-                await code_input.fill(email_code)
-                await page.get_by_role("button", name="Continue").click()
-                await raise_if_cloudflare(page, "email_code")
+        step_kind = await _code_step_kind(page)
+        if step_kind == "email":
+            await _submit_email_code(
+                page,
+                code_input,
+                email_provider,
+                email_preflight_error,
+            )
+            continue
 
-    # Шаг 2: потенциальный 2FA TOTP (появляется после email-code или сразу после пароля,
-    # если email_provider не задан / email-code не требовался).
-    if totp_secret:
-        otp_input = pending_totp_input or page.locator(
-            'input[name="code"], input[inputmode="numeric"]'
-        ).first
-        try:
-            if pending_totp_input is None:
-                await otp_input.wait_for(timeout=int(timeout_s * 1000))
+        if step_kind == "totp":
+            if not totp_secret:
+                raise OAuthLoginError(
+                    "OpenAI запросил код из приложения-аутентификатора, но TOTP не настроен.",
+                    code=OAuthErrorCode.OAUTH_REJECTED,
+                    stage="totp",
+                )
             code = generate_totp(totp_secret)
-            await otp_input.fill(code)
+            await code_input.fill(code)
             await page.get_by_role("button", name="Continue").click()
             await raise_if_cloudflare(page, "totp")
-        except PlaywrightTimeoutError:
-            # 2FA не потребовалось — нормальный сценарий для некоторых аккаунтов.
-            pass
+            await _raise_if_code_rejected(page, code_input, kind="totp")
+            return
+
+        raise OAuthLoginError(
+            "OpenAI показал поле кода, но тип подтверждения определить не удалось.",
+            code=OAuthErrorCode.OAUTH_REJECTED,
+            stage="verification_code",
+        )
+
+
+async def _submit_email_code(
+    page: Page,
+    code_input,
+    email_provider: EmailProvider | None,
+    email_preflight_error: EmailProviderError | None,
+) -> None:
+    """Fetch and submit an OpenAI email verification code safely."""
+    if email_provider is None:
+        raise OAuthLoginError(
+            "OpenAI запросил код из почты, но почта не подключена.",
+            code=OAuthErrorCode.EMAIL_PROVIDER_UNSUPPORTED,
+            stage="email_code",
+        )
+    if email_preflight_error is not None:
+        exc = email_preflight_error
+        try:
+            code = OAuthErrorCode(exc.code.value)
+        except ValueError:
+            code = OAuthErrorCode.EMAIL_CONNECTION_FAILED
+        raise OAuthLoginError(
+            exc.detail,
+            code=code,
+            stage="email_code",
+        ) from exc
+    try:
+        email_code = await email_provider.fetch_verification_code()
+    except EmailProviderError as exc:
+        try:
+            code = OAuthErrorCode(exc.code.value)
+        except ValueError:
+            code = OAuthErrorCode.EMAIL_CONNECTION_FAILED
+        raise OAuthLoginError(
+            exc.detail,
+            code=code,
+            stage="email_code",
+        ) from exc
+    if not email_code:
+        raise OAuthLoginError(
+            "Новое письмо с кодом OpenAI не найдено.",
+            code=OAuthErrorCode.EMAIL_CODE_NOT_FOUND,
+            stage="email_code",
+        )
+    await code_input.fill(email_code)
+    await page.get_by_role("button", name="Continue").click()
+    await raise_if_cloudflare(page, "email_code")
+    await _raise_if_code_rejected(page, code_input, kind="email")
 
 
 async def login_and_get_auth_code(
@@ -366,32 +474,66 @@ async def login_and_get_auth_code(
         # Шаг 1: ввод email
         email_input = page.locator('input[name="email"], input[type="email"]').first
         await email_input.fill(login)
-        await page.get_by_role("button", name="Continue").click()
-        await raise_if_cloudflare(page, "email")
-
-        # Шаг 2: ввод пароля
-        password_input = page.locator('input[name="password"], input[type="password"]').first
-        await password_input.fill(password)
         email_preflight_error = None
         if email_provider is not None:
             try:
-                # Capture the old-message baseline immediately before OpenAI
-                # can send a new login code. Failure is deferred unless the
-                # page actually asks for email verification.
+                # The next click may send an email code instead of opening the
+                # password form, so establish the mailbox baseline first.
                 await email_provider.preflight()
             except EmailProviderError as exc:
+                # Defer this error until the UI actually asks for email.
                 email_preflight_error = exc
         await page.get_by_role("button", name="Continue").click()
-        await raise_if_cloudflare(page, "password")
-        await _raise_if_credentials_rejected(page)
+        await raise_if_cloudflare(page, "email")
+
+        # Шаг 2: OpenAI may ask for either the password or an email code.
+        password_input = page.locator('input[name="password"], input[type="password"]').first
+        password_visible = True
+        try:
+            await password_input.wait_for(timeout=_PASSWORD_OR_CODE_WAIT_MS)
+        except PlaywrightTimeoutError:
+            password_visible = False
+
+        if not password_visible and not callback_future.done():
+            email_code_input = page.locator(
+                'input[name="code"], input[inputmode="numeric"]'
+            ).first
+            try:
+                await email_code_input.wait_for(timeout=_PASSWORD_OR_CODE_WAIT_MS)
+            except PlaywrightTimeoutError as exc:
+                raise OAuthLoginError(
+                    "OpenAI не показал ни пароль, ни форму кода из почты.",
+                    code=OAuthErrorCode.LOGIN_TIMEOUT,
+                    stage="email",
+                ) from exc
+            await _submit_email_code(
+                page,
+                email_code_input,
+                email_provider,
+                email_preflight_error,
+            )
+            # Some accounts ask for password after verifying the email; most
+            # passwordless accounts continue directly to TOTP/consent.
+            try:
+                await password_input.wait_for(timeout=2_000)
+                password_visible = True
+            except PlaywrightTimeoutError:
+                password_visible = False
+
+        if password_visible and not callback_future.done():
+            await password_input.fill(password)
+            await page.get_by_role("button", name="Continue").click()
+            await raise_if_cloudflare(page, "password")
+            await _raise_if_credentials_rejected(page)
 
         # Шаг 3: email-code и/или 2FA (TOTP), если OpenAI требует.
-        await _do_post_password_steps(
-            page,
-            totp_secret,
-            email_provider,
-            email_preflight_error,
-        )
+        if not callback_future.done():
+            await _do_post_password_steps(
+                page,
+                totp_secret,
+                email_provider,
+                email_preflight_error,
+            )
 
         # Ждём, пока redirect на callback принесёт код.
         auth_code = await asyncio.wait_for(

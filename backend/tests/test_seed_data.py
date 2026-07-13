@@ -5,11 +5,13 @@ from sqlalchemy import func, select
 # чтобы create_all в фикстуре test_engine создал таблицу.
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.message import MessageTemplate
+from app.services.messages import validate_template_content
 from app.services.seed_data import (
     DEFAULT_DURATIONS,
     DEFAULT_LIMIT_SCOPES,
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_TIERS,
+    LEGACY_LIMIT_MESSAGE_TEMPLATES,
     seed_catalog,
     seed_message_templates,
 )
@@ -30,17 +32,51 @@ async def test_seed_message_templates_creates_all_keys(session):
             assert result.scalar_one() is not None, f"missing {key}/{lang}"
 
 
+def test_default_message_templates_use_only_valid_placeholders():
+    for key, translations in DEFAULT_MESSAGE_TEMPLATES.items():
+        for lang, content in translations.items():
+            validate_template_content(key, lang, content)
+
+
 @pytest.mark.asyncio
 async def test_seed_message_templates_idempotent(session):
     await seed_message_templates(session)
     expected_count = len(DEFAULT_MESSAGE_TEMPLATES) * 2  # ru + en
-    count_result = await session.execute(select(func.count()).select_from(MessageTemplate))
+    count_result = await session.execute(
+        select(func.count()).select_from(MessageTemplate)
+    )
     assert count_result.scalar_one() == expected_count
 
     # Повторный вызов — число не меняется
     await seed_message_templates(session)
-    count_result = await session.execute(select(func.count()).select_from(MessageTemplate))
+    count_result = await session.execute(
+        select(func.count()).select_from(MessageTemplate)
+    )
     assert count_result.scalar_one() == expected_count
+
+
+@pytest.mark.asyncio
+async def test_seed_upgrades_only_exact_legacy_limit_defaults(session):
+    legacy_welcome = MessageTemplate(
+        key="welcome",
+        lang="ru",
+        content=LEGACY_LIMIT_MESSAGE_TEMPLATES["welcome"]["ru"],
+    )
+    customized_subscription = MessageTemplate(
+        key="subscription",
+        lang="ru",
+        content="Мой шаблон: {tier}",
+    )
+    session.add_all([legacy_welcome, customized_subscription])
+    await session.commit()
+
+    await seed_message_templates(session)
+    await session.refresh(legacy_welcome)
+    await session.refresh(customized_subscription)
+
+    assert legacy_welcome.content == DEFAULT_MESSAGE_TEMPLATES["welcome"]["ru"]
+    assert "{codex_primary_window}" in legacy_welcome.content
+    assert customized_subscription.content == "Мой шаблон: {tier}"
 
 
 @pytest.mark.asyncio

@@ -25,7 +25,14 @@ const TEMPLATE_META: Record<string, { title: string; description: string }> = {
 const SAMPLE_VALUES: Record<string, string> = {
   tier: 'Plus', days: '7', login: 'user@example.com', password: '••••••••', expires_at: '19.07.2026', expires_in: '6д 23ч',
   code: '482 913', retry_in_sec: '24', retry_minutes: '5', chat_5h: '82', chat_weekly: '64', codex_5h: '82', codex_weekly: '64',
+  codex_primary_limit: '95%', codex_primary_window: '5 ч', codex_primary_reset: '13.07.2026 15:21 UTC',
+  codex_secondary_limit: '72%', codex_secondary_window: '7 дн.', codex_secondary_reset: '19.07.2026 03:21 UTC',
 }
+
+const OBSERVED_LIMIT_VARIABLES = [
+  'codex_primary_limit', 'codex_primary_window', 'codex_primary_reset',
+  'codex_secondary_limit', 'codex_secondary_window', 'codex_secondary_reset',
+]
 
 const draftKey = (key: string, lang: string) => `${key}:${lang}`
 
@@ -125,8 +132,10 @@ export default function Templates() {
             </div>
             <div className="template-editor__body">
               <div className="editor-pane">
-                <label className="field"><span className="field__label">Текст сообщения</span><textarea value={content} onChange={(event) => changeContent(event.target.value)} rows={13} spellCheck="true" /></label>
+                <label className="field"><span className="field__label">Текст сообщения</span><textarea value={content} onChange={(event) => changeContent(event.target.value)} rows={13} spellCheck="true" maxLength={4000} /><span className="field__hint">{content.length} / 4000 символов{['welcome', 'replace_success'].includes(selectedKey) ? ' · обязательны {login} и {password}' : selectedKey === 'code_success' ? ' · обязателен {code}' : ''}</span></label>
                 <div className="variable-bar"><span>Переменные в сообщении:</span>{variables.length ? variables.map((variable) => <button key={variable} type="button" onClick={() => changeContent(`${content}{${variable}}`)}>{`{${variable}}`}</button>) : <small>Нет переменных</small>}</div>
+                <div className="variable-bar variable-bar--available"><span>Фактические окна Codex:</span>{OBSERVED_LIMIT_VARIABLES.map((variable) => <button key={variable} type="button" onClick={() => changeContent(`${content}{${variable}}`)} title="Добавить переменную в конец сообщения">{`{${variable}}`}</button>)}</div>
+                <div className="form-alert form-alert--info"><Icon name="activity" /><span>Primary/secondary — порядок полей OpenAI, а не названия короткого и длинного окна. Ориентируйтесь на переменную длительности: длинное окно Free — 30 дней, у платных тарифов — 7 дней; у платных отдельно может быть короткое окно 5 часов. Старые 5ч/weekly-переменные оставлены только для совместимости.</span></div>
                 {unknownVariables.length > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Неизвестные переменные: {unknownVariables.join(', ')}. Проверьте, что backend передаёт их при рендеринге.</span></div>}
               </div>
               <div className="preview-pane">

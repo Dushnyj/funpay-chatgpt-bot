@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
-from app.models.account import Account, AccountCheckJob, AccountLimits
+from app.models.account import (
+    Account,
+    AccountCheckJob,
+    AccountLimits,
+    EmailOAuthCredential,
+)
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier
 
@@ -163,9 +168,20 @@ async def test_patch_account_status(auth_client: AsyncClient, session: AsyncSess
         "tier_id": tier_id,
     })
     acc_id = resp.json()["id"]
-    resp = await auth_client.patch(f"/api/accounts/{acc_id}", json={"status": "active"})
+    resp = await auth_client.patch(
+        f"/api/accounts/{acc_id}", json={"status": "maintenance"}
+    )
     assert resp.status_code == 200
-    assert resp.json()["status"] == "active"
+    assert resp.json()["status"] == "maintenance"
+
+    resp = await auth_client.patch(
+        f"/api/accounts/{acc_id}", json={"status": "active"}
+    )
+    assert resp.status_code == 422
+    account = await session.get(Account, acc_id)
+    await session.refresh(account)
+    assert account.status == "maintenance"
+    assert account.operator_status_override == "maintenance"
 
 
 async def test_failed_account_can_be_requeued_with_visible_job(
@@ -184,6 +200,7 @@ async def test_failed_account_can_be_requeued_with_visible_job(
         )
     ).scalar_one()
     account.status = "validation_failed"
+    account.operator_status_override = "maintenance"
     job.status = "failed"
     job.error = '{"stage":"login","code":"cloudflare_challenge","detail":"blocked"}'
     await session.commit()
@@ -194,6 +211,8 @@ async def test_failed_account_can_be_requeued_with_visible_job(
     assert payload["status"] == "pending_validation"
     assert payload["validation_job"]["status"] == "pending"
     assert payload["validation_job"]["priority"] == "manual"
+    await session.refresh(account)
+    assert account.operator_status_override is None
 
 
 async def test_recheck_rejects_live_validation_without_mutating_account(
@@ -263,6 +282,282 @@ async def test_create_account_without_totp_secret(auth_client: AsyncClient, sess
     })
     assert resp.status_code == 201
     assert resp.json()["login"] == "acc-nototp"
+
+
+async def test_patch_account_credentials_is_write_only_and_requeues_validation(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "old-login@example.com",
+            "password": "old-chat-password",
+            "totp_secret": "OLDTOTPSECRET",
+            "email": "old-mail@hotmail.com",
+            "email_password": "old-mail-password",
+        },
+    )
+    account_id = created.json()["id"]
+    account = await session.get(Account, account_id)
+    account.operator_status_override = "maintenance"
+    session.add(
+        EmailOAuthCredential(
+            account_id=account_id,
+            email="old-mail@hotmail.com",
+            external_subject="subject-1",
+            refresh_token_encrypted="graph-refresh-token",
+            scopes="Mail.Read offline_access",
+        )
+    )
+    await session.commit()
+
+    payload = {
+        "login": "new-login@example.com",
+        "password": "new-chat-password",
+        "totp_secret": "NEWTOTPSECRET",
+        "email": "new-mail@hotmail.com",
+        "email_password": "new-mail-password",
+    }
+    response = await auth_client.patch(
+        f"/api/accounts/{account_id}/credentials",
+        json=payload,
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["login"] == payload["login"]
+    assert body["email"] == payload["email"]
+    assert body["status"] == "pending_validation"
+    assert body["operator_status_override"] is None
+    assert body["email_oauth_connected"] is False
+    serialized = str(body)
+    for secret in (
+        payload["password"],
+        payload["totp_secret"],
+        payload["email_password"],
+        "graph-refresh-token",
+    ):
+        assert secret not in serialized
+
+    await session.refresh(account)
+    assert account.login == payload["login"]
+    assert account.password_encrypted == payload["password"]
+    assert account.totp_secret_encrypted == payload["totp_secret"]
+    assert account.email == payload["email"]
+    assert account.email_password_encrypted == payload["email_password"]
+    assert account.validation_rerun_requested is False
+    assert await session.get(EmailOAuthCredential, account_id) is None
+    raw = (
+        await session.execute(
+            text(
+                "SELECT password_encrypted, totp_secret_encrypted, "
+                "email_password_encrypted FROM accounts WHERE id=:id"
+            ),
+            {"id": account_id},
+        )
+    ).one()
+    assert raw.password_encrypted != payload["password"]
+    assert raw.totp_secret_encrypted != payload["totp_secret"]
+    assert raw.email_password_encrypted != payload["email_password"]
+
+    jobs = list(
+        (
+            await session.execute(
+                select(AccountCheckJob)
+                .where(AccountCheckJob.account_id == account_id)
+                .order_by(AccountCheckJob.id)
+            )
+        ).scalars()
+    )
+    assert [(job.status, job.priority, job.job_type) for job in jobs] == [
+        ("done", "new", "full_validation"),
+        ("pending", "manual", "full_validation"),
+    ]
+    audit = (
+        await session.execute(
+            select(AuditLog).where(
+                AuditLog.event_type == "account_credentials_updated"
+            )
+        )
+    ).scalar_one()
+    assert audit.metadata_["changed_fields"] == [
+        "email",
+        "email_oauth",
+        "email_password",
+        "login",
+        "password",
+        "totp_secret",
+    ]
+    assert audit.metadata_["rerun_requested"] is False
+    assert audit.message_text is None
+    audit_text = str(audit.metadata_)
+    assert all(secret not in audit_text for secret in payload.values())
+
+
+async def test_patch_account_credentials_requires_a_safe_explicit_change(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={"login": "safe-patch", "password": "unchanged-password"},
+    )
+    account_id = created.json()["id"]
+
+    assert (
+        await auth_client.patch(
+            f"/api/accounts/{account_id}/credentials", json={}
+        )
+    ).status_code == 422
+    assert (
+        await auth_client.patch(
+            f"/api/accounts/{account_id}/credentials",
+            json={"password": None},
+        )
+    ).status_code == 422
+    assert (
+        await auth_client.patch(
+            f"/api/accounts/{account_id}/credentials",
+            json={"totp_secret": ""},
+        )
+    ).status_code == 422
+    mailbox_secret = "must-never-be-echoed"
+    missing_email = await auth_client.patch(
+        f"/api/accounts/{account_id}/credentials",
+        json={"email_password": mailbox_secret},
+    )
+    assert missing_email.status_code == 422
+    assert mailbox_secret not in missing_email.text
+    oversized_secret = "x" * 4097
+    oversized = await auth_client.patch(
+        f"/api/accounts/{account_id}/credentials",
+        json={"password": oversized_secret},
+    )
+    assert oversized.status_code == 422
+    assert oversized_secret not in oversized.text
+
+    account = await session.get(Account, account_id)
+    await session.refresh(account)
+    assert account.login == "safe-patch"
+    assert account.password_encrypted == "unchanged-password"
+
+
+async def test_patch_account_credentials_uses_null_only_for_optional_clears(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "clear-credentials",
+            "password": "password",
+            "totp_secret": "TOTPTOCLEAR",
+            "email": "clear@example.com",
+            "email_password": "mail-to-clear",
+        },
+    )
+    account_id = created.json()["id"]
+
+    response = await auth_client.patch(
+        f"/api/accounts/{account_id}/credentials",
+        json={"totp_secret": None, "email": None},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["email"] is None
+    account = await session.get(Account, account_id)
+    await session.refresh(account)
+    assert account.totp_secret_encrypted == ""
+    assert account.email is None
+    assert account.email_password_encrypted is None
+
+
+async def test_patch_account_credentials_duplicate_login_rolls_back_all_changes(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    first = await auth_client.post(
+        "/api/accounts",
+        json={"login": "credential-first", "password": "first-password"},
+    )
+    await auth_client.post(
+        "/api/accounts",
+        json={"login": "credential-second", "password": "second-password"},
+    )
+    first_id = first.json()["id"]
+
+    response = await auth_client.patch(
+        f"/api/accounts/{first_id}/credentials",
+        json={
+            "login": "credential-second",
+            "password": "must-not-be-partially-written",
+        },
+    )
+
+    assert response.status_code == 409
+    account = await session.get(Account, first_id)
+    await session.refresh(account)
+    assert account.login == "credential-first"
+    assert account.password_encrypted == "first-password"
+    jobs = list(
+        (
+            await session.execute(
+                select(AccountCheckJob).where(
+                    AccountCheckJob.account_id == first_id
+                )
+            )
+        ).scalars()
+    )
+    assert [(job.status, job.priority) for job in jobs] == [("pending", "new")]
+
+
+async def test_patch_account_credentials_during_running_job_requests_followup(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={"login": "credential-race", "password": "old-password"},
+    )
+    account_id = created.json()["id"]
+    account = await session.get(Account, account_id)
+    job = (
+        await session.execute(
+            select(AccountCheckJob).where(
+                AccountCheckJob.account_id == account_id
+            )
+        )
+    ).scalar_one()
+    account.status = "active"
+    job.status = "running"
+    job.started_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    response = await auth_client.patch(
+        f"/api/accounts/{account_id}/credentials",
+        json={"password": "new-password"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["validation_job"]["id"] == job.id
+    assert response.json()["validation_job"]["status"] == "running"
+    await session.refresh(account)
+    await session.refresh(job)
+    assert account.password_encrypted == "new-password"
+    assert account.status == "pending_validation"
+    assert account.validation_rerun_requested is True
+    assert job.status == "running"
+    audit = (
+        await session.execute(
+            select(AuditLog).where(
+                AuditLog.event_type == "account_credentials_updated"
+            )
+        )
+    ).scalar_one()
+    assert audit.metadata_["changed_fields"] == ["password"]
+    assert audit.metadata_["rerun_requested"] is True
+    assert "new-password" not in str(audit.metadata_)
 
 
 async def test_get_account_returns_email(auth_client: AsyncClient, session: AsyncSession):

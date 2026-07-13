@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.playwright.browser import browser_context
 from app.integrations.playwright.kick import kick_account
 from app.models.account import Account
+from app.services.account_validation import _build_email_provider
 
 
-_KICK_DEDUP_WINDOW = timedelta(seconds=60)
+_KICK_LOCKS: dict[int, asyncio.Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -23,20 +24,22 @@ class KickResult:
 
 
 class KickService:
-    """Logout all через Playwright с дедупликацией 60 сек.
+    """Logout all through Playwright, serialized per account in this process.
 
-    Дедупликация in-memory: повторный kick аккаунта в пределах окна — no-op.
+    Every revoke request executes. A time-window no-op is unsafe because the
+    buyer may log in again immediately after a previous successful logout.
     """
 
-    def __init__(self) -> None:
-        self._last_kick_at: dict[int, datetime] = {}
-
     async def kick(self, session: AsyncSession, account_id: int) -> KickResult:
-        now = datetime.now(timezone.utc)
-        last = self._last_kick_at.get(account_id)
-        if last is not None and now - last < _KICK_DEDUP_WINDOW:
-            return KickResult(success=True, deduplicated=True)
+        lock = _KICK_LOCKS.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            return await self._kick_once(session, account_id)
 
+    async def _kick_once(
+        self,
+        session: AsyncSession,
+        account_id: int,
+    ) -> KickResult:
         account = await session.get(Account, account_id)
         if account is None:
             raise KeyError(f"Account {account_id} not found")
@@ -46,15 +49,21 @@ class KickService:
         totp_secret = account.totp_secret_encrypted
 
         try:
+            email_provider = await _build_email_provider(
+                session,
+                account,
+                account.email,
+                account.email_password_encrypted or None,
+            )
             async with browser_context() as context:
                 await kick_account(
                     context=context,
                     login=account.login,
                     password=password,
                     totp_secret=totp_secret,
+                    email_provider=email_provider,
                 )
         except Exception as exc:
             return KickResult(success=False, error=str(exc))
 
-        self._last_kick_at[account_id] = now
         return KickResult(success=True)

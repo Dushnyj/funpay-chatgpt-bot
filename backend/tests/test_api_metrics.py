@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 from types import SimpleNamespace
 
@@ -6,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
-from app.models.account import Account
+from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.models.settings import SellerSettings
 
@@ -34,7 +36,13 @@ async def test_metrics_report_free_rental_capacity(
     auth_client: AsyncClient,
     session: AsyncSession,
 ):
-    session.add(SubscriptionTier(id=1, name="Plus"))
+    session.add(SubscriptionTier(
+        id=1,
+        code="free",
+        name="Free",
+        is_active=True,
+        is_sellable=True,
+    ))
     session.add(SellerSettings(id=1, default_max_active_rentals=2))
     session.add_all([
         Account(
@@ -60,6 +68,37 @@ async def test_metrics_report_free_rental_capacity(
             tier_id=1,
             max_active_rentals=10,
             status="maintenance",
+        ),
+    ])
+    await session.flush()
+    measured_at = datetime.now(timezone.utc)
+    session.add_all([
+        AccountLimits(
+            account_id=1,
+            refresh_token_encrypted="refresh-a",
+            refresh_status="ok",
+            measured_at=measured_at,
+            plan_type="free",
+            plan_window_status="ok",
+            expected_long_window_seconds=30 * 24 * 60 * 60,
+        ),
+        AccountLimits(
+            account_id=2,
+            refresh_token_encrypted="refresh-b",
+            refresh_status="ok",
+            measured_at=measured_at,
+            plan_type="free",
+            plan_window_status="ok",
+            expected_long_window_seconds=30 * 24 * 60 * 60,
+        ),
+        AccountLimits(
+            account_id=3,
+            refresh_token_encrypted="refresh-c",
+            refresh_status="ok",
+            measured_at=measured_at,
+            plan_type="free",
+            plan_window_status="ok",
+            expected_long_window_seconds=30 * 24 * 60 * 60,
         ),
     ])
     await session.commit()

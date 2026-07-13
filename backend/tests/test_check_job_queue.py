@@ -73,6 +73,30 @@ async def test_regular_enqueue_does_not_supersede_running_job(
     assert running.status == "running"
 
 
+async def test_running_limit_check_serializes_full_validation(
+    session: AsyncSession,
+):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    limit_job = await queue.enqueue(
+        session,
+        account.id,
+        priority="limit_check",
+        job_type="limit_check",
+    )
+    await queue.mark_running(session, limit_job)
+
+    validation = await queue.enqueue(
+        session,
+        account.id,
+        priority="scheduled",
+        job_type="full_validation",
+    )
+
+    assert validation.id == limit_job.id
+    assert limit_job.status == "running"
+
+
 async def test_fetch_next_pending_returns_oldest(session: AsyncSession):
     acc1 = await _add_account(session, "acc1")
     q = CheckJobQueue()
@@ -92,6 +116,33 @@ async def test_fetch_next_pending_filters_by_type(session: AsyncSession):
     await q.enqueue(session, account_id=acc.id, priority="new", job_type="full_validation")
     next_job = await q.fetch_next_pending(session, job_types=("limit_check",))
     assert next_job is None
+
+
+async def test_fetch_next_pending_respects_priority_across_accounts(
+    session: AsyncSession,
+):
+    low_account = await _add_account(session, "low")
+    high_account = await _add_account(session, "high")
+    queue = CheckJobQueue()
+    await queue.enqueue(
+        session,
+        low_account.id,
+        priority="scheduled",
+        job_type="full_validation",
+    )
+    high = await queue.enqueue(
+        session,
+        high_account.id,
+        priority="refresh_recover",
+        job_type="refresh_recover",
+    )
+
+    next_job = await queue.fetch_next_pending(
+        session, ("full_validation", "refresh_recover")
+    )
+
+    assert next_job is not None
+    assert next_job.id == high.id
 
 
 async def test_mark_running_updates_status(session: AsyncSession):
@@ -189,3 +240,74 @@ async def test_exclusive_job_recovers_expired_running_lease(session: AsyncSessio
     assert stale.status == "failed"
     assert stale.error == "stale_worker_lease"
     assert replacement.status == "pending"
+
+
+async def test_recover_stale_running_requeues_only_expired_worker_jobs(
+    session: AsyncSession,
+):
+    stale_account = await _add_account(session, "stale")
+    live_account = await _add_account(session, "live")
+    queue = CheckJobQueue()
+    stale = await queue.enqueue(
+        session, stale_account.id, priority="scheduled", job_type="full_validation"
+    )
+    live = await queue.enqueue(
+        session, live_account.id, priority="refresh_recover", job_type="refresh_recover"
+    )
+    stale.status = "running"
+    stale.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    live.status = "running"
+    live.started_at = datetime.now(timezone.utc)
+    await session.flush()
+
+    recovered = await queue.recover_stale_running(
+        session, ("full_validation", "refresh_recover")
+    )
+
+    assert recovered == 1
+    assert stale.status == "pending"
+    assert stale.started_at is None
+    assert stale.result == "requeued_after_stale_worker"
+    assert live.status == "running"
+
+
+async def test_startup_recovery_can_requeue_all_previous_process_jobs(
+    session: AsyncSession,
+):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    job = await queue.enqueue(
+        session, account.id, priority="scheduled", job_type="full_validation"
+    )
+    await queue.mark_running(session, job)
+
+    recovered = await queue.recover_stale_running(
+        session,
+        ("full_validation", "refresh_recover"),
+        stale_before=datetime.now(timezone.utc),
+    )
+
+    assert recovered == 1
+    assert job.status == "pending"
+
+
+async def test_fail_active_jobs_terminalizes_non_resumable_device_auth(
+    session: AsyncSession,
+):
+    account = await _add_account(session)
+    queue = CheckJobQueue()
+    job = await queue.enqueue(
+        session, account.id, priority="manual", job_type="device_auth"
+    )
+    await queue.mark_running(session, job)
+
+    account_ids = await queue.fail_active_jobs(
+        session,
+        ("device_auth",),
+        error="device_auth_server_restarted",
+    )
+
+    assert account_ids == [account.id]
+    assert job.status == "failed"
+    assert job.error == "device_auth_server_restarted"
+    assert job.finished_at is not None

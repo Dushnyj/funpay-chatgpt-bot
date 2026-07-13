@@ -25,7 +25,7 @@ def _test_env(monkeypatch):
     """Изолирует тесты от реального .env — единая точка настройки окружения."""
     monkeypatch.setenv("DATABASE_URL", TEST_DATABASE_URL)
     monkeypatch.setenv("ENCRYPTION_KEY", _gen_fernet_key())
-    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key-at-least-32-bytes-long")
     monkeypatch.setenv("ADMIN_PASSWORD_HASH", "$2b$12$dummyhash")
     monkeypatch.setenv("ADMIN_COOKIE_SECURE", "true")
     monkeypatch.setenv("FUNPAY_SESSION_KEY", "")
@@ -38,11 +38,7 @@ def _test_env(monkeypatch):
     from app.config import get_settings
 
     get_settings.cache_clear()
-    from app.api.routers.auth import _login_limiter
-
-    _login_limiter.clear()
     yield
-    _login_limiter.clear()
     get_settings.cache_clear()
 
 

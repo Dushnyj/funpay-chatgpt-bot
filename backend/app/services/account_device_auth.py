@@ -88,6 +88,7 @@ class AccountDeviceAuthManager:
                     existing.status = "expired"
                     existing.code = None
                     self._cancel_background_task(existing.id)
+            account.operator_status_override = None
             account.status = "pending_validation"
             session.add(AuditLog(
                 event_type="account_device_auth_started",
@@ -216,12 +217,29 @@ class AccountDeviceAuthManager:
             job = await db.get(AccountCheckJob, auth_session.job_id)
             if job is not None:
                 job.status = "done"
-                job.result = "ok"
+                job.result = "tokens_connected"
                 job.finished_at = finished_at
+            # Device authorization proves mailbox identity and supplies API
+            # tokens, but it never proves the password/TOTP that a buyer will
+            # receive. Keep the account unsellable and enqueue the normal
+            # credential login validation before it can return to active.
+            account.status = account.operator_status_override or "pending_validation"
+            account.validation_rerun_requested = False
+            await db.flush()
+            credential_job = await self._queue.enqueue(
+                db,
+                account.id,
+                priority="manual",
+                job_type="full_validation",
+            )
             db.add(AuditLog(
                 event_type="account_device_auth_completed",
                 account_id=account.id,
-                metadata_={"actor": "admin", "job_id": auth_session.job_id},
+                metadata_={
+                    "actor": "admin",
+                    "job_id": auth_session.job_id,
+                    "credential_validation_job_id": credential_job.id,
+                },
             ))
             await db.commit()
             auth_session.status = "completed"
@@ -379,7 +397,23 @@ class AccountDeviceAuthManager:
                         )
                     account = await db.get(Account, auth_session.account_id)
                     if account is not None:
-                        account.status = "validation_failed"
+                        if account.validation_rerun_requested:
+                            account.validation_rerun_requested = False
+                            account.status = (
+                                account.operator_status_override
+                                or "pending_validation"
+                            )
+                            await self._queue.enqueue(
+                                db,
+                                account.id,
+                                priority="manual",
+                                job_type="full_validation",
+                            )
+                        else:
+                            account.status = (
+                                account.operator_status_override
+                                or "validation_failed"
+                            )
                 await db.commit()
         except Exception:
             logger.warning(
@@ -409,7 +443,18 @@ class AccountDeviceAuthManager:
         stage: str = "device_auth",
     ) -> None:
         now = datetime.now(timezone.utc)
-        account.status = "validation_failed"
+        await db.refresh(
+            account,
+            attribute_names=[
+                "operator_status_override",
+                "validation_rerun_requested",
+            ],
+        )
+        rerun_requested = account.validation_rerun_requested
+        account.status = account.operator_status_override or (
+            "pending_validation" if rerun_requested else "validation_failed"
+        )
+        account.validation_rerun_requested = False
         job = await db.get(AccountCheckJob, auth_session.job_id)
         if job is not None:
             job.status = "failed"
@@ -419,10 +464,26 @@ class AccountDeviceAuthManager:
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+        await db.flush()
+        followup_job = None
+        if rerun_requested:
+            followup_job = await self._queue.enqueue(
+                db,
+                account.id,
+                priority="manual",
+                job_type="full_validation",
+            )
+        metadata = {
+            "actor": "admin",
+            "job_id": auth_session.job_id,
+            "code": code,
+        }
+        if followup_job is not None:
+            metadata["credential_validation_job_id"] = followup_job.id
         db.add(AuditLog(
             event_type="account_device_auth_failed",
             account_id=account.id,
-            metadata_={"actor": "admin", "job_id": auth_session.job_id, "code": code},
+            metadata_=metadata,
         ))
         await db.commit()
         auth_session.status = "failed"

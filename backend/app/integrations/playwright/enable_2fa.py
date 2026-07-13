@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -142,5 +143,57 @@ async def _enable_authenticator(page: Page, timeout_ms: int) -> str:
         "button", name=re.compile(r"continue|verify|confirm", re.IGNORECASE)
     ).first.click(timeout=10_000)
     await raise_if_cloudflare(page, "setup_2fa_confirm")
+    await _wait_for_2fa_confirmation(page, code_input, timeout_ms)
 
     return secret
+
+
+async def _wait_for_2fa_confirmation(
+    page: Page,
+    code_input,
+    timeout_ms: int,
+) -> None:
+    """Require a positive UI transition before persisting the TOTP secret."""
+    deadline = asyncio.get_running_loop().time() + min(10, timeout_ms / 1000)
+    success_markers = (
+        "two-factor authentication is on",
+        "two-factor authentication enabled",
+        "authenticator app enabled",
+        "2fa is enabled",
+        "двухфакторная аутентификация включена",
+        "приложение-аутентификатор подключено",
+    )
+    error_markers = (
+        "invalid code",
+        "incorrect code",
+        "code is invalid",
+        "неверный код",
+        "недействительный код",
+    )
+    while asyncio.get_running_loop().time() < deadline:
+        body = ""
+        try:
+            body = (await page.text_content("body", timeout=1_000) or "").casefold()
+        except Exception:
+            pass
+        if any(marker in body for marker in error_markers):
+            raise Enable2FAError(
+                "OpenAI отклонил проверочный TOTP-код.",
+                code="setup_2fa_code_rejected",
+                stage="setup_2fa_confirm",
+            )
+        if any(marker in body for marker in success_markers):
+            return
+        try:
+            if not await code_input.is_visible():
+                # The setup dialog closed after Verify, which is the normal
+                # successful UI transition even when no toast is rendered.
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+    raise Enable2FAError(
+        "OpenAI не подтвердил включение 2FA.",
+        code="setup_2fa_not_confirmed",
+        stage="setup_2fa_confirm",
+    )

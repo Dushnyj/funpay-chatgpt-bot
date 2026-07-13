@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     database_url: str
     encryption_key: str
-    secret_key: str
+    secret_key: str = Field(min_length=32)
     admin_password_hash: str = ""
     admin_cookie_secure: bool = True
     admin_login_max_attempts: int = Field(default=5, ge=1, le=100)
@@ -32,6 +32,19 @@ class Settings(BaseSettings):
     def _validate_fernet_key(cls, v: str) -> str:
         Fernet(v.encode())
         return v
+
+    @field_validator("secret_key")
+    @classmethod
+    def _validate_secret_key(cls, value: str) -> str:
+        if value.strip().casefold() in {
+            "changeme",
+            "change-me",
+            "secret",
+            "test-secret",
+            "changeme-secret-key-for-jwt",
+        }:
+            raise ValueError("SECRET_KEY must be a unique random value")
+        return value
 
 
 @lru_cache

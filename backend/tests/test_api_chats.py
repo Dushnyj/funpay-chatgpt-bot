@@ -1,5 +1,6 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
@@ -158,3 +159,79 @@ async def test_from_me_echo_merges_with_pending_outbox(session: AsyncSession):
     assert echoed.funpay_message_id == "909"
     assert echoed.delivery_status == "sent"
     assert len(history) == 2
+
+
+async def test_login_codes_are_never_persisted_in_local_chat_history(
+    session: AsyncSession,
+):
+    conversation_id = await _seed_conversation(session)
+    service = ChatService()
+    conversation = await service.get_conversation(session, conversation_id)
+    plaintext = (
+        "TOTP (приложение): 123456\n"
+        "Email OTP OpenAI: 654321"
+    )
+    pending = await service.create_outgoing_pending(
+        session, conversation, plaintext,
+    )
+    await session.commit()
+
+    echoed, created = await service.record_event(
+        session,
+        MessageInfo(
+            message_id=910,
+            chat_id=500,
+            sender_id=1,
+            text=plaintext,
+            order_id=None,
+            from_me=True,
+        ),
+    )
+    await session.commit()
+
+    history = await service.list_messages(session, conversation_id)
+    assert created is False
+    assert echoed.id == pending.id
+    assert "123456" not in pending.text
+    assert "654321" not in pending.text
+    assert pending.text.count("[скрыто]") == 2
+    assert all("123456" not in item.text for item in history)
+    assert all("654321" not in item.text for item in history)
+
+
+async def test_chat_text_is_encrypted_at_rest_but_available_to_admin(
+    session: AsyncSession,
+):
+    secret_message = "Логин buyer@example.com; пароль SuperSecret-123"
+    stored, _ = await ChatService().record_event(
+        session,
+        MessageInfo(
+            message_id=911,
+            chat_id=501,
+            sender_id=1,
+            text=secret_message,
+            order_id=None,
+            from_me=True,
+        ),
+    )
+    await session.commit()
+
+    raw_message = (
+        await session.execute(
+            text("SELECT text FROM chat_messages WHERE id=:id"),
+            {"id": stored.id},
+        )
+    ).scalar_one()
+    raw_preview = (
+        await session.execute(
+            text(
+                "SELECT last_message_text FROM chat_conversations "
+                "WHERE id=:id"
+            ),
+            {"id": stored.conversation_id},
+        )
+    ).scalar_one()
+
+    assert secret_message not in raw_message
+    assert secret_message not in raw_preview
+    assert stored.text == secret_message

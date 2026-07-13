@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
+from email.utils import getaddresses, parsedate_to_datetime
+import hashlib
 import logging
+import re
 import ssl
 import time
 
@@ -13,6 +18,7 @@ from app.integrations.email.provider import (
     EmailErrorCode,
     EmailProvider,
     EmailProviderError,
+    FreshVerificationCode,
     parse_verification_code,
 )
 
@@ -36,6 +42,15 @@ _KNOWN_HOSTS = {
 
 _DEFAULT_PORT = 993
 _DEFAULT_FALLBACK_HOST = "imap.gmail.com"
+_JUNK_FOLDER_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "imap.gmail.com": ("[Gmail]/Spam",),
+    "outlook.office365.com": ("Junk Email", "Junk"),
+    "imap.mail.yahoo.com": ("Bulk Mail", "Spam"),
+    "imap.mail.me.com": ("Junk",),
+}
+_GENERIC_JUNK_FOLDER_CANDIDATES = ("Junk", "Junk Email", "Spam")
+_MAX_MESSAGE_BYTES = 512 * 1024
+_MAX_CANDIDATES_PER_FOLDER = 20
 
 
 class IMAPResponseError(RuntimeError):
@@ -55,10 +70,14 @@ def _require_ok(response, operation: str) -> None:
         raise IMAPResponseError(f"IMAP {operation} failed")
 
 
+def _raw_message(lines: list[object]) -> bytes:
+    byte_lines = [line for line in lines if isinstance(line, bytes)]
+    return max(byte_lines, key=len, default=b"")
+
+
 def _message_text(lines: list[object]) -> str:
     """Decode an IMAP RFC822 response, including multipart/encoded MIME bodies."""
-    byte_lines = [line for line in lines if isinstance(line, bytes)]
-    raw = max(byte_lines, key=len, default=b"")
+    raw = _raw_message(lines)
     if not raw:
         return " ".join(str(line) for line in lines)
 
@@ -87,6 +106,70 @@ def _message_text(lines: list[object]) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
+def _message_received_at(lines: list[object]) -> datetime | None:
+    """Return the server-provided IMAP INTERNALDATE, never sender Date."""
+    for line in lines:
+        if not isinstance(line, bytes):
+            continue
+        match = re.search(rb'INTERNALDATE\s+"([^"]+)"', line, re.IGNORECASE)
+        if match is None:
+            continue
+        try:
+            received_at = parsedate_to_datetime(match.group(1).decode("ascii"))
+        except (UnicodeError, TypeError, ValueError, OverflowError):
+            return None
+        if received_at.tzinfo is None:
+            return None
+        return received_at.astimezone(timezone.utc)
+    return None
+
+
+def _message_size(lines: list[object]) -> int | None:
+    for line in lines:
+        if not isinstance(line, bytes):
+            continue
+        match = re.search(rb"RFC822\.SIZE\s+(\d+)", line, re.IGNORECASE)
+        if match is not None:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _message_identity(lines: list[object]) -> str | None:
+    raw = _raw_message(lines)
+    if not raw:
+        return None
+    try:
+        message = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
+        value = str(message.get("message-id") or "").strip()
+    except Exception:
+        return None
+    return value or None
+
+
+def _is_openai_sender(lines: list[object]) -> bool:
+    raw = _raw_message(lines)
+    if not raw:
+        return False
+    try:
+        message = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
+        addresses = getaddresses(message.get_all("from", []))
+    except Exception:
+        return False
+    for _name, address in addresses:
+        domain = address.rsplit("@", 1)[-1].lower().rstrip(".")
+        if domain == "openai.com" or domain.endswith(".openai.com"):
+            return True
+    return False
+
+
+def _fresh_fingerprint(message_identity: str, received_at: datetime) -> str:
+    material = f"imap|{message_identity}|{received_at.isoformat()}"
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
 class IMAPProvider:
     """IMAP-источник кодов подтверждения.
 
@@ -108,7 +191,7 @@ class IMAPProvider:
         self.imap_host = imap_host
         self.imap_port = imap_port
         self._basic_auth_supported = basic_auth_supported
-        self._baseline_ids: set[str] = set()
+        self._baseline_ids: set[tuple[str, str]] = set()
 
     def _ensure_supported(self) -> None:
         if not self._basic_auth_supported:
@@ -123,7 +206,13 @@ class IMAPProvider:
         try:
             client = await self._connect()
             try:
-                self._baseline_ids = await self._search_openai_messages(client)
+                baseline_ids: set[tuple[str, str]] = set()
+                async for mailbox in self._selected_mailboxes(client):
+                    message_ids = await self._search_openai_messages(client)
+                    baseline_ids.update(
+                        (mailbox, message_id) for message_id in message_ids
+                    )
+                self._baseline_ids = baseline_ids
             finally:
                 await self._logout(client)
         except EmailProviderError:
@@ -151,6 +240,30 @@ class IMAPProvider:
             raise EmailProviderError(
                 EmailErrorCode.CONNECTION_FAILED,
                 "Не удалось получить письмо через IMAP.",
+            ) from exc
+
+    async def fetch_fresh_verification_code(
+        self,
+        *,
+        not_before: datetime,
+        timeout: float = 10.0,
+    ) -> FreshVerificationCode:
+        """Read a timestamp-proven OpenAI code without a post-arrival preflight."""
+        self._ensure_supported()
+        cutoff = (
+            not_before.replace(tzinfo=timezone.utc)
+            if not_before.tzinfo is None
+            else not_before.astimezone(timezone.utc)
+        )
+        try:
+            return await self._do_fetch_fresh(cutoff, timeout)
+        except EmailProviderError:
+            raise
+        except Exception as exc:
+            logger.warning("IMAP fresh-code lookup failed for %s", self.email, exc_info=True)
+            raise EmailProviderError(
+                EmailErrorCode.CONNECTION_FAILED,
+                "Не удалось получить свежее письмо через IMAP.",
             ) from exc
 
     async def _connect(self):
@@ -183,20 +296,40 @@ class IMAPProvider:
         client = await self._connect()
         try:
             while True:
-                message_ids = await self._search_openai_messages(client)
-                candidates = message_ids - self._baseline_ids
+                async for mailbox in self._selected_mailboxes(client):
+                    message_ids = await self._search_openai_messages(client)
+                    candidates = {
+                        message_id
+                        for message_id in message_ids
+                        if (mailbox, message_id) not in self._baseline_ids
+                    }
 
-                # If preflight was not used (e.g. a standalone provider call),
-                # inspect the current messages too, preserving API usefulness.
-                if not self._baseline_ids:
-                    candidates = message_ids
-
-                for message_id in sorted(candidates, key=int, reverse=True):
-                    fetch_result = await client.fetch(message_id, "(BODY.PEEK[])")
-                    _require_ok(fetch_result, "fetch")
-                    code = parse_verification_code(_message_text(fetch_result.lines or []))
-                    if code:
-                        return code
+                    for message_id in sorted(candidates, key=int, reverse=True)[
+                        :_MAX_CANDIDATES_PER_FOLDER
+                    ]:
+                        header_result = await client.fetch(
+                            message_id,
+                            "(RFC822.SIZE BODY.PEEK[HEADER.FIELDS "
+                            "(FROM SUBJECT MESSAGE-ID)])",
+                        )
+                        _require_ok(header_result, "fetch")
+                        header_lines = header_result.lines or []
+                        size = _message_size(header_lines)
+                        if (
+                            size is None
+                            or size > _MAX_MESSAGE_BYTES
+                            or not _is_openai_sender(header_lines)
+                        ):
+                            self._baseline_ids.add((mailbox, message_id))
+                            continue
+                        fetch_result = await client.fetch(message_id, "(BODY.PEEK[])")
+                        _require_ok(fetch_result, "fetch")
+                        self._baseline_ids.add((mailbox, message_id))
+                        code = parse_verification_code(
+                            _message_text(fetch_result.lines or [])
+                        )
+                        if code:
+                            return code
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -207,6 +340,102 @@ class IMAPProvider:
                 await asyncio.sleep(min(2.0, remaining))
         finally:
             await self._logout(client)
+
+    async def _do_fetch_fresh(
+        self,
+        not_before: datetime,
+        timeout: float,
+    ) -> FreshVerificationCode:
+        deadline = time.monotonic() + timeout
+        client = await self._connect()
+        examined: set[tuple[str, str]] = set()
+        try:
+            while True:
+                async for mailbox in self._selected_mailboxes(client):
+                    message_ids = await self._search_openai_messages(client)
+                    for message_id in sorted(message_ids, key=int, reverse=True)[
+                        :_MAX_CANDIDATES_PER_FOLDER
+                    ]:
+                        identity = (mailbox, message_id)
+                        if identity in examined:
+                            continue
+                        header_result = await client.fetch(
+                            message_id,
+                            "(RFC822.SIZE INTERNALDATE BODY.PEEK[HEADER.FIELDS "
+                            "(FROM SUBJECT MESSAGE-ID)])",
+                        )
+                        _require_ok(header_result, "fetch")
+                        header_lines = header_result.lines or []
+                        received_at = _message_received_at(header_lines)
+                        message_identity = _message_identity(header_lines)
+                        size = _message_size(header_lines)
+                        if (
+                            received_at is None
+                            or received_at < not_before
+                            or message_identity is None
+                            or size is None
+                            or size > _MAX_MESSAGE_BYTES
+                            or not _is_openai_sender(header_lines)
+                        ):
+                            examined.add(identity)
+                            continue
+                        fetch_result = await client.fetch(message_id, "(BODY.PEEK[])")
+                        _require_ok(fetch_result, "fetch")
+                        examined.add(identity)
+                        code = parse_verification_code(
+                            _message_text(fetch_result.lines or [])
+                        )
+                        if code is not None:
+                            return FreshVerificationCode(
+                                code=code,
+                                received_at=received_at,
+                                fingerprint=_fresh_fingerprint(
+                                    message_identity, received_at,
+                                ),
+                            )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise EmailProviderError(
+                        EmailErrorCode.NO_CODE,
+                        "Свежее письмо с кодом OpenAI не найдено.",
+                    )
+                await asyncio.sleep(min(2.0, remaining))
+        finally:
+            await self._logout(client)
+
+    async def _selected_mailboxes(self, client) -> AsyncIterator[str]:
+        """Select Inbox and the first supported provider-specific junk alias."""
+        for mailbox in ("INBOX", *self._junk_folder_candidates()):
+            selected = await client.select(self._mailbox_argument(mailbox))
+            if mailbox == "INBOX":
+                _require_ok(selected, "select")
+            elif not self._response_is_ok(selected):
+                continue
+
+            yield mailbox
+            if mailbox != "INBOX":
+                return
+
+    @staticmethod
+    def _mailbox_argument(mailbox: str) -> str:
+        if mailbox.upper() == "INBOX":
+            return "INBOX"
+        escaped = mailbox.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def _junk_folder_candidates(self) -> tuple[str, ...]:
+        return _JUNK_FOLDER_CANDIDATES.get(
+            self.imap_host.lower(),
+            _GENERIC_JUNK_FOLDER_CANDIDATES,
+        )
+
+    @staticmethod
+    def _response_is_ok(response) -> bool:
+        result = getattr(response, "result", "")
+        if isinstance(result, bytes):
+            result = result.decode(errors="replace")
+        return str(result).upper() == "OK"
 
     @staticmethod
     async def _logout(client) -> None:

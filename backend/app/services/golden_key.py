@@ -14,8 +14,13 @@ async def get_effective_funpay_key(
     return settings.funpay_session_key
 
 
-def key_status(key: str) -> dict[str, bool | str | None]:
+def key_status(
+    key: str,
+    *,
+    connected: bool = False,
+) -> dict[str, bool | str | None]:
     return {
         "configured": bool(key),
+        "connected": bool(key and connected),
         "last4": key[-4:] if key else None,
     }

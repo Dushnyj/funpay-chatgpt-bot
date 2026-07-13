@@ -3,11 +3,15 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
 from app.integrations.funpay.runner import RunnerCallbacks
 from app.integrations.funpay.types import MessageInfo
+from app.models.lot import Lot
+from app.models.rental import Order, Rental
 from app.services.command_handlers import (
     CodeHandler,
     HelpHandler,
@@ -20,6 +24,7 @@ from app.services.command_router import CommandRouter, UnhandledMessage
 from app.services.chat_service import ChatService
 from app.services.order_processor import OrderProcessor, LotNotFoundError
 from app.services.rental_service import RentalService
+from app.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,12 @@ def build_callbacks(
                 logger.exception("Failed to process new sale %s", order_id)
                 return
 
+            notifier = await TelegramNotifier.from_settings(session)
+            if notifier is not None:
+                lot = await session.get(Lot, order.lot_id)
+                description = lot.title_ru if lot is not None else "ChatGPT"
+                await notifier.notify_new_order(order_id, description, order.price)
+
             try:
                 # Выдача аккаунта + welcome сообщение.
                 # Если аккаунта нет — RentalService отправит no_account_available
@@ -93,14 +104,23 @@ def build_callbacks(
             try:
                 await order_processor.process_sale_closed(session, order_id)
                 await session.commit()
+                notifier = await TelegramNotifier.from_settings(session)
+                if notifier is not None:
+                    await notifier.notify_order_confirmed(order_id)
             except Exception:
                 logger.exception("Failed to process sale closed %s", order_id)
 
     async def on_sale_refunded(order_id: str) -> None:
         async with session_factory() as session:
             try:
-                await order_processor.process_sale_refunded(session, order_id)
+                order = await order_processor.process_sale_refunded(session, order_id)
                 await session.commit()
+                notifier = await TelegramNotifier.from_settings(session)
+                if notifier is not None:
+                    await notifier.notify_order_refunded(
+                        order_id,
+                        pending=order.status == "refund_pending",
+                    )
             except Exception:
                 logger.exception("Failed to process sale refunded %s", order_id)
 
@@ -109,10 +129,17 @@ def build_callbacks(
             try:
                 _, created = await chat_service.record_event(session, msg)
                 await session.commit()
+            except IntegrityError:
+                # A concurrent copy of the same FunPay event won the unique
+                # source-id insert. Never execute a command without owning the
+                # durable idempotency record.
+                await session.rollback()
+                logger.info("Duplicate message event in chat %s", msg.chat_id)
+                return
             except Exception:
                 await session.rollback()
                 logger.exception("Failed to persist message in chat %s", msg.chat_id)
-                created = True
+                return
 
             # Duplicate FunPay events must not increment unread counters or run
             # a buyer command twice.
@@ -132,6 +159,23 @@ def build_callbacks(
                 lang="ru",
                 gateway=gateway,
             )
+            if ctx.parsed is not None and msg.order_id:
+                # The selected command alias is an explicit language signal.
+                # Persist it for later automated messages in the same order.
+                order = (
+                    await session.execute(
+                        select(Order).where(Order.funpay_order_id == msg.order_id)
+                    )
+                ).scalar_one_or_none()
+                if order is not None:
+                    order.buyer_locale = ctx.lang
+                    rental = (
+                        await session.execute(
+                            select(Rental).where(Rental.order_id == order.id)
+                        )
+                    ).scalar_one_or_none()
+                    if rental is not None:
+                        rental.lang = ctx.lang
             # Передаём session в контекст для хэндлеров команд
             # (CommandContext — frozen dataclass, поэтому через object.__setattr__).
             object.__setattr__(ctx, "_session", session)

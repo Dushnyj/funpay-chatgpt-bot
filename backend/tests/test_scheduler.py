@@ -64,3 +64,18 @@ async def test_scheduler_unregister_removes_task():
     await asyncio.sleep(0.05)
     await sched.stop()
     task.assert_not_awaited()
+
+
+async def test_register_updates_live_interval_without_restart():
+    sched = Scheduler()
+    task = AsyncMock()
+    sched.register("test", ScheduledTask(callback=task, interval=60))
+    await sched.start()
+    await asyncio.sleep(0.02)
+    assert task.await_count == 1
+
+    sched.register("test", ScheduledTask(callback=task, interval=0.01))
+    await asyncio.sleep(0.04)
+    await sched.stop()
+
+    assert task.await_count >= 2

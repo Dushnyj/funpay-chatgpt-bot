@@ -1,4 +1,6 @@
-from sqlalchemy import Boolean, Integer, String
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -19,7 +21,9 @@ class SellerSettings(Base):
         FernetEncrypted(allow_legacy_plaintext=True), default=None
     )
     telegram_seller_chat_id: Mapped[str | None] = mapped_column(default=None)
-    check_interval_minutes: Mapped[int] = mapped_column(default=10)
+    # A full browser/OAuth validation is intentionally infrequent. Lightweight
+    # usage-window measurements have their own five-minute scheduler below.
+    check_interval_minutes: Mapped[int] = mapped_column(default=1440)
     limits_check_interval_minutes: Mapped[int] = mapped_column(default=5)
     refresh_recover_concurrency: Mapped[int] = mapped_column(default=3)
     refresh_max_attempts: Mapped[int] = mapped_column(default=3)
@@ -32,3 +36,10 @@ class SellerSettings(Base):
     limits_warn_threshold_pct: Mapped[int] = mapped_column(default=20)
     admin_password_hash: Mapped[str | None] = mapped_column(default=None)
     admin_session_version: Mapped[int] = mapped_column(Integer, default=0)
+    admin_login_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    admin_login_window_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    admin_login_blocked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )

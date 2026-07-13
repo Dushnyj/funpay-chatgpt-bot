@@ -29,13 +29,16 @@ async def _add_account(session: AsyncSession, login: str = "acc1") -> Account:
 async def test_kick_account_success(session: AsyncSession):
     acc = await _add_account(session)
     svc = KickService()
-    with patch("app.services.kick_service.browser_context") as mock_ctx, \
+    provider = object()
+    with patch("app.services.kick_service._build_email_provider", new=AsyncMock(return_value=provider)), \
+         patch("app.services.kick_service.browser_context") as mock_ctx, \
          patch("app.services.kick_service.kick_account", new_callable=AsyncMock) as mock_kick:
         mock_ctx.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
         mock_ctx.return_value.__aexit__ = AsyncMock(return_value=None)
         result = await svc.kick(session, acc.id)
     assert result.success is True
     mock_kick.assert_awaited_once()
+    assert mock_kick.await_args.kwargs["email_provider"] is provider
 
 
 async def test_kick_account_failure_returns_error(session: AsyncSession):
@@ -51,7 +54,7 @@ async def test_kick_account_failure_returns_error(session: AsyncSession):
     assert "login failed" in (result.error or "")
 
 
-async def test_kick_dedup_skips_within_60_seconds(session: AsyncSession):
+async def test_sequential_kicks_always_revoke_again(session: AsyncSession):
     acc = await _add_account(session)
     svc = KickService()
     with patch("app.services.kick_service.browser_context") as mock_ctx, \
@@ -61,8 +64,8 @@ async def test_kick_dedup_skips_within_60_seconds(session: AsyncSession):
         await svc.kick(session, acc.id)
         result2 = await svc.kick(session, acc.id)
     assert result2.success is True
-    assert result2.deduplicated is True
-    mock_kick.assert_awaited_once()
+    assert result2.deduplicated is False
+    assert mock_kick.await_count == 2
 
 
 async def test_kick_unknown_account_raises(session: AsyncSession):

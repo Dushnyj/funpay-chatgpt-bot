@@ -91,12 +91,53 @@ async def test_validate_account_success(session, monkeypatch):
     # Проверяем: аккаунт active, AccountLimits создан с токенами
     reloaded_acc = await session.get(Account, acc.id)
     assert reloaded_acc.status == "active"
+    assert reloaded_acc.chatgpt_last_check_at is not None
 
     limits = await session.get(AccountLimits, acc.id)
     assert limits is not None
     assert limits.refresh_token_encrypted == "initial-refresh"
     assert limits.account_id_openai == "openai-acc-1"
     assert limits.refresh_status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_token_identity_must_match_configured_account(session, monkeypatch):
+    from app.integrations.openai.oauth import RefreshedTokens
+    from app.services.account_validation import (
+        AccountValidationError,
+        ValidationCode,
+        _save_tokens_and_measure,
+    )
+
+    account = Account(
+        login="expected@example.com",
+        email="mailbox@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        status="pending_validation",
+    )
+    session.add(account)
+    await session.flush()
+    measure = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.account_validation.measure_account_limits",
+        measure,
+    )
+    tokens = RefreshedTokens(
+        access_token="access",
+        refresh_token="refresh",
+        id_token=_make_jwt({
+            "email": "different@example.com",
+            "https://api.openai.com/account": {"account_id": "wrong-account"},
+        }),
+    )
+
+    with pytest.raises(AccountValidationError) as error:
+        await _save_tokens_and_measure(session, account, tokens)
+
+    assert error.value.code == ValidationCode.INVALID_CREDENTIALS.value
+    assert await session.get(AccountLimits, account.id) is None
+    measure.assert_not_awaited()
 
 
 @pytest.mark.asyncio

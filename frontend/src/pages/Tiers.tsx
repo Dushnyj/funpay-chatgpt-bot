@@ -110,14 +110,18 @@ function ScopesTab() {
   const scopes = query.data ?? []
   const descriptions: Record<string, string> = {
     any: 'Без гарантии остатка конкретного лимита. Подходит для базовых предложений.',
-    chat: 'Гарантированный остаток лимитов ChatGPT для диалогов.',
-    codex: 'Гарантированный остаток лимитов Codex для задач разработки.',
+    chat: 'Недоступно для продажи с гарантией: OpenAI не публикует достоверный остаток сообщений ChatGPT.',
+    codex: 'Гарантированный остаток измеримых лимитов Codex в фактическом окне OpenAI.',
   }
   return (
     <section className="panel panel--flush">
       <div className="section-toolbar"><div><h2>Типы лимитов</h2><p>Определяют, какие показатели учитываются при подборе аккаунта.</p></div><span className="soft-badge"><Icon name="shield" size={14} />Только просмотр</span></div>
       {scopes.length === 0 ? <EmptyState icon="activity" title="Типы лимитов не инициализированы" description="Ожидаются системные значения any, chat и codex." /> : (
-        <div className="scope-grid">{scopes.map((scope) => <article className="scope-card" key={scope.id}><div className="scope-card__icon"><Icon name={scope.code === 'codex' ? 'templates' : scope.code === 'chat' ? 'activity' : 'catalog'} /></div><div><span className="eyebrow">{scope.code}</span><h3>{scope.name}</h3><p>{descriptions[scope.code] ?? 'Системное правило подбора аккаунтов.'}</p></div></article>)}</div>
+        <div className="scope-grid">{scopes.map((scope) => {
+          const code = scope.code.toLowerCase()
+          const unavailable = code === 'chat'
+          return <article className={`scope-card ${unavailable ? 'scope-card--unavailable' : ''}`} key={scope.id} aria-disabled={unavailable}><div className="scope-card__icon"><Icon name={code === 'codex' ? 'templates' : unavailable ? 'activity' : 'catalog'} /></div><div><span className="eyebrow">{code}</span><h3>{scope.name}</h3>{unavailable && <StatusBadge value="disabled" label="Недоступно · не измеряется" />}<p>{descriptions[code] ?? 'Системное правило подбора аккаунтов.'}</p></div></article>
+        })}</div>
       )}
     </section>
   )

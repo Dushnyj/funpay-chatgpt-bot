@@ -21,12 +21,24 @@ from app.telegram_notifier import TelegramNotifier, get_effective_telegram_confi
 router = APIRouter(prefix="/api/settings", tags=["settings"], dependencies=[Depends(get_current_user)])
 
 
+def _settings_response(settings: SellerSettings) -> SettingsOut:
+    app_settings = get_app_settings()
+    graph_configured = all((
+        app_settings.microsoft_graph_client_id.strip(),
+        app_settings.microsoft_graph_client_secret.strip(),
+        app_settings.microsoft_graph_redirect_uri.strip(),
+    ))
+    return SettingsOut.model_validate(settings).model_copy(
+        update={"graph_configured": graph_configured}
+    )
+
+
 @router.get("", response_model=SettingsOut)
 async def get_settings(session: AsyncSession = Depends(get_db_session)):
     settings = await session.get(SellerSettings, 1)
     if settings is None:
         raise HTTPException(status_code=404, detail="Settings not configured")
-    return settings
+    return _settings_response(settings)
 
 
 @router.put("", response_model=SettingsOut)
@@ -44,11 +56,13 @@ async def update_settings(
         setattr(settings, field, value)
     await session.commit()
     await session.refresh(settings)
-    if "funpay_node_id" in update:
-        lifecycle = getattr(request.app.state, "lifecycle", None)
-        if lifecycle is not None and hasattr(lifecycle, "reconfigure_funpay"):
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is not None:
+        if "funpay_node_id" in update and hasattr(lifecycle, "reconfigure_funpay"):
             await lifecycle.reconfigure_funpay()
-    return settings
+        if hasattr(lifecycle, "reload_settings"):
+            await lifecycle.reload_settings()
+    return _settings_response(settings)
 
 
 @router.get("/funpay-key", response_model=FunPayKeyStatus)
@@ -56,7 +70,13 @@ async def get_funpay_key_status(
     session: AsyncSession = Depends(get_db_session),
 ) -> FunPayKeyStatus:
     key = await get_effective_funpay_key(session, get_app_settings())
-    return FunPayKeyStatus(**key_status(key))
+    settings = await session.get(SellerSettings, 1)
+    return FunPayKeyStatus(
+        **key_status(
+            key,
+            connected=bool(settings and settings.funpay_session_valid),
+        )
+    )
 
 
 @router.put("/funpay-key", response_model=FunPayKeyStatus)
@@ -65,17 +85,29 @@ async def set_funpay_key(
     request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> FunPayKeyStatus:
+    previous_key = await get_effective_funpay_key(session, get_app_settings())
     settings = await session.get(SellerSettings, 1)
     if settings is None:
         settings = SellerSettings(id=1)
         session.add(settings)
-    settings.funpay_session_key = req.key
-    settings.funpay_session_valid = False
-    await session.commit()
     lifecycle = getattr(request.app.state, "lifecycle", None)
-    if lifecycle is not None and hasattr(lifecycle, "reconfigure_funpay"):
-        await lifecycle.reconfigure_funpay(req.key)
-    return FunPayKeyStatus(**key_status(req.key))
+    if lifecycle is None or not hasattr(lifecycle, "reconfigure_funpay"):
+        raise HTTPException(status_code=503, detail="FunPay runtime is unavailable")
+    connected = await lifecycle.reconfigure_funpay(req.key)
+    if not connected:
+        raise HTTPException(
+            status_code=422,
+            detail="FunPay rejected the golden key; the previous connection was preserved",
+        )
+    settings.funpay_session_key = req.key
+    settings.funpay_session_valid = True
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        await lifecycle.reconfigure_funpay(previous_key)
+        raise
+    return FunPayKeyStatus(**key_status(req.key, connected=True))
 
 
 @router.delete("/funpay-key", response_model=FunPayKeyStatus)
@@ -90,11 +122,15 @@ async def clear_funpay_key(
         await session.commit()
     key = get_app_settings().funpay_session_key
     lifecycle = getattr(request.app.state, "lifecycle", None)
+    connected = False
     if lifecycle is not None and hasattr(lifecycle, "reconfigure_funpay"):
-        # Reload after clearing the DB override so an intentionally configured
-        # environment fallback remains consistent with the reported status.
-        await lifecycle.reconfigure_funpay()
-    return FunPayKeyStatus(**key_status(key))
+        # Stop the removed credential first. If an explicit environment
+        # fallback exists, start it only from a disconnected state so a failed
+        # replacement cannot silently restore the credential just cleared.
+        await lifecycle.reconfigure_funpay("")
+        if key:
+            connected = await lifecycle.reconfigure_funpay(key)
+    return FunPayKeyStatus(**key_status(key, connected=connected))
 
 
 def _telegram_status(token: str, chat_id: str) -> TelegramConfigStatus:

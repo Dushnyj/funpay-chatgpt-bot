@@ -25,9 +25,17 @@ def test_parse_code_none_for_short_numbers():
     assert parse_verification_code("Order #123 confirmed") is None
 
 
-def test_parse_code_picks_first_six_digit():
+def test_parse_code_prefers_explicit_code_context():
     text = "Reference 999333, code 111222, other 444555"
-    assert parse_verification_code(text) == "999333"
+    assert parse_verification_code(text) == "111222"
+
+
+def test_parse_code_rejects_ambiguous_numbers_without_context():
+    assert parse_verification_code("Reference 999333, item 444555") is None
+
+
+def test_parse_code_rejects_two_contextual_codes():
+    assert parse_verification_code("Code 111222. Security code 333444.") is None
 
 
 def test_parse_code_ignores_phone_numbers():

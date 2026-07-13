@@ -7,11 +7,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
 from app.models.account import Account, AccountLimits
+from app.models.audit import AuditLog
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
 from app.services.account_pool import AccountCriteria, AccountPool
-from app.services.messages import render_message
+from app.services.messages import issued_usage_template_variables, render_message
+
+
+CREDENTIAL_DELIVERY_LEASE = timedelta(minutes=5)
+CREDENTIAL_DELIVERY_MAX_ATTEMPTS = 6
+_CREDENTIAL_RETRY_BASE = timedelta(minutes=1)
+_CREDENTIAL_RETRY_MAX = timedelta(hours=1)
+_FULFILLABLE_ORDER_STATUSES = {"pending", "completed"}
 
 
 class RentalService:
@@ -30,14 +38,29 @@ class RentalService:
         gateway: ChatGateway,
         order_id: int,
         default_max_active_rentals: int,
+        *,
+        notify_unavailable: bool = True,
     ) -> Rental | None:
-        existing = await self._find_rental_by_order(session, order_id)
-        if existing is not None:
-            return existing
-
-        order = await session.get(Order, order_id)
+        # Serialize the live FunPay callback and scheduled/manual retries for
+        # the same order. Together with uq_rental_order this prevents two
+        # workers from allocating and delivering two independent rentals.
+        order = (
+            await session.execute(
+                select(Order).where(Order.id == order_id).with_for_update()
+            )
+        ).scalar_one_or_none()
         if order is None:
             raise KeyError(f"Order {order_id} not found")
+        rental = await self._find_rental_by_order(session, order_id)
+        if rental is not None:
+            if not self._claim_existing_delivery(order, rental):
+                return rental
+            await session.commit()
+            return await self._deliver_claimed(
+                session, gateway, order.id, rental.id,
+            )
+        if order.status not in _FULFILLABLE_ORDER_STATUSES:
+            return None
 
         duration = await session.get(Duration, order.duration_id)
         if duration is None:
@@ -56,7 +79,8 @@ class RentalService:
         )
         account = await self._pool.acquire(session, criteria, default_max_active_rentals)
         if account is None:
-            await self._send_no_account(session, gateway, order)
+            if notify_unavailable:
+                await self._send_no_account(session, gateway, order)
             return None
 
         limits = await session.get(AccountLimits, account.id)
@@ -80,12 +104,58 @@ class RentalService:
             issued_chat_weekly_pct=limits.chat_weekly_remaining_pct if limits else None,
             issued_codex_5h_pct=limits.codex_5h_remaining_pct if limits else None,
             issued_codex_weekly_pct=limits.codex_weekly_remaining_pct if limits else None,
+            issued_codex_primary_pct=(
+                limits.codex_primary_remaining_pct if limits else None
+            ),
+            issued_codex_primary_window_seconds=(
+                limits.codex_primary_window_seconds if limits else None
+            ),
+            issued_codex_primary_resets_at=(
+                limits.codex_primary_resets_at if limits else None
+            ),
+            issued_codex_secondary_pct=(
+                limits.codex_secondary_remaining_pct if limits else None
+            ),
+            issued_codex_secondary_window_seconds=(
+                limits.codex_secondary_window_seconds if limits else None
+            ),
+            issued_codex_secondary_resets_at=(
+                limits.codex_secondary_resets_at if limits else None
+            ),
+            issued_plan_window_status=(
+                limits.plan_window_status if limits else None
+            ),
+            issued_expected_long_window_seconds=(
+                limits.expected_long_window_seconds if limits else None
+            ),
+            issued_limits_measured_at=limits.measured_at if limits else None,
+            credentials_delivery_status="sending",
+            credentials_delivery_template="welcome",
+            credentials_delivery_started_at=now,
+            credentials_delivery_next_attempt_at=None,
+            credentials_delivery_attempts=1,
         )
         session.add(rental)
         await session.flush()
+        # Persist the allocation before external delivery. If the process dies
+        # after FunPay accepts the message, retries can only reuse this Rental
+        # and therefore never allocate a second account for the same order.
+        await session.commit()
+        return await self._deliver_claimed(session, gateway, order.id, rental.id)
 
-        await self._send_welcome(session, gateway, order, account, limits, duration.days)
-        return rental
+    async def deliver_claimed_rental(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        rental_id: int,
+    ) -> Rental:
+        """Deliver a previously committed primary/replacement credential claim."""
+        rental = await session.get(Rental, rental_id)
+        if rental is None:
+            raise KeyError(f"Rental {rental_id} not found")
+        return await self._deliver_claimed(
+            session, gateway, rental.order_id, rental.id,
+        )
 
     async def revoke_rental(self, session: AsyncSession, rental_id: int) -> Rental:
         rental = await session.get(Rental, rental_id)
@@ -103,31 +173,180 @@ class RentalService:
         )
         return result.scalar_one_or_none()
 
+    @staticmethod
+    def _claim_existing_delivery(order: Order, rental: Rental) -> bool:
+        if (
+            order.status not in _FULFILLABLE_ORDER_STATUSES
+            or rental.status != "active"
+            or rental.credentials_delivery_status == "sent"
+            or rental.credentials_delivery_status == "manual"
+            or rental.credentials_delivery_attempts
+            >= CREDENTIAL_DELIVERY_MAX_ATTEMPTS
+        ):
+            return False
+
+        now = datetime.now(timezone.utc)
+        next_attempt_at = rental.credentials_delivery_next_attempt_at
+        if next_attempt_at is not None and next_attempt_at.tzinfo is None:
+            next_attempt_at = next_attempt_at.replace(tzinfo=timezone.utc)
+        if next_attempt_at is not None and next_attempt_at > now:
+            return False
+
+        started_at = rental.credentials_delivery_started_at
+        if started_at is not None and started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        if (
+            rental.credentials_delivery_status == "sending"
+            and started_at is not None
+            and started_at > now - CREDENTIAL_DELIVERY_LEASE
+        ):
+            return False
+
+        rental.credentials_delivery_status = "sending"
+        rental.credentials_delivery_started_at = now
+        rental.credentials_delivery_next_attempt_at = None
+        rental.credentials_delivery_attempts += 1
+        rental.credentials_delivery_last_error = None
+        return True
+
+    async def _deliver_claimed(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        order_id: int,
+        rental_id: int,
+    ) -> Rental:
+        # Reacquire the order lock after the allocation commit. Refund handling
+        # uses the same lock, so credentials cannot race a completed refund.
+        order = (
+            await session.execute(
+                select(Order).where(Order.id == order_id).with_for_update()
+            )
+        ).scalar_one()
+        rental = await session.get(Rental, rental_id)
+        if rental is None:
+            raise KeyError(f"Rental {rental_id} not found")
+        if (
+            order.status not in _FULFILLABLE_ORDER_STATUSES
+            or rental.status != "active"
+            or rental.credentials_delivery_status != "sending"
+        ):
+            if rental.credentials_delivery_status == "sending":
+                rental.credentials_delivery_status = "failed"
+                rental.credentials_delivery_last_error = "order_not_fulfillable"
+                rental.credentials_delivery_next_attempt_at = None
+                await session.commit()
+            return rental
+
+        account = await session.get(Account, rental.account_id)
+        duration = await session.get(Duration, rental.duration_id)
+        if account is None or duration is None:
+            rental.credentials_delivery_status = "manual"
+            rental.credentials_delivery_last_error = "delivery_data_missing"
+            rental.credentials_delivery_next_attempt_at = None
+            self._record_manual_delivery_required(session, rental)
+            await session.commit()
+            return rental
+        try:
+            await self._send_welcome(
+                session,
+                gateway,
+                order,
+                account,
+                rental,
+                duration.days,
+                template_key=rental.credentials_delivery_template,
+            )
+        except Exception as exc:
+            self._schedule_delivery_retry(
+                session,
+                rental,
+                f"delivery_failed:{type(exc).__name__}"[:128],
+            )
+            await session.commit()
+            raise
+
+        delivered_at = datetime.now(timezone.utc)
+        rental.credentials_delivery_status = "sent"
+        rental.credentials_delivered_at = delivered_at
+        rental.credentials_delivery_next_attempt_at = None
+        rental.credentials_delivery_last_error = None
+        # Only the initial paid rental begins at credential delivery. A
+        # replacement must preserve the customer's original expiry instead of
+        # silently granting a new full term.
+        if rental.credentials_delivery_template == "welcome":
+            rental.started_at = delivered_at
+            rental.expires_at = delivered_at + timedelta(days=duration.days)
+        await session.commit()
+        return rental
+
+    @staticmethod
+    def _schedule_delivery_retry(
+        session: AsyncSession,
+        rental: Rental,
+        error: str,
+    ) -> None:
+        rental.credentials_delivery_last_error = error[:128]
+        if rental.credentials_delivery_attempts >= CREDENTIAL_DELIVERY_MAX_ATTEMPTS:
+            rental.credentials_delivery_status = "manual"
+            rental.credentials_delivery_next_attempt_at = None
+            RentalService._record_manual_delivery_required(session, rental)
+            return
+
+        exponent = max(0, rental.credentials_delivery_attempts - 1)
+        delay_seconds = min(
+            _CREDENTIAL_RETRY_BASE.total_seconds() * (2**exponent),
+            _CREDENTIAL_RETRY_MAX.total_seconds(),
+        )
+        rental.credentials_delivery_status = "failed"
+        rental.credentials_delivery_next_attempt_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+        )
+
+    @staticmethod
+    def _record_manual_delivery_required(
+        session: AsyncSession,
+        rental: Rental,
+    ) -> None:
+        session.add(
+            AuditLog(
+                event_type="credential_delivery_manual_required",
+                account_id=rental.account_id,
+                rental_id=rental.id,
+                chat_id=rental.buyer_funpay_chat_id,
+                metadata_={
+                    "attempts": rental.credentials_delivery_attempts,
+                    "error": rental.credentials_delivery_last_error,
+                },
+            )
+        )
+
     async def _send_welcome(
         self,
         session: AsyncSession,
         gateway: ChatGateway,
         order: Order,
         account: Account,
-        limits: AccountLimits | None,
+        rental: Rental,
         days: int,
+        *,
+        template_key: str = "welcome",
     ) -> None:
         tier = await session.get(SubscriptionTier, account.tier_id)
         # account.password_encrypted использует FernetEncrypted TypeDecorator:
         # ORM автоматически расшифровывает при чтении, отдавая plaintext.
         password = account.password_encrypted
         lang = order.buyer_locale or "ru"
+        if template_key not in {"welcome", "replace_success"}:
+            template_key = "welcome"
         text = await render_message(
-            session, "welcome", lang,
+            session, template_key, lang,
             login=account.login,
             password=password,
             tier=tier.name if tier else "",
             days=days,
             expires_at=_fmt_expires(account.subscription_expires_at),
-            chat_5h=_pct(limits, "chat_5h") if limits else "—",
-            chat_weekly=_pct(limits, "chat_weekly") if limits else "—",
-            codex_5h=_pct(limits, "codex_5h") if limits else "—",
-            codex_weekly=_pct(limits, "codex_weekly") if limits else "—",
+            **issued_usage_template_variables(rental, lang=lang),
         )
         await gateway.send_message(chat_id=int(order.funpay_chat_id), text=text)
 
@@ -150,11 +369,6 @@ class RentalService:
         if settings is not None:
             return settings.limits_check_interval_minutes
         return 5
-
-
-def _pct(limits: AccountLimits, field: str) -> str:
-    val = getattr(limits, f"{field}_remaining_pct")
-    return f"{val}%" if val is not None else "—"
 
 
 def _fmt_expires(dt: datetime | None) -> str:

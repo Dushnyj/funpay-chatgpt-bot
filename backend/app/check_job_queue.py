@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountCheckJob
@@ -73,11 +73,87 @@ class CheckJobQueue:
                 AccountCheckJob.status == "pending",
                 AccountCheckJob.job_type.in_(job_types),
             )
-            .order_by(AccountCheckJob.created_at.asc())
+            .order_by(
+                case(
+                    (AccountCheckJob.priority.in_(["new", "refresh_recover"]), 0),
+                    (AccountCheckJob.priority == "manual", 1),
+                    (AccountCheckJob.priority == "scheduled", 2),
+                    (AccountCheckJob.priority == "limit_check", 3),
+                    else_=9,
+                ),
+                AccountCheckJob.created_at.asc(),
+            )
             .limit(1)
             .with_for_update(skip_locked=True)
         )
         return result.scalar_one_or_none()
+
+    async def recover_stale_running(
+        self,
+        session: AsyncSession,
+        job_types: tuple[str, ...],
+        *,
+        stale_before: datetime | None = None,
+    ) -> int:
+        """Durably requeue worker jobs whose running lease is no longer valid.
+
+        ``stale_before`` is explicit so application startup can reclaim every
+        job owned by the previous process immediately. Periodic callers omit it
+        and use the normal worker lease.
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = stale_before or now - _RUNNING_JOB_LEASE
+        result = await session.execute(
+            select(AccountCheckJob)
+            .where(
+                AccountCheckJob.status == "running",
+                AccountCheckJob.job_type.in_(job_types),
+                or_(
+                    AccountCheckJob.started_at.is_(None),
+                    AccountCheckJob.started_at <= cutoff,
+                ),
+            )
+            .order_by(AccountCheckJob.id)
+            .with_for_update(skip_locked=True)
+        )
+        jobs = list(result.scalars())
+        for job in jobs:
+            job.status = "pending"
+            job.started_at = None
+            job.finished_at = None
+            job.error = None
+            job.result = "requeued_after_stale_worker"
+        if jobs:
+            await session.flush()
+        return len(jobs)
+
+    async def fail_active_jobs(
+        self,
+        session: AsyncSession,
+        job_types: tuple[str, ...],
+        *,
+        error: str,
+    ) -> list[int]:
+        """Terminalize active jobs that cannot be resumed after a restart."""
+        result = await session.execute(
+            select(AccountCheckJob)
+            .where(
+                AccountCheckJob.status.in_(["pending", "running"]),
+                AccountCheckJob.job_type.in_(job_types),
+            )
+            .order_by(AccountCheckJob.id)
+            .with_for_update(skip_locked=True)
+        )
+        jobs = list(result.scalars())
+        now = datetime.now(timezone.utc)
+        for job in jobs:
+            job.status = "failed"
+            job.result = None
+            job.error = error
+            job.finished_at = now
+        if jobs:
+            await session.flush()
+        return list(dict.fromkeys(job.account_id for job in jobs))
 
     async def enqueue_exclusive(
         self,
@@ -149,18 +225,37 @@ class CheckJobQueue:
     async def mark_running(self, session: AsyncSession, job: AccountCheckJob) -> None:
         job.status = "running"
         job.started_at = datetime.now(timezone.utc)
+        job.finished_at = None
+        job.error = None
         await session.flush()
 
     async def mark_done(self, session: AsyncSession, job: AccountCheckJob, result: str) -> None:
         job.status = "done"
         job.result = result
+        job.error = None
         job.finished_at = datetime.now(timezone.utc)
         await session.flush()
 
     async def mark_failed(self, session: AsyncSession, job: AccountCheckJob, error: str) -> None:
         job.status = "failed"
+        job.result = None
         job.error = error
         job.finished_at = datetime.now(timezone.utc)
+        await session.flush()
+
+    async def requeue(
+        self,
+        session: AsyncSession,
+        job: AccountCheckJob,
+        *,
+        reason: str,
+    ) -> None:
+        """Return an interrupted job to the durable pending queue."""
+        job.status = "pending"
+        job.started_at = None
+        job.finished_at = None
+        job.error = None
+        job.result = reason
         await session.flush()
 
     async def _find_active(

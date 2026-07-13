@@ -1,5 +1,5 @@
 from cryptography.fernet import InvalidToken
-from sqlalchemy import Dialect, String, TypeDecorator
+from sqlalchemy import Dialect, String, Text, TypeDecorator
 
 from app.services.crypto import decrypt_legacy_layers, encrypt
 
@@ -29,3 +29,13 @@ class FernetEncrypted(TypeDecorator[str]):
             if self.allow_legacy_plaintext and not value.startswith("gAAAA"):
                 return value
             raise
+
+
+class FernetEncryptedText(FernetEncrypted):
+    """Fernet payload stored in an unbounded text column.
+
+    Encryption expands the payload, so a 4,000-character chat message cannot
+    safely fit back into VARCHAR(4000).
+    """
+
+    impl = Text

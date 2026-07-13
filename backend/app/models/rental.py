@@ -24,6 +24,13 @@ class Order(Base):
     max_weekly_pct: Mapped[int | None] = mapped_column(default=None)
     price: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), default="pending")
+    fulfillment_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    fulfillment_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    fulfillment_last_error: Mapped[str | None] = mapped_column(
+        String(128), default=None
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -56,3 +63,39 @@ class Rental(Base):
     issued_chat_weekly_pct: Mapped[int | None] = mapped_column(default=None)
     issued_codex_5h_pct: Mapped[int | None] = mapped_column(default=None)
     issued_codex_weekly_pct: Mapped[int | None] = mapped_column(default=None)
+    issued_codex_primary_pct: Mapped[int | None] = mapped_column(default=None)
+    issued_codex_primary_window_seconds: Mapped[int | None] = mapped_column(default=None)
+    issued_codex_primary_resets_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    issued_codex_secondary_pct: Mapped[int | None] = mapped_column(default=None)
+    issued_codex_secondary_window_seconds: Mapped[int | None] = mapped_column(default=None)
+    issued_codex_secondary_resets_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    issued_plan_window_status: Mapped[str | None] = mapped_column(
+        String(24), default=None
+    )
+    issued_expected_long_window_seconds: Mapped[int | None] = mapped_column(default=None)
+    issued_limits_measured_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    credentials_delivery_status: Mapped[str] = mapped_column(
+        String(16), default="sending"
+    )
+    credentials_delivery_template: Mapped[str] = mapped_column(
+        String(32), default="welcome"
+    )
+    credentials_delivery_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    credentials_delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    credentials_delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    credentials_delivery_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    credentials_delivery_last_error: Mapped[str | None] = mapped_column(
+        String(128), default=None
+    )
