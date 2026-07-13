@@ -117,6 +117,7 @@ async def test_seed_catalog_is_complete_idempotent_and_preserves_existing(sessio
     scopes = (await session.execute(select(LimitScope))).scalars().all()
     assert {tier.name for tier in tiers} == {name for name, _ in DEFAULT_TIERS}
     assert {duration.days for duration in durations} == set(DEFAULT_DURATIONS)
+    assert all(duration.sort_order == duration.days for duration in durations)
     assert {scope.code for scope in scopes} == {
         code for code, _ in DEFAULT_LIMIT_SCOPES
     }
@@ -173,4 +174,23 @@ async def test_seed_catalog_preserves_limit_scope_availability_override(session)
     await session.refresh(codex)
 
     assert codex.is_enabled is False
-    assert codex.sort_order == 5
+    assert codex.sort_order == 30
+
+
+@pytest.mark.asyncio
+async def test_seed_catalog_does_not_restore_missing_duration(session):
+    await seed_catalog(session)
+    duration = (
+        await session.execute(select(Duration).where(Duration.days == 3))
+    ).scalar_one()
+    await session.delete(duration)
+    custom = Duration(days=8, is_enabled=True, sort_order=999)
+    session.add(custom)
+    await session.commit()
+
+    await seed_catalog(session)
+
+    durations = (await session.execute(select(Duration))).scalars().all()
+    assert 3 not in {item.days for item in durations}
+    custom = next(item for item in durations if item.days == 8)
+    assert custom.sort_order == 8

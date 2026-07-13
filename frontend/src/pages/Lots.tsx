@@ -6,9 +6,10 @@ import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Duration, LimitScope, Lot, LotCreate, Tier } from '../types/api'
+import { compareDurationsByDays } from '../utils/catalogEditor'
 import { formatCurrency } from '../utils/format'
 import { getLotCatalogAvailability } from '../utils/lotAvailability'
-import { isAvailableOfferScope } from '../utils/offerScopes'
+import { compareOfferScopes, isAvailableOfferScope } from '../utils/offerScopes'
 
 export default function Lots() {
   const lotsQuery = useLots()
@@ -219,10 +220,10 @@ function ManualLotDialog({
 }) {
   const createLot = useCreateLot()
   const availableTiers = tiers.filter((tier) => tier.is_active && tier.is_sellable !== false)
-  const availableDurations = durations.filter((duration) => duration.is_enabled).sort((a, b) => a.sort_order - b.sort_order)
+  const availableDurations = durations.filter((duration) => duration.is_enabled).sort(compareDurationsByDays)
   const availableScopes = scopes
     .filter(isAvailableOfferScope)
-    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
+    .sort(compareOfferScopes)
   const defaultScope = availableScopes.find((scope) => scope.code.toLowerCase() === 'any') ?? availableScopes[0]
   const [error, setError] = useState('')
   const [form, setForm] = useState({

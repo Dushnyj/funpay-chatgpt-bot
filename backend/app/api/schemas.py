@@ -70,7 +70,6 @@ class DurationCreate(BaseModel):
 
     days: int = Field(strict=True, ge=1, le=30)
     is_enabled: bool = True
-    sort_order: int | None = Field(default=None, ge=0, le=10_000)
 
 
 class DurationUpdate(BaseModel):
@@ -78,9 +77,8 @@ class DurationUpdate(BaseModel):
 
     id: int = Field(gt=0)
     is_enabled: bool | None = None
-    sort_order: int | None = Field(default=None, ge=0, le=10_000)
 
-    @field_validator("is_enabled", "sort_order", mode="before")
+    @field_validator("is_enabled", mode="before")
     @classmethod
     def reject_explicit_null(cls, value):
         if value is None:
@@ -98,9 +96,8 @@ class DurationPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_enabled: bool | None = None
-    sort_order: int | None = Field(default=None, ge=0, le=10_000)
 
-    @field_validator("is_enabled", "sort_order", mode="before")
+    @field_validator("is_enabled", mode="before")
     @classmethod
     def reject_explicit_null(cls, value):
         if value is None:
@@ -126,9 +123,8 @@ class LimitScopeUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     is_enabled: bool | None = None
-    sort_order: int | None = Field(default=None, ge=0, le=10_000)
 
-    @field_validator("is_enabled", "sort_order", mode="before")
+    @field_validator("is_enabled", mode="before")
     @classmethod
     def reject_explicit_null(cls, value):
         if value is None:

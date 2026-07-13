@@ -22,7 +22,7 @@ import {
   renderTemplatePreview,
   templateKeyForName,
 } from '../utils/templateEditor'
-import { isAvailableOfferScope, offerScopeUnavailableReason } from '../utils/offerScopes'
+import { compareOfferScopes, isAvailableOfferScope, offerScopeUnavailableReason } from '../utils/offerScopes'
 import '../styles/templates.css'
 
 type TemplateSection = 'messages' | 'lots'
@@ -304,7 +304,7 @@ export default function Templates() {
   const activeLotDraft = activeLot ? lotDrafts[activeLot.key] ?? toLotDraft(activeLot) : null
   const availableLotScopes = (scopesQuery.data ?? [])
     .filter(isAvailableOfferScope)
-    .sort((left, right) => left.sort_order - right.sort_order || left.id - right.id)
+    .sort(compareOfferScopes)
   const activeLotScope = activeLot?.limit_scope_id
     ? (scopesQuery.data ?? []).find((scope) => scope.id === activeLot.limit_scope_id)
     : null

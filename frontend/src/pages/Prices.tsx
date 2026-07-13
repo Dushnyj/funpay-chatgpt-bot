@@ -5,8 +5,9 @@ import { usePrices, useUpdatePrices } from '../api/prices'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, TableShell } from '../components/ui'
 import type { PriceMatrixItem, Tier } from '../types/api'
+import { compareDurationsByDays } from '../utils/catalogEditor'
 import { formatCurrency } from '../utils/format'
-import { isAvailableOfferScope, isSupportedOfferScopeCode, offerScopeUnavailableReason } from '../utils/offerScopes'
+import { compareOfferScopes, isAvailableOfferScope, isSupportedOfferScopeCode, offerScopeUnavailableReason } from '../utils/offerScopes'
 
 type DraftRule = PriceMatrixItem & { draftId: string }
 type BuilderState = {
@@ -41,11 +42,11 @@ export default function Prices() {
   const scopes = scopesQuery.data ?? []
   const configurableScopes = scopes
     .filter(isAvailableOfferScope)
-    .sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)
+    .sort(compareOfferScopes)
   const sellableTiers = tiers.filter(isTierSellable)
   const enabledDurations = durations
     .filter((duration) => duration.is_enabled)
-    .sort((a, b) => a.sort_order - b.sort_order)
+    .sort(compareDurationsByDays)
   const visibleDraft = useMemo(
     () => draft.filter((item) => tierFilter === 'all' || item.tier_id === Number(tierFilter)),
     [draft, tierFilter],
@@ -294,9 +295,10 @@ export default function Prices() {
             const rowTierOptions = currentTier && !sellableTiers.some((tier) => tier.id === currentTier.id)
               ? [currentTier, ...sellableTiers]
               : sellableTiers
-            const rowDurationOptions = currentDuration && !enabledDurations.some((duration) => duration.id === currentDuration.id)
+            const rowDurationOptions = (currentDuration && !enabledDurations.some((duration) => duration.id === currentDuration.id)
               ? [currentDuration, ...enabledDurations]
-              : enabledDurations
+              : [...enabledDurations])
+              .sort(compareDurationsByDays)
             const rowScopeOptions = currentScope && !configurableScopes.some((candidate) => candidate.id === currentScope.id)
               ? [currentScope, ...configurableScopes]
               : configurableScopes

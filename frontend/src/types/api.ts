@@ -29,18 +29,15 @@ export interface Duration {
   id: number
   days: number
   is_enabled: boolean
-  sort_order: number
 }
 
 export interface DurationCreate {
   days: number
   is_enabled?: boolean
-  sort_order?: number
 }
 
 export interface DurationUpdate {
   is_enabled?: boolean
-  sort_order?: number
 }
 
 export interface LimitScope {
@@ -48,12 +45,10 @@ export interface LimitScope {
   code: string
   name: string
   is_enabled: boolean
-  sort_order: number
 }
 
 export interface LimitScopeUpdate {
   is_enabled?: boolean
-  sort_order?: number
 }
 
 export interface AccountLimits {

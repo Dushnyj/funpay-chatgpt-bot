@@ -63,7 +63,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
-    assert version == "20260713_0013"
+    assert version == "20260713_0014"
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
         "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
@@ -205,6 +205,57 @@ async def test_0013_limit_scope_availability_fails_closed_for_unknown_codes(
         "chat": False,
         "codex": True,
         "legacy": False,
+    }
+
+
+async def test_0014_normalizes_catalog_sort_mirrors(tmp_path, monkeypatch):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'catalog-0014.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260713_0013")
+
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO durations (days, is_enabled, sort_order) VALUES "
+                "(8, true, 999), (3, true, 0)"
+            )
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO limit_scopes "
+                "(code, name, is_enabled, sort_order) VALUES "
+                "('any', 'Any', true, 99), "
+                "('chat', 'Chat', false, 1), "
+                "('codex', 'Codex', true, 2), "
+                "('legacy', 'Legacy', false, -1)"
+            )
+        )
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260713_0014")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        duration_rows = (
+            await connection.execute(
+                text("SELECT days, sort_order FROM durations")
+            )
+        ).all()
+        scope_rows = (
+            await connection.execute(
+                text("SELECT code, sort_order FROM limit_scopes")
+            )
+        ).all()
+    await engine.dispose()
+
+    assert {row.days: row.sort_order for row in duration_rows} == {8: 8, 3: 3}
+    assert {row.code: row.sort_order for row in scope_rows} == {
+        "any": 10,
+        "chat": 20,
+        "codex": 30,
+        "legacy": 100,
     }
 
 
@@ -380,7 +431,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260713_0013"
+    assert version == "20260713_0014"
     await engine.dispose()
 
 
@@ -469,7 +520,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260713_0013"
+    assert version == "20260713_0014"
     await engine.dispose()
 
 

@@ -1,17 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { durationUnit, parseCatalogSortOrder, validateDurationDays } from '../src/utils/catalogEditor.ts'
+import { compareDurationsByDays, durationUnit, validateDurationDays } from '../src/utils/catalogEditor.ts'
 
-test('catalog sort order accepts only non-negative safe integers', () => {
-  assert.equal(parseCatalogSortOrder('0'), 0)
-  assert.equal(parseCatalogSortOrder(' 25 '), 25)
-  assert.equal(parseCatalogSortOrder('10000'), 10_000)
-  assert.equal(parseCatalogSortOrder('10001'), null)
-  assert.equal(parseCatalogSortOrder('-1'), null)
-  assert.equal(parseCatalogSortOrder('1.5'), null)
-  assert.equal(parseCatalogSortOrder(''), null)
-  assert.equal(parseCatalogSortOrder('9007199254740992'), null)
+test('durations are ordered by days with id as a stable tie breaker', () => {
+  const durations = [
+    { id: 9, days: 30 },
+    { id: 4, days: 7 },
+    { id: 2, days: 1 },
+    { id: 3, days: 7 },
+  ]
+
+  assert.deepEqual(durations.sort(compareDurationsByDays).map((duration) => duration.id), [2, 3, 4, 9])
 })
 
 test('duration labels use the correct Russian plural form', () => {

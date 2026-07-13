@@ -21,6 +21,7 @@ async def bootstrap_database(
     """
     async with session_factory() as session:
         seller_settings = await session.get(SellerSettings, 1)
+        initialize_durations = seller_settings is None
         if seller_settings is None:
             seller_settings = SellerSettings(
                 id=1,
@@ -30,7 +31,11 @@ async def bootstrap_database(
         elif not seller_settings.admin_password_hash and settings.admin_password_hash:
             seller_settings.admin_password_hash = settings.admin_password_hash
 
-        await seed_catalog(session, commit=False)
+        await seed_catalog(
+            session,
+            commit=False,
+            initialize_durations=initialize_durations,
+        )
         await seed_message_templates(session, commit=False)
         await seed_lot_templates(session, commit=False)
         await session.commit()

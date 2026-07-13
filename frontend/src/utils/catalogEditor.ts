@@ -1,8 +1,7 @@
-export function parseCatalogSortOrder(value: string): number | null {
-  const normalized = value.trim()
-  if (!/^\d+$/.test(normalized)) return null
-  const parsed = Number(normalized)
-  return Number.isSafeInteger(parsed) && parsed <= 10_000 ? parsed : null
+type OrderedDuration = { id: number; days: number }
+
+export function compareDurationsByDays(left: OrderedDuration, right: OrderedDuration) {
+  return left.days - right.days || left.id - right.id
 }
 
 export function durationUnit(days: number) {

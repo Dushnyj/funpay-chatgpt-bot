@@ -10,6 +10,7 @@ import type {
   TierCreate,
   TierUpdate,
 } from '../types/api'
+import { compareDurationsByDays } from '../utils/catalogEditor'
 
 export function useTiers() {
   return useQuery({ queryKey: ['tiers'], queryFn: () => api.get<Tier[]>('/tiers') })
@@ -46,7 +47,10 @@ export function useUpdateTier() {
 }
 
 export function useDurations() {
-  return useQuery({ queryKey: ['durations'], queryFn: () => api.get<Duration[]>('/durations') })
+  return useQuery({
+    queryKey: ['durations'],
+    queryFn: async () => (await api.get<Duration[]>('/durations')).sort(compareDurationsByDays),
+  })
 }
 
 export function useCreateDuration() {
@@ -56,7 +60,7 @@ export function useCreateDuration() {
     onSuccess: (created) => {
       qc.setQueryData<Duration[]>(['durations'], (current) =>
         [...(current?.filter((duration) => duration.id !== created.id) ?? []), created]
-          .sort((left, right) => left.sort_order - right.sort_order || left.days - right.days || left.id - right.id),
+          .sort(compareDurationsByDays),
       )
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ['durations'] }),
@@ -71,6 +75,19 @@ export function useUpdateDuration() {
     onSuccess: (updated) => {
       qc.setQueryData<Duration[]>(['durations'], (current) =>
         current?.map((duration) => duration.id === updated.id ? updated : duration),
+      )
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ['durations'] }),
+  })
+}
+
+export function useDeleteDuration() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => api.delete(`/durations/${id}`),
+    onSuccess: (_result, id) => {
+      qc.setQueryData<Duration[]>(['durations'], (current) =>
+        current?.filter((duration) => duration.id !== id),
       )
     },
     onSettled: () => qc.invalidateQueries({ queryKey: ['durations'] }),

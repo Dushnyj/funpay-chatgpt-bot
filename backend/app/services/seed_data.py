@@ -278,7 +278,12 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
-async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
+async def seed_catalog(
+    session: AsyncSession,
+    *,
+    commit: bool = True,
+    initialize_durations: bool | None = None,
+) -> None:
     """Create the stable catalog defaults without overwriting operator data."""
     existing_tiers = (
         (await session.execute(select(SubscriptionTier))).scalars().all()
@@ -314,26 +319,39 @@ async def seed_catalog(session: AsyncSession, *, commit: bool = True) -> None:
         tier.sort_order = plan.sort_order
         tier.usage_multiplier = plan.usage_multiplier
 
-    existing_durations = set(
-        (await session.execute(select(Duration.days))).scalars().all()
+    existing_durations = (
+        (await session.execute(select(Duration))).scalars().all()
     )
-    for sort_order, days in enumerate(DEFAULT_DURATIONS):
-        if days not in existing_durations:
-            session.add(Duration(days=days, is_enabled=True, sort_order=sort_order))
+    if initialize_durations is None:
+        # Direct callers retain the original first-run behavior. Production
+        # bootstrap passes an explicit flag based on whether SellerSettings
+        # existed before startup, so a deliberately emptied catalog stays empty.
+        initialize_durations = not existing_durations
+    if initialize_durations and not existing_durations:
+        for days in DEFAULT_DURATIONS:
+            session.add(Duration(days=days, is_enabled=True, sort_order=days))
+    else:
+        for duration in existing_durations:
+            duration.sort_order = duration.days
 
-    existing_scopes = set(
-        (await session.execute(select(LimitScope.code))).scalars().all()
+    existing_scopes = (
+        (await session.execute(select(LimitScope))).scalars().all()
     )
-    for sort_order, (code, name) in enumerate(DEFAULT_LIMIT_SCOPES, start=1):
-        if code not in existing_scopes:
+    scopes_by_code = {scope.code: scope for scope in existing_scopes}
+    canonical_scope_order = {"any": 10, "chat": 20, "codex": 30}
+    for code, name in DEFAULT_LIMIT_SCOPES:
+        scope = scopes_by_code.get(code)
+        if scope is None:
             session.add(
                 LimitScope(
                     code=code,
                     name=name,
                     is_enabled=DEFAULT_LIMIT_SCOPE_AVAILABILITY[code],
-                    sort_order=sort_order * 10,
+                    sort_order=canonical_scope_order[code],
                 )
             )
+        else:
+            scope.sort_order = canonical_scope_order[code]
 
     if commit:
         await session.commit()

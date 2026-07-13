@@ -4,6 +4,7 @@ import {
   useLimitScopes,
   useTiers,
   useCreateDuration,
+  useDeleteDuration,
   useUpdateDuration,
   useUpdateLimitScope,
   useUpdateTier,
@@ -21,18 +22,15 @@ import {
 } from '../components/ui'
 import type {
   Duration,
-  DurationUpdate,
   LimitScope,
-  LimitScopeUpdate,
   Tier,
   TierUpdate,
 } from '../types/api'
-import { durationUnit, parseCatalogSortOrder, validateDurationDays } from '../utils/catalogEditor'
-import { isSupportedOfferScopeCode } from '../utils/offerScopes'
+import { compareDurationsByDays, durationUnit, validateDurationDays } from '../utils/catalogEditor'
+import { compareOfferScopes, isSupportedOfferScopeCode } from '../utils/offerScopes'
 
 type CatalogTab = 'tiers' | 'durations' | 'scopes'
 type UpdatingTier = { id: number; field: 'active' | 'sellable' }
-type CatalogItemUpdate = DurationUpdate | LimitScopeUpdate
 
 export default function Tiers() {
   const [tab, setTab] = useState<CatalogTab>('tiers')
@@ -88,7 +86,6 @@ function TiersTab() {
     <section className="panel panel--flush">
       <div className="section-toolbar">
         <div><h2>Системный каталог тарифов</h2><p>Free, Go, Plus и варианты Pro распознаются автоматически по данным аккаунта.</p></div>
-        <span className="soft-badge soft-badge--editable"><Icon name="settings" size={14} />Доступно редактирование</span>
       </div>
       <div className="form-alert form-alert--info catalog-system-note"><Icon name="activity" /><span>Названия тарифов синхронизируются системой. Здесь можно включить сам тариф и отдельно разрешить его продажу.</span></div>
       {error && <div className="form-alert form-alert--error catalog-system-note" role="alert"><Icon name="warning" /><span>{error}</span></div>}
@@ -142,18 +139,17 @@ function TiersTab() {
 
 function DurationsTab() {
   const query = useDurations()
-  const updateDuration = useUpdateDuration()
   const [editing, setEditing] = useState<Duration | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
 
   if (query.isLoading) return <LoadingState label="Загружаем сроки аренды" />
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
 
-  const durations = [...(query.data ?? [])].sort((left, right) => left.sort_order - right.sort_order || left.id - right.id)
+  const durations = [...(query.data ?? [])].sort(compareDurationsByDays)
 
   return (
     <section className="panel panel--flush">
-      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен.</p></div><div className="catalog-toolbar-actions"><span className="soft-badge soft-badge--editable"><Icon name="settings" size={14} />Доступно редактирование</span><button type="button" className="button button--secondary" onClick={() => setCreateOpen(true)} title="Добавить пользовательский срок аренды"><Icon name="plus" size={16} />Добавить срок</button></div></div>
+      <div className="section-toolbar"><div><h2>Сроки аренды</h2><p>Включённые периоды участвуют в построении матрицы цен и всегда показаны по возрастанию дней.</p></div><div className="catalog-toolbar-actions"><button type="button" className="button button--secondary" onClick={() => setCreateOpen(true)} title="Добавить пользовательский срок аренды"><Icon name="plus" size={16} />Добавить срок</button></div></div>
       {durations.length === 0 ? <EmptyState icon="clock" title="Сроки не настроены" description="Добавьте первый период аренды от 1 до 30 дней." action={<button type="button" className="button button--primary" onClick={() => setCreateOpen(true)}><Icon name="plus" />Добавить срок</button>} /> : (
         <div className="duration-grid">{durations.map((duration) => (
           <article className={`duration-card ${duration.is_enabled ? 'duration-card--active' : ''}`} key={duration.id}>
@@ -169,50 +165,113 @@ function DurationsTab() {
         ))}</div>
       )}
       {editing && (
-        <CatalogSettingsDialog
-          title={`Срок ${editing.days} ${durationUnit(editing.days)}`}
-          description="Количество дней зафиксировано после создания. Можно изменить доступность и положение в списках."
-          enabled={editing.is_enabled}
-          sortOrder={editing.sort_order}
-          isPending={updateDuration.isPending}
-          onClose={() => setEditing(null)}
-          onSave={async (changes) => {
-            await updateDuration.mutateAsync({ id: editing.id, ...changes })
-            setEditing(null)
-          }}
-        />
+        <DurationSettingsDialog duration={editing} onClose={() => setEditing(null)} />
       )}
       {createOpen && <CreateDurationDialog durations={durations} onClose={() => setCreateOpen(false)} />}
     </section>
   )
 }
 
+function DurationSettingsDialog({ duration, onClose }: { duration: Duration; onClose: () => void }) {
+  const updateDuration = useUpdateDuration()
+  const deleteDuration = useDeleteDuration()
+  const [nextEnabled, setNextEnabled] = useState(duration.is_enabled)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  const [deleteError, setDeleteError] = useState('')
+  const hasChanges = nextEnabled !== duration.is_enabled
+  const busy = updateDuration.isPending || deleteDuration.isPending
+  const durationLabel = `${duration.days} ${durationUnit(duration.days)}`
+
+  const save = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!hasChanges) return
+    setSaveError('')
+    try {
+      await updateDuration.mutateAsync({ id: duration.id, is_enabled: nextEnabled })
+      onClose()
+    } catch (cause) {
+      setSaveError(cause instanceof ApiError ? cause.message : 'Не удалось изменить доступность срока')
+    }
+  }
+
+  const remove = async () => {
+    setDeleteError('')
+    try {
+      await deleteDuration.mutateAsync(duration.id)
+      onClose()
+    } catch (cause) {
+      setDeleteError(cause instanceof ApiError
+        ? cause.status === 409
+          ? 'Этот срок уже используется в ценах, лотах, сделках/заказах или арендах, поэтому удалить его нельзя. Вернитесь назад, выключите срок и сохраните — существующие данные останутся.'
+          : cause.message
+        : 'Не удалось удалить срок аренды')
+    }
+  }
+
+  if (confirmDelete) {
+    return (
+      <ModalOverlay key="duration-delete-confirm" onClose={() => setConfirmDelete(false)} canClose={!deleteDuration.isPending}>
+        <div className="modal modal--compact catalog-delete-confirm" role="alertdialog" aria-modal="true" aria-busy={deleteDuration.isPending} aria-labelledby="delete-duration-title" aria-describedby="delete-duration-description">
+          <div className="modal__danger-icon"><Icon name="trash" size={22} /></div>
+          <h2 id="delete-duration-title">Удалить срок {durationLabel}?</h2>
+          <p id="delete-duration-description">Срок исчезнет из справочника. Если он уже связан с ценами, лотами, сделками/заказами или арендами, сервер не даст его удалить — тогда безопасно выключите срок в настройках.</p>
+          {deleteError && <div className="form-alert form-alert--error catalog-delete-confirm__alert" role="alert"><Icon name="warning" /><span>{deleteError}</span></div>}
+          <div className="modal__actions">
+            <button type="button" className="button button--secondary" onClick={() => { setConfirmDelete(false); setDeleteError('') }} disabled={deleteDuration.isPending} autoFocus>Назад</button>
+            <button type="button" className="button button--danger" onClick={remove} disabled={deleteDuration.isPending}>{deleteDuration.isPending ? 'Удаляем…' : 'Удалить'}</button>
+          </div>
+        </div>
+      </ModalOverlay>
+    )
+  }
+
+  return (
+    <ModalOverlay key="duration-settings" onClose={onClose} canClose={!busy}>
+      <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-busy={busy} aria-labelledby="duration-settings-title" aria-describedby="duration-settings-description" onSubmit={save}>
+        <div className="modal__header">
+          <div><span className="eyebrow">Настройка срока</span><h2 id="duration-settings-title">Срок {durationLabel}</h2><p id="duration-settings-description">Количество дней зафиксировано после создания. В списках сроки автоматически располагаются по возрастанию дней.</p></div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" title="Закрыть" disabled={busy}><Icon name="close" /></button>
+        </div>
+        {saveError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{saveError}</span></div>}
+        <div className="catalog-toggle-row">
+          <div><strong>Использовать в продажах</strong><small>Выключенный срок исчезнет из создания цен и новых лотов, не затрагивая существующие данные.</small></div>
+          <label className="switch-control">
+            <input data-autofocus type="checkbox" checked={nextEnabled} onChange={(event) => { setNextEnabled(event.target.checked); setSaveError('') }} disabled={busy} aria-label={`Использовать срок ${durationLabel} в продажах`} />
+            <span aria-hidden="true" />
+            <strong>{nextEnabled ? 'Включён' : 'Выключен'}</strong>
+          </label>
+        </div>
+        <div className="modal__actions catalog-settings-actions">
+          <button type="button" className="button button--secondary catalog-delete-trigger" onClick={() => { setConfirmDelete(true); setDeleteError('') }} disabled={busy}><Icon name="trash" size={16} />Удалить срок</button>
+          <div className="catalog-settings-actions__primary">
+            <button type="button" className="button button--secondary" onClick={onClose} disabled={busy}>Отмена</button>
+            <button type="submit" className="button button--primary" disabled={busy || !hasChanges}>{updateDuration.isPending ? 'Сохраняем…' : 'Сохранить'}</button>
+          </div>
+        </div>
+      </form>
+    </ModalOverlay>
+  )
+}
+
 function CreateDurationDialog({ durations, onClose }: { durations: Duration[]; onClose: () => void }) {
   const createDuration = useCreateDuration()
-  const suggestedSortOrder = Math.min(
-    10_000,
-    Math.max(0, ...durations.map((duration) => duration.sort_order)) + 10,
-  )
   const [daysInput, setDaysInput] = useState('')
   const [enabled, setEnabled] = useState(true)
-  const [sortOrderInput, setSortOrderInput] = useState(String(suggestedSortOrder))
   const [attempted, setAttempted] = useState(false)
   const [serverError, setServerError] = useState('')
   const daysValidation = validateDurationDays(daysInput, durations.map((duration) => duration.days))
-  const parsedSortOrder = parseCatalogSortOrder(sortOrderInput)
   const daysError = attempted && daysValidation.error
-  const orderError = attempted && parsedSortOrder === null
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
     setAttempted(true)
     setServerError('')
-    if (daysValidation.days === null || parsedSortOrder === null) return
+    if (daysValidation.days === null) return
     try {
       await createDuration.mutateAsync({
         days: daysValidation.days,
         is_enabled: enabled,
-        sort_order: parsedSortOrder,
       })
       onClose()
     } catch (cause) {
@@ -228,22 +287,15 @@ function CreateDurationDialog({ durations, onClose }: { durations: Duration[]; o
     <ModalOverlay onClose={onClose} canClose={!createDuration.isPending}>
       <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="create-duration-title" aria-describedby="create-duration-description" onSubmit={submit}>
         <div className="modal__header">
-          <div><span className="eyebrow">Справочник сроков</span><h2 id="create-duration-title">Новый срок аренды</h2><p id="create-duration-description">После создания количество дней изменить нельзя. Доступность и порядок можно настроить позже.</p></div>
+          <div><span className="eyebrow">Справочник сроков</span><h2 id="create-duration-title">Новый срок аренды</h2><p id="create-duration-description">После создания количество дней изменить нельзя. Срок автоматически займёт место по возрастанию дней.</p></div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" title="Закрыть" disabled={createDuration.isPending}><Icon name="close" /></button>
         </div>
         {serverError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{serverError}</span></div>}
-        <div className="catalog-create-fields">
-          <label className="field" htmlFor="create-duration-days">
-            <span className="field__label">Количество дней</span>
-            <input id="create-duration-days" data-autofocus type="number" min="1" max="30" step="1" inputMode="numeric" value={daysInput} onChange={(event) => { setDaysInput(event.target.value); setServerError('') }} onBlur={() => setAttempted(true)} disabled={createDuration.isPending} aria-invalid={Boolean(daysError)} aria-describedby="create-duration-days-hint" placeholder="Например, 8" />
-            <small id="create-duration-days-hint" className={`field__hint ${daysError ? 'text-danger' : ''}`}>{daysError || 'Целое уникальное значение от 1 до 30.'}</small>
-          </label>
-          <label className="field" htmlFor="create-duration-order">
-            <span className="field__label">Порядок отображения</span>
-            <input id="create-duration-order" type="number" min="0" max="10000" step="1" inputMode="numeric" value={sortOrderInput} onChange={(event) => setSortOrderInput(event.target.value)} disabled={createDuration.isPending} aria-invalid={Boolean(orderError)} aria-describedby="create-duration-order-hint" />
-            <small id="create-duration-order-hint" className={`field__hint ${orderError ? 'text-danger' : ''}`}>{orderError ? 'Введите целое число от 0 до 10 000.' : 'Меньшее число показывается раньше.'}</small>
-          </label>
-        </div>
+        <label className="field" htmlFor="create-duration-days">
+          <span className="field__label">Количество дней</span>
+          <input id="create-duration-days" data-autofocus type="number" min="1" max="30" step="1" inputMode="numeric" value={daysInput} onChange={(event) => { setDaysInput(event.target.value); setServerError('') }} onBlur={() => setAttempted(true)} disabled={createDuration.isPending} aria-invalid={Boolean(daysError)} aria-describedby="create-duration-days-hint" placeholder="Например, 8" />
+          <small id="create-duration-days-hint" className={`field__hint ${daysError ? 'text-danger' : ''}`}>{daysError || 'Целое уникальное значение от 1 до 30.'}</small>
+        </label>
         <div className="catalog-toggle-row catalog-create-toggle">
           <div><strong>Включить сразу</strong><small>Срок появится в создании цен и новых лотов.</small></div>
           <label className="switch-control">
@@ -263,13 +315,12 @@ function CreateDurationDialog({ durations, onClose }: { durations: Duration[]; o
 
 function ScopesTab() {
   const query = useLimitScopes()
-  const updateScope = useUpdateLimitScope()
   const [editing, setEditing] = useState<LimitScope | null>(null)
 
   if (query.isLoading) return <LoadingState label="Загружаем типы лимитов" />
   if (query.isError) return <ErrorState onRetry={() => query.refetch()} />
 
-  const scopes = [...(query.data ?? [])].sort((left, right) => left.sort_order - right.sort_order || left.id - right.id)
+  const scopes = [...(query.data ?? [])].sort(compareOfferScopes)
   const descriptions: Record<string, string> = {
     any: 'Без гарантии остатка конкретного лимита. Подходит для базовых предложений.',
     chat: 'Недоступно для продажи с гарантией: OpenAI не публикует достоверный остаток сообщений ChatGPT.',
@@ -278,7 +329,8 @@ function ScopesTab() {
 
   return (
     <section className="panel panel--flush">
-      <div className="section-toolbar"><div><h2>Типы лимитов</h2><p>Определяют, какие показатели учитываются при подборе аккаунта.</p></div><span className="soft-badge soft-badge--editable"><Icon name="settings" size={14} />Доступно редактирование</span></div>
+      <div className="section-toolbar"><div><h2>Типы лимитов</h2><p>Определяют, какие показатели учитываются при подборе аккаунта.</p></div></div>
+      <div className="form-alert form-alert--info catalog-system-note"><Icon name="activity" /><span>Коды и названия типов лимитов системные: по ним работает подбор аккаунта. Здесь управляется только доступность, а пороговые проценты настраиваются в разделе «Цены».</span></div>
       {scopes.length === 0 ? <EmptyState icon="activity" title="Типы лимитов не инициализированы" description="Ожидаются системные значения any, chat и codex." /> : (
         <div className="scope-grid">{scopes.map((scope) => {
           const code = scope.code.toLowerCase()
@@ -290,103 +342,65 @@ function ScopesTab() {
                 <div className="scope-card__body"><span className="eyebrow">{code}</span><h3>{scope.name}</h3>{unavailable && <StatusBadge value="disabled" label={code === 'chat' ? 'Недоступно · не измеряется' : 'Недоступно · не поддерживается'} />}<p>{descriptions[code] ?? 'Неизвестный системный тип не используется в новых предложениях.'}</p></div>
               </div>
               <div className="catalog-card__footer">
-                {!unavailable && <StatusBadge value={scope.is_enabled ? 'active' : 'paused'} label={scope.is_enabled ? 'Включён' : 'Выключен'} />}
-                <button type="button" className="catalog-card__edit" onClick={() => setEditing(scope)} aria-label={`Настроить тип лимита ${scope.name}`} title="Настроить">
-                  <Icon name="settings" size={15} /><span>Настроить</span>
-                </button>
+                {unavailable ? (
+                  <span className="catalog-card__locked" title={code === 'chat' ? 'Chat нельзя включить: OpenAI не предоставляет измеримый остаток лимита' : 'Неизвестный системный тип не поддерживается'}><Icon name="shield" size={14} />Системное ограничение</span>
+                ) : (
+                  <>
+                    <StatusBadge value={scope.is_enabled ? 'active' : 'paused'} label={scope.is_enabled ? 'Включён' : 'Выключен'} />
+                    <button type="button" className="catalog-card__edit" onClick={() => setEditing(scope)} aria-label={`Настроить доступность типа лимита ${scope.name}`} title="Настроить доступность">
+                      <Icon name="settings" size={15} /><span>Настроить</span>
+                    </button>
+                  </>
+                )}
               </div>
             </article>
           )
         })}</div>
       )}
       {editing && (
-        <CatalogSettingsDialog
-          title={`Тип лимита «${editing.name}»`}
-          description={`Системный код ${editing.code} не меняется. Управляйте доступностью и положением в списках.`}
-          enabled={editing.is_enabled}
-          sortOrder={editing.sort_order}
-          enabledLocked={!isSupportedOfferScopeCode(editing.code)}
-          lockedHint={editing.code.toLowerCase() === 'chat'
-            ? 'Chat нельзя включить: OpenAI не предоставляет измеримый остаток этого лимита.'
-            : `Тип «${editing.code}» не поддерживается и не может участвовать в новых предложениях.`}
-          isPending={updateScope.isPending}
-          onClose={() => setEditing(null)}
-          onSave={async (changes) => {
-            await updateScope.mutateAsync({ id: editing.id, ...changes })
-            setEditing(null)
-          }}
-        />
+        <ScopeAvailabilityDialog scope={editing} onClose={() => setEditing(null)} />
       )}
     </section>
   )
 }
 
-function CatalogSettingsDialog({
-  title,
-  description,
-  enabled,
-  sortOrder,
-  enabledLocked = false,
-  lockedHint,
-  isPending,
-  onClose,
-  onSave,
-}: {
-  title: string
-  description: string
-  enabled: boolean
-  sortOrder: number
-  enabledLocked?: boolean
-  lockedHint?: string
-  isPending: boolean
-  onClose: () => void
-  onSave: (changes: CatalogItemUpdate) => Promise<void>
-}) {
-  const [nextEnabled, setNextEnabled] = useState(enabled)
-  const [sortOrderInput, setSortOrderInput] = useState(String(sortOrder))
+function ScopeAvailabilityDialog({ scope, onClose }: { scope: LimitScope; onClose: () => void }) {
+  const updateScope = useUpdateLimitScope()
+  const [nextEnabled, setNextEnabled] = useState(scope.is_enabled)
   const [error, setError] = useState('')
-  const parsedSortOrder = parseCatalogSortOrder(sortOrderInput)
-  const hasChanges = nextEnabled !== enabled || parsedSortOrder !== sortOrder
+  const hasChanges = nextEnabled !== scope.is_enabled
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (parsedSortOrder === null || !hasChanges) return
-    const changes: CatalogItemUpdate = {}
-    if (nextEnabled !== enabled) changes.is_enabled = nextEnabled
-    if (parsedSortOrder !== sortOrder) changes.sort_order = parsedSortOrder
+    if (!hasChanges) return
     setError('')
     try {
-      await onSave(changes)
+      await updateScope.mutateAsync({ id: scope.id, is_enabled: nextEnabled })
+      onClose()
     } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : 'Не удалось сохранить изменения')
+      setError(cause instanceof ApiError ? cause.message : 'Не удалось изменить доступность типа лимита')
     }
   }
 
   return (
-    <ModalOverlay onClose={onClose} canClose={!isPending}>
-      <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="catalog-edit-title" onSubmit={submit}>
+    <ModalOverlay onClose={onClose} canClose={!updateScope.isPending}>
+      <form className="modal catalog-settings-dialog" role="dialog" aria-modal="true" aria-busy={updateScope.isPending} aria-labelledby="scope-settings-title" aria-describedby="scope-settings-description" onSubmit={submit}>
         <div className="modal__header">
-          <div><span className="eyebrow">Настройка справочника</span><h2 id="catalog-edit-title">{title}</h2><p>{description}</p></div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" disabled={isPending}><Icon name="close" /></button>
+          <div><span className="eyebrow">Доступность типа лимита</span><h2 id="scope-settings-title">{scope.name}</h2><p id="scope-settings-description">Название «{scope.name}» и системный код {scope.code} используются логикой подбора аккаунта и не редактируются. Здесь меняется только доступность.</p></div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Закрыть" title="Закрыть" disabled={updateScope.isPending}><Icon name="close" /></button>
         </div>
         {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
         <div className="catalog-toggle-row">
-          <div><strong>Использовать в продажах</strong><small>Выключенный элемент исчезнет из создания цен и новых лотов.</small></div>
+          <div><strong>Использовать в новых предложениях</strong><small>Выключенный тип исчезнет из создания цен, лотов и шаблонов. Пороговые проценты задаются в разделе «Цены».</small></div>
           <label className="switch-control">
-            <input type="checkbox" checked={nextEnabled} onChange={(event) => setNextEnabled(event.target.checked)} disabled={enabledLocked || isPending} aria-label="Использовать элемент в продажах" />
+            <input data-autofocus type="checkbox" checked={nextEnabled} onChange={(event) => { setNextEnabled(event.target.checked); setError('') }} disabled={updateScope.isPending} aria-label={`Использовать тип лимита ${scope.name} в новых предложениях`} />
             <span aria-hidden="true" />
             <strong>{nextEnabled ? 'Включён' : 'Выключен'}</strong>
           </label>
         </div>
-        {enabledLocked && lockedHint && <div className="form-alert form-alert--warning catalog-lock-note"><Icon name="warning" /><span>{lockedHint}</span></div>}
-        <label className="field catalog-order-field">
-          <span className="field__label">Порядок отображения</span>
-          <input data-autofocus type="number" min="0" max="10000" step="1" inputMode="numeric" value={sortOrderInput} onChange={(event) => setSortOrderInput(event.target.value)} disabled={isPending} aria-invalid={parsedSortOrder === null} />
-          <small className="field__hint">{parsedSortOrder === null ? 'Введите целое число от 0 до 10 000.' : 'Меньшее число показывается раньше.'}</small>
-        </label>
         <div className="modal__actions">
-          <button type="button" className="button button--secondary" onClick={onClose} disabled={isPending}>Отмена</button>
-          <button type="submit" className="button button--primary" disabled={isPending || parsedSortOrder === null || !hasChanges}>{isPending ? 'Сохраняем…' : 'Сохранить'}</button>
+          <button type="button" className="button button--secondary" onClick={onClose} disabled={updateScope.isPending}>Отмена</button>
+          <button type="submit" className="button button--primary" disabled={updateScope.isPending || !hasChanges}>{updateScope.isPending ? 'Сохраняем…' : 'Сохранить'}</button>
         </div>
       </form>
     </ModalOverlay>

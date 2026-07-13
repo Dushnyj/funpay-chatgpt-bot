@@ -1,4 +1,4 @@
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
@@ -60,3 +60,28 @@ async def test_bootstrap_does_not_overwrite_existing_admin_hash(test_engine):
         seller_settings = await session.get(SellerSettings, 1)
         assert seller_settings is not None
         assert seller_settings.admin_password_hash == "operator-hash"
+
+
+async def test_bootstrap_does_not_restore_deliberately_deleted_durations(
+    test_engine,
+):
+    factory = async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    settings = Settings()
+    await bootstrap_database(settings, factory)
+
+    async with factory() as session:
+        await session.execute(delete(Duration))
+        await session.commit()
+
+    # Simulate a later process restart. SellerSettings already exists, which
+    # distinguishes this operator-managed empty catalog from a new install.
+    await bootstrap_database(settings, factory)
+
+    async with factory() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(Duration))
+        ).scalar_one() == 0

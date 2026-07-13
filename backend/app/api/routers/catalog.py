@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +18,8 @@ from app.api.schemas import (
     TierUpdate,
 )
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.lot import Lot, PriceMatrix
+from app.models.rental import Order, Rental
 
 router = APIRouter(prefix="/api", tags=["catalog"], dependencies=[Depends(get_current_user)])
 
@@ -92,7 +94,7 @@ async def delete_tier(tier_id: int, session: AsyncSession = Depends(get_db_sessi
 @router.get("/durations", response_model=list[DurationOut])
 async def list_durations(session: AsyncSession = Depends(get_db_session)):
     result = await session.execute(
-        select(Duration).order_by(Duration.sort_order, Duration.days, Duration.id)
+        select(Duration).order_by(Duration.days, Duration.id)
     )
     return result.scalars().all()
 
@@ -102,16 +104,12 @@ async def create_duration(
     req: DurationCreate,
     session: AsyncSession = Depends(get_db_session),
 ):
-    sort_order = req.sort_order
-    if sort_order is None:
-        highest_order = (
-            await session.execute(select(func.max(Duration.sort_order)))
-        ).scalar_one_or_none()
-        sort_order = min((highest_order or 0) + 10, 10_000)
     duration = Duration(
         days=req.days,
         is_enabled=req.is_enabled,
-        sort_order=sort_order,
+        # Retained for database/API compatibility. Ordering is derived only
+        # from ``days`` and this mirror cannot be edited independently.
+        sort_order=req.days,
     )
     session.add(duration)
     try:
@@ -162,7 +160,7 @@ async def update_durations_batch(
     if availability_changed:
         await _reconcile_lots(request, "Durations saved")
     result = await session.execute(
-        select(Duration).order_by(Duration.sort_order, Duration.days, Duration.id)
+        select(Duration).order_by(Duration.days, Duration.id)
     )
     return result.scalars().all()
 
@@ -191,10 +189,54 @@ async def update_duration(
     return duration
 
 
+@router.delete("/durations/{duration_id}", status_code=204)
+async def delete_duration(
+    duration_id: int,
+    session: AsyncSession = Depends(get_db_session),
+):
+    duration = await session.get(Duration, duration_id)
+    if duration is None:
+        raise HTTPException(status_code=404, detail="Duration not found")
+
+    usage = await _duration_usage(session, duration_id)
+    if any(usage.values()):
+        references = ", ".join(
+            f"{name}={count}" for name, count in usage.items() if count
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Duration {duration.days} days is still referenced by "
+                f"{references}; disable it instead or remove those references first"
+            ),
+        )
+
+    await session.delete(duration)
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        # The pre-check gives a useful normal response. The FK constraint is
+        # still the source of truth if a new reference appears concurrently.
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Duration became referenced while it was being deleted; "
+                "retry after removing the new price, lot, order, or rental reference"
+            ),
+        ) from exc
+
+
 @router.get("/limit-scopes", response_model=list[LimitScopeOut])
 async def list_limit_scopes(session: AsyncSession = Depends(get_db_session)):
+    canonical_order = case(
+        (LimitScope.code == "any", 10),
+        (LimitScope.code == "chat", 20),
+        (LimitScope.code == "codex", 30),
+        else_=100,
+    )
     result = await session.execute(
-        select(LimitScope).order_by(LimitScope.sort_order, LimitScope.id)
+        select(LimitScope).order_by(canonical_order, LimitScope.code, LimitScope.id)
     )
     return result.scalars().all()
 
@@ -229,6 +271,28 @@ async def update_limit_scope(
     if availability_changed:
         await _reconcile_lots(request, "Limit scope saved")
     return scope
+
+
+async def _duration_usage(
+    session: AsyncSession,
+    duration_id: int,
+) -> dict[str, int]:
+    models = (
+        ("price_matrix", PriceMatrix),
+        ("lots", Lot),
+        ("orders", Order),
+        ("rentals", Rental),
+    )
+    usage: dict[str, int] = {}
+    for name, model in models:
+        usage[name] = (
+            await session.execute(
+                select(func.count())
+                .select_from(model)
+                .where(model.duration_id == duration_id)
+            )
+        ).scalar_one()
+    return usage
 
 
 async def _reconcile_lots(request: Request, saved_message: str) -> None:

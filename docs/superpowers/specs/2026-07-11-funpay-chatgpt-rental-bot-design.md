@@ -178,9 +178,10 @@ SubscriptionTier
 Duration
 ├── id
 ├── days                           1, 3, 5, 7, 15, 30 (любое 1-30, на усмотрение продавца)
-├── is_enabled                     какие сроки продавец разрешил продавать
-└── sort_order
+└── is_enabled                     какие сроки продавец разрешил продавать
 ```
+
+Сроки всегда показываются по возрастанию `days`; ручного порядка отображения нет.
 
 ### LimitScope — тип лимита лота
 
@@ -188,7 +189,8 @@ Duration
 LimitScope
 ├── id
 ├── code                           any | chat | codex
-└── name                           "Любой" | "Чат (GPT-5)" | "Codex"
+├── name                           "Любой" | "Чат (GPT-5)" | "Codex"
+└── is_enabled                     доступность системного типа для новых предложений
 ```
 
 Три варианта:
@@ -807,9 +809,9 @@ CSV: `login,pass,totp,tier_id,expires_at`. Все → `status=pending_validation
 
 **Тарифы (SubscriptionTier):** CRUD.
 
-**Сроки (Duration):** список уникальных периодов от 1 до 30 дней, создание пользовательских сроков, включение/выключение, sort_order.
+**Сроки (Duration):** список уникальных периодов от 1 до 30 дней, автоматическая сортировка по дням, создание, включение/выключение и безопасное удаление неиспользуемых сроков.
 
-**Лимиты (LimitScope):** any/chat/codex — включение/выключение использования в лотах.
+**Лимиты (LimitScope):** системные any/chat/codex — только включение/выключение использования в новых предложениях. Коды и названия не редактируются, пороговые проценты задаются в матрице цен.
 
 **Цены (PriceMatrix):** 4-мерная матрица (tier × duration × scope × пороги), inline-редактирование. Для scope=any — два ползунка (max_5h, max_weekly). Для chat/codex — один ползунок (min_limit). Цена растёт с требованиями.
 
@@ -832,7 +834,7 @@ POST   /api/auth/login
 GET    /api/metrics
 GET    /api/accounts | POST | POST /bulk | POST /{id}/check | PATCH /{id} | DELETE /{id}
 GET    /api/tiers | POST | PATCH | DELETE
-GET    /api/durations | POST | PATCH
+GET    /api/durations | POST | PATCH | DELETE /{id}
 GET    /api/limit-scopes | PATCH
 GET    /api/prices | PUT (matrix update)
 GET    /api/templates | PUT                         шаблоны лотов (LotTemplate)
