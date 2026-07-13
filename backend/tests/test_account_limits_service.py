@@ -227,6 +227,75 @@ async def test_measure_current_free_claims_preserves_sellable_override_and_exact
 
 
 @pytest.mark.asyncio
+async def test_measure_survives_accounts_check_cloudflare_403(
+    session, httpx_mock
+):
+    free_tier = SubscriptionTier(
+        code="free",
+        name="Free",
+        is_active=True,
+        system_managed=True,
+        is_sellable=False,
+    )
+    session.add(free_tier)
+    await session.flush()
+    account = Account(
+        login="cloudflare@e.com",
+        password_encrypted="p",
+        totp_secret_encrypted="t",
+        status="pending_validation",
+    )
+    session.add(account)
+    await session.flush()
+    access_token = _make_jwt({
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-cloudflare",
+            "chatgpt_plan_type": "free",
+        }
+    })
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="rt",
+        access_token_encrypted=access_token,
+        access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    ))
+    await session.commit()
+
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/wham/usage",
+        method="GET",
+        json={
+            "plan_type": "free",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 5,
+                    "limit_window_seconds": 2_592_000,
+                    "reset_at": 1_786_493_497,
+                }
+            },
+        },
+    )
+    httpx_mock.add_response(
+        url="https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+        method="GET",
+        status_code=403,
+        text="<!doctype html><title>Just a moment</title>",
+        headers={"content-type": "text/html"},
+    )
+
+    assert await measure_account_limits(session, account.id) == MeasureResult.OK
+    await session.refresh(account)
+    limits = await session.get(AccountLimits, account.id)
+    assert account.tier_id == free_tier.id
+    assert account.plan_raw_type == "free"
+    assert account.plan_source == "wham_usage+access_token"
+    assert account.subscription_expires_at is None
+    assert limits.codex_primary_remaining_pct == 95
+    assert limits.codex_primary_window_seconds == 2_592_000
+    assert limits.refresh_status == "ok"
+
+
+@pytest.mark.asyncio
 async def test_measure_refresh_failed_sets_status(session, httpx_mock):
     """Протухший refresh_token → RefreshFailedError → refresh_status=expired."""
     tier = SubscriptionTier(name="Plus", is_active=True)

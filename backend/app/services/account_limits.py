@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.openai.client import OpenAIClient
 from app.integrations.openai.exceptions import BackendApiError, RefreshFailedError, TokenExpiredError
 from app.integrations.openai.oauth import parse_id_token, refresh_access_token
+from app.integrations.openai.types import AccountMetadata
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.services.subscription_plans import (
@@ -66,7 +67,16 @@ async def measure_account_limits(
         try:
             async with OpenAIClient(access_token, limits.account_id_openai) as client:
                 usage = await client.get_usage()
-                metadata = await client.get_account_metadata()
+                try:
+                    metadata = await client.get_account_metadata()
+                except BackendApiError:
+                    # ``accounts/check`` is protected independently from the
+                    # Codex usage endpoint and may return a Cloudflare 403 from
+                    # a datacenter IP. A verified usage payload plus matching
+                    # token claims is still enough to identify the current
+                    # plan and exact limits; only subscription expiry remains
+                    # unknown until metadata is reachable again.
+                    metadata = AccountMetadata()
             break
         except TokenExpiredError:
             if attempt >= _MAX_RETRIES:
