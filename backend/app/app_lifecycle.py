@@ -19,10 +19,15 @@ from app.models.settings import SellerSettings
 from app.scheduler import ScheduledTask, Scheduler
 from app.services.bump import BumpService
 from app.services.funpay_lifecycle import build_callbacks
-from app.services.lot_auto_manager import LotAutoManager
+from app.services.lot_auto_manager import LotAutoManager, ProvenanceMarkerSyncError
 from app.services.lot_sync import LotSyncService
 from app.services.offer_configuration import validate_offer_configurations
 from app.services.order_processor import OrderProcessor
+from app.services.order_provenance import (
+    exact_lot_binding_exists,
+    is_verified_bot_sale_order,
+    verified_sale_for_order_exists,
+)
 from app.services.sale_registry import SaleRegistryService, SalesSyncResult
 from app.services.rental_service import (
     CREDENTIAL_DELIVERY_LEASE,
@@ -150,8 +155,16 @@ class AppLifecycle:
                 )
                 gateway = candidate.gateway
                 candidate.set_callbacks(build_callbacks(async_session_factory, gateway))
-                # Validate and fully start the candidate before touching the
-                # working transport. A bad key must not disconnect the bot.
+                # Authenticate without enabling callbacks, then make the
+                # ownership marker a startup barrier. Otherwise a sale of a
+                # pre-migration lot can arrive before its immutable marker is
+                # present on the order page and be lost as "unmanaged".
+                prepare = getattr(candidate, "prepare", None)
+                if prepare is not None:
+                    await prepare()
+                await self._sync_lot_markers_before_listener(gateway, node_id)
+                # Fully start the candidate before touching the working
+                # transport. A bad key must not disconnect the old bot.
                 await candidate.start()
                 if node_id:
                     try:
@@ -192,6 +205,31 @@ class AppLifecycle:
                     bool(old_runner is not None and getattr(old_runner, "started", False))
                 )
                 return False
+
+    async def _sync_lot_markers_before_listener(
+        self,
+        gateway,
+        node_id: int | None,
+    ) -> None:
+        """Retry a short, fail-closed marker pass before event intake."""
+
+        last_error: ProvenanceMarkerSyncError | None = None
+        for attempt in range(3):
+            try:
+                async with async_session_factory() as session:
+                    manager = LotAutoManager(funpay_node_id=node_id or 0)
+                    await manager.sync_missing_provenance_markers(
+                        session,
+                        gateway,
+                        strict=True,
+                    )
+                return
+            except ProvenanceMarkerSyncError as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(2**attempt)
+        if last_error is not None:
+            raise last_error
 
     async def stop(self) -> None:
         """Остановка Scheduler (и Runner если есть)."""
@@ -691,6 +729,8 @@ class AppLifecycle:
                     select(Order.id)
                     .outerjoin(Rental, Rental.order_id == Order.id)
                     .where(
+                        exact_lot_binding_exists(Order),
+                        verified_sale_for_order_exists(Order),
                         Order.status.in_(["pending", "completed"]),
                         or_(
                             and_(
@@ -858,6 +898,8 @@ class AppLifecycle:
                 order = await session.get(Order, rental.order_id)
                 if order is None or order.status not in {"pending", "completed"}:
                     raise ValueError("Order is no longer fulfillable")
+                if not await is_verified_bot_sale_order(session, order):
+                    raise ValueError("Order has no exact verified bot-sale provenance")
                 remote = await gateway.get_order(order.funpay_order_id)
                 if remote.status is SaleStatus.REFUNDED:
                     await self._refunds.process_sale_refunded(
@@ -878,6 +920,8 @@ class AppLifecycle:
                         .execution_options(populate_existing=True)
                     )
                 ).scalar_one()
+                if not await is_verified_bot_sale_order(session, order):
+                    raise ValueError("Order has no exact verified bot-sale provenance")
                 rental = (
                     await session.execute(
                         select(Rental)

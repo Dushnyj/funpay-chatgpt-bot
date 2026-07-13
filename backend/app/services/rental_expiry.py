@@ -14,6 +14,11 @@ from app.models.catalog import Duration, SubscriptionTier
 from app.models.rental import Order, Rental
 from app.services.kick_service import KickService
 from app.services.messages import render_message
+from app.services.order_provenance import (
+    exact_lot_binding_exists,
+    is_verified_bot_sale_order,
+    verified_sale_for_order_exists,
+)
 from app.services.durations import (
     format_duration,
     format_legacy_days,
@@ -152,7 +157,10 @@ class RentalExpiryService:
 
         candidates = await session.execute(
             select(Rental.id, Rental.order_id)
+            .join(Order, Order.id == Rental.order_id)
             .where(
+                exact_lot_binding_exists(Order),
+                verified_sale_for_order_exists(Order),
                 Rental.status == "expired",
                 Rental.expiry_notified_at.is_(None),
             )
@@ -181,7 +189,6 @@ class RentalExpiryService:
         if claimed is None:
             return
         rental, claim_started_at = claimed
-        notification_chat_id = int(rental.buyer_funpay_chat_id)
         success = False
         error: str | None = None
         try:
@@ -189,6 +196,28 @@ class RentalExpiryService:
             # Template/catalog reads are complete. Never cancel a database
             # operation merely because FunPay message delivery timed out.
             await session.commit()
+            route = (
+                await session.execute(
+                    select(Order, Rental)
+                    .join(Rental, Rental.order_id == Order.id)
+                    .where(
+                        Order.id == order_id,
+                        Rental.id == rental_id,
+                        exact_lot_binding_exists(Order),
+                        verified_sale_for_order_exists(Order),
+                        Rental.buyer_funpay_id == Order.buyer_funpay_id,
+                        Rental.buyer_funpay_chat_id == Order.funpay_chat_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).one_or_none()
+            if route is None:
+                raise RuntimeError("unverified_order_provenance")
+            current_order, current_rental = route
+            if not await is_verified_bot_sale_order(session, current_order):
+                raise RuntimeError("unverified_order_provenance")
+            notification_chat_id = int(current_rental.buyer_funpay_chat_id)
             await asyncio.wait_for(
                 gateway.send_message(
                     chat_id=notification_chat_id,
@@ -311,6 +340,9 @@ class RentalExpiryService:
             )
         ).scalar_one_or_none()
         if order is None:
+            await session.commit()
+            return None
+        if not await is_verified_bot_sale_order(session, order):
             await session.commit()
             return None
         rental = (
@@ -595,7 +627,11 @@ class RentalExpiryService:
             return True
 
         active = await session.execute(
-            select(Rental).where(
+            select(Rental)
+            .join(Order, Order.id == Rental.order_id)
+            .where(
+                exact_lot_binding_exists(Order),
+                verified_sale_for_order_exists(Order),
                 Rental.account_id == account_id,
                 Rental.status == "active",
             )

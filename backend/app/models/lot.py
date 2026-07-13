@@ -1,4 +1,5 @@
 from datetime import datetime
+import uuid
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -33,6 +34,20 @@ class Lot(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     funpay_id: Mapped[str | None] = mapped_column(default=None)
+    # Stable bot-only identity embedded into the published description.  It
+    # survives title/price/status edits and lets an immutable order page prove
+    # which local lot was actually sold when FunPay omits the offer id.
+    provenance_token: Mapped[str] = mapped_column(
+        String(32),
+        unique=True,
+        nullable=False,
+        default=lambda: uuid.uuid4().hex,
+    )
+    provenance_marker_synced: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
     funpay_node_id: Mapped[int | None] = mapped_column(default=None)
     tier_id: Mapped[int] = mapped_column(ForeignKey("subscription_tiers.id"))
     duration_id: Mapped[int] = mapped_column(ForeignKey("durations.id"))

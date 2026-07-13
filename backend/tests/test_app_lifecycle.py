@@ -9,6 +9,63 @@ from app.app_lifecycle import (
 from app.models.rental import Order
 
 
+async def _seed_verified_pending_order(session, funpay_order_id: str) -> Order:
+    from app.models.catalog import Duration, LimitScope, SubscriptionTier
+    from app.models.funpay_sale import FunPaySale
+    from app.models.lot import Lot
+
+    tier = SubscriptionTier(
+        code="plus",
+        name="Plus",
+        is_active=True,
+        is_sellable=True,
+    )
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=1)
+    scope = LimitScope(code="any", name="Any", is_enabled=True)
+    session.add_all([tier, duration, scope])
+    await session.flush()
+    lot = Lot(
+        funpay_id="5001",
+        provenance_token="1" * 32,
+        provenance_marker_synced=True,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        title_ru="Аренда Plus",
+        title_en="Plus rental",
+        status="active",
+    )
+    session.add(lot)
+    await session.flush()
+    order = Order(
+        funpay_order_id=funpay_order_id,
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        buyer_locale="ru",
+        lot_id=lot.id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=lot.funpay_id,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        status="pending",
+    )
+    session.add(order)
+    await session.flush()
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id=order.funpay_chat_id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        status="paid",
+    ))
+    await session.flush()
+    return order
+
+
 def test_lifecycle_creates_components():
     lc = AppLifecycle(golden_key="", category_id=0)
     assert lc.scheduler is not None
@@ -81,6 +138,7 @@ async def test_manual_delivery_retry_rechecks_remote_refund(monkeypatch):
     session = MagicMock()
     session.execute = AsyncMock(return_value=result)
     session.get = AsyncMock(return_value=order)
+    session.scalar = AsyncMock(return_value=order.id)
     session.commit = AsyncMock()
 
     class Context:
@@ -163,6 +221,7 @@ async def test_manual_retry_preserves_nonzero_disclosure_attempts(monkeypatch):
         return order if model is Order else None
 
     session.get = AsyncMock(side_effect=get)
+    session.scalar = AsyncMock(return_value=order.id)
     session.commit = AsyncMock()
 
     class Context:
@@ -284,6 +343,8 @@ async def test_start_builds_live_runner_from_runtime_settings(monkeypatch):
     monkeypatch.setattr(lc, "_load_runtime_settings", AsyncMock(return_value=("db-key", 55)))
     valid = AsyncMock()
     monkeypatch.setattr(lc, "_set_session_valid", valid)
+    marker_barrier = AsyncMock()
+    monkeypatch.setattr(lc, "_sync_lot_markers_before_listener", marker_barrier)
     lc.scheduler.start = AsyncMock()
     lc.scheduler.stop = AsyncMock()
 
@@ -294,6 +355,7 @@ async def test_start_builds_live_runner_from_runtime_settings(monkeypatch):
     assert lc._gateway is lc.runner.gateway
     assert lc._category_id == 7
     valid.assert_awaited_once_with(True)
+    marker_barrier.assert_awaited_once_with(lc.runner.gateway, 55)
     await lc.stop()
 
 
@@ -448,12 +510,19 @@ async def test_reconfigure_funpay_swaps_runner_and_clear_stops_it(monkeypatch):
     )
     valid = AsyncMock()
     monkeypatch.setattr(lifecycle, "_set_session_valid", valid)
+    marker_barrier = AsyncMock()
+    monkeypatch.setattr(
+        lifecycle,
+        "_sync_lot_markers_before_listener",
+        marker_barrier,
+    )
 
     assert await lifecycle.reconfigure_funpay("new-key") is True
     current = lifecycle.runner
     assert old.stopped is True
     assert current is not None and current.key == "new-key" and current.started
     assert lifecycle._gateway is current.gateway
+    marker_barrier.assert_awaited_once_with(current.gateway, 55)
 
     assert await lifecycle.reconfigure_funpay("") is False
     assert current.stopped is True
@@ -509,6 +578,11 @@ async def test_reconfigure_funpay_rejects_bad_candidate_without_stopping_old(
     )
     valid = AsyncMock()
     monkeypatch.setattr(lifecycle, "_set_session_valid", valid)
+    monkeypatch.setattr(
+        lifecycle,
+        "_sync_lot_markers_before_listener",
+        AsyncMock(),
+    )
 
     connected = await lifecycle.reconfigure_funpay("bad-key")
 
@@ -857,15 +931,7 @@ async def test_pending_order_retry_suppresses_duplicate_unavailable_message(
     from app.integrations.funpay.types import OrderInfo, SaleStatus
     from app.models.rental import Order
 
-    order = Order(
-        funpay_order_id="retry-order",
-        funpay_chat_id="100",
-        buyer_funpay_id="200",
-        buyer_locale="ru",
-        price=100,
-        status="pending",
-    )
-    session.add(order)
+    order = await _seed_verified_pending_order(session, "retry-order")
     await session.commit()
 
     class Context:
@@ -907,15 +973,7 @@ async def test_pending_order_retry_does_not_fulfill_remote_refund(
     from app.integrations.funpay.types import OrderInfo, SaleStatus
     from app.models.rental import Order
 
-    order = Order(
-        funpay_order_id="refunded-order",
-        funpay_chat_id="100",
-        buyer_funpay_id="200",
-        buyer_locale="ru",
-        price=100,
-        status="pending",
-    )
-    session.add(order)
+    order = await _seed_verified_pending_order(session, "refunded-order")
     await session.commit()
 
     class Context:
@@ -1048,6 +1106,7 @@ async def test_reconcile_pauses_invalid_manual_lot_without_global_node(
         status="active",
         auto_created=False,
         funpay_id="901",
+        provenance_marker_synced=True,
     )
     matrix = PriceMatrix(
         tier_id=valid_tier.id,
@@ -1069,6 +1128,7 @@ async def test_reconcile_pauses_invalid_manual_lot_without_global_node(
         status="active",
         auto_created=True,
         funpay_id="902",
+        provenance_marker_synced=True,
     )
     session.add_all([invalid_manual_lot, matrix, valid_auto_lot])
     await session.commit()

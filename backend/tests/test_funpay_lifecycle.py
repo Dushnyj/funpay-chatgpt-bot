@@ -15,6 +15,10 @@ from app.services.funpay_lifecycle import build_callbacks
 from app.services.sale_registry import SaleRegistryService
 
 
+_MANAGED_OFFER_ID = "9001"
+_MANAGED_PROVENANCE_TOKEN = "0123456789abcdef0123456789abcdef"
+
+
 async def _seed_verified_sale(
     session: AsyncSession,
     *,
@@ -22,8 +26,23 @@ async def _seed_verified_sale(
     chat_id: int = 100,
     buyer_id: int = 200,
 ) -> None:
+    lot_id = await _seed_lot(session)
+    order = Order(
+        funpay_order_id=order_id,
+        funpay_chat_id=str(chat_id),
+        buyer_funpay_id=str(buyer_id),
+        buyer_locale="ru",
+        lot_id=lot_id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=_MANAGED_OFFER_ID,
+        price=100,
+        status="pending",
+    )
+    session.add(order)
+    await session.flush()
     session.add(FunPaySale(
         funpay_order_id=order_id,
+        order_id=order.id,
         funpay_chat_id=str(chat_id),
         buyer_funpay_id=str(buyer_id),
         status="paid",
@@ -32,6 +51,12 @@ async def _seed_verified_sale(
 
 
 async def _seed_lot(session: AsyncSession) -> int:
+    existing = await session.scalar(
+        select(Lot).where(Lot.funpay_id == _MANAGED_OFFER_ID)
+    )
+    if existing is not None:
+        return existing.id
+
     tier = SubscriptionTier(
         code="plus", name="Plus", is_active=True, is_sellable=True,
     )
@@ -42,6 +67,9 @@ async def _seed_lot(session: AsyncSession) -> int:
     session.add(scope)
     await session.flush()
     lot = Lot(
+        funpay_id=_MANAGED_OFFER_ID,
+        provenance_token=_MANAGED_PROVENANCE_TOKEN,
+        provenance_marker_synced=True,
         funpay_node_id=55,
         tier_id=tier.id,
         duration_id=duration.id,
@@ -78,6 +106,7 @@ async def test_on_new_sale_callback_processes_order(session: AsyncSession):
         subcategory_id=55,
         title="T",
         price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
     ))
     callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
     await callbacks.on_new_sale("ord-1")  # type: ignore
@@ -121,6 +150,7 @@ async def test_new_sale_continues_after_concurrent_registry_insert(
         subcategory_id=55,
         title="T",
         price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
     ))
     callbacks = build_callbacks(
         session_factory=lambda: session,
@@ -153,6 +183,7 @@ async def test_on_sale_closed_callback_updates_status(session: AsyncSession):
         subcategory_id=55,
         title="T",
         price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
     ))
     callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
     await callbacks.on_new_sale("ord-1")  # type: ignore
@@ -161,7 +192,7 @@ async def test_on_sale_closed_callback_updates_status(session: AsyncSession):
     assert order.status == "completed"
 
 
-async def test_unmatched_sale_keeps_provenance_and_remote_status(
+async def test_unmatched_sale_never_creates_provenance_or_chat(
     session: AsyncSession,
 ):
     gateway = FakeChatGateway()
@@ -181,23 +212,16 @@ async def test_unmatched_sale_keeps_provenance_and_remote_status(
     sale = await session.scalar(
         select(FunPaySale).where(FunPaySale.funpay_order_id == "unmatched-sale")
     )
-    assert sale is not None
-    assert sale.status == "paid"
-    assert sale.order_id is None
+    assert sale is None
     assert await session.scalar(
         select(Order).where(Order.funpay_order_id == "unmatched-sale")
     ) is None
+    assert await session.scalar(select(ChatConversation)) is None
 
     await callbacks.on_sale_closed("unmatched-sale")  # type: ignore
-    sale = await session.scalar(
-        select(FunPaySale).where(FunPaySale.funpay_order_id == "unmatched-sale")
-    )
-    assert sale.status == "completed"
     await callbacks.on_sale_refunded("unmatched-sale")  # type: ignore
-    sale = await session.scalar(
-        select(FunPaySale).where(FunPaySale.funpay_order_id == "unmatched-sale")
-    )
-    assert sale.status == "refunded"
+    assert await session.scalar(select(FunPaySale)) is None
+    assert await session.scalar(select(ChatConversation)) is None
 
 
 async def test_on_message_callback_dispatches_command(session: AsyncSession):
@@ -336,6 +360,9 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
         expected_long_window_seconds=7 * 24 * 60 * 60,
     ))
     session.add(Lot(
+        funpay_id=_MANAGED_OFFER_ID,
+        provenance_token=_MANAGED_PROVENANCE_TOKEN,
+        provenance_marker_synced=True,
         funpay_node_id=55,
         tier_id=tier.id,
         duration_id=duration.id,
@@ -357,6 +384,7 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
         subcategory_id=55,
         title="T",
         price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
     ))
     callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
     await callbacks.on_new_sale("ord-99")  # type: ignore

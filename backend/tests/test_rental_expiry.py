@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.funpay.gateway import FakeChatGateway
 from app.models.account import Account
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
+from app.models.funpay_sale import FunPaySale
+from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.models.audit import AuditLog
 from app.models.account import AccountCheckJob
@@ -47,13 +49,38 @@ async def _make_rental(
     )
     session.add(acc)
     await session.flush()
+    lot = Lot(
+        funpay_id="5001",
+        provenance_token="1" * 32,
+        provenance_marker_synced=True,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        title_ru="Аренда Plus",
+        title_en="Plus rental",
+        status="active",
+    )
+    session.add(lot)
+    await session.flush()
     order = Order(
         funpay_order_id="o1", funpay_chat_id=chat_id, buyer_funpay_id="200",
-        lot_id=None, tier_id=tier.id, duration_id=duration.id,
+        lot_id=lot.id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=lot.funpay_id,
+        tier_id=tier.id, duration_id=duration.id,
         limit_scope_id=scope.id, price=100, status="pending",
     )
     session.add(order)
     await session.flush()
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id=order.funpay_chat_id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        status="paid",
+    ))
     rental = Rental(
         order_id=order.id, account_id=acc.id,
         buyer_funpay_id="200", buyer_funpay_chat_id=chat_id,
@@ -262,6 +289,46 @@ async def test_expire_sends_to_correct_chat(session: AsyncSession):
     assert len(gateway.sent_messages) == 1
     chat_id, _ = gateway.sent_messages[0]
     assert chat_id == 555
+
+
+async def test_expiry_notification_reloads_route_after_rebind(
+    session: AsyncSession,
+):
+    from sqlalchemy import select
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _make_rental(
+        session,
+        expires_delta=timedelta(seconds=-1),
+        chat_id="555",
+        status="expired",
+    )
+    rental.expiry_notified_at = None
+    service = _service()
+
+    async def rebind_before_send(db, current_rental):
+        order = await db.get(Order, current_rental.order_id)
+        assert order is not None
+        sale = await db.scalar(
+            select(FunPaySale).where(FunPaySale.order_id == order.id)
+        )
+        assert sale is not None
+        order.funpay_chat_id = "777"
+        current_rental.buyer_funpay_chat_id = "777"
+        sale.funpay_chat_id = "777"
+        return "Срок аренды завершён"
+
+    service._render_expiry = rebind_before_send  # type: ignore[method-assign]
+    gateway = FakeChatGateway()
+    await service.notify_expiration_candidate(
+        session,
+        gateway,
+        rental_id=rental.id,
+        order_id=rental.order_id,
+    )
+
+    assert gateway.sent_messages == [(777, "Срок аренды завершён")]
 
 
 async def test_expiry_kicks_account_audits_and_enqueues_recovery(session: AsyncSession):

@@ -1,7 +1,7 @@
 import pytest
 from datetime import datetime, timezone
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import COOKIE_NAME, create_access_token
@@ -11,7 +11,13 @@ from app.integrations.funpay.types import MessageInfo
 from app.main import app
 from app.models.chat import ChatConversation
 from app.models.funpay_sale import FunPaySale
+from app.models.lot import Lot
+from app.models.rental import Order
 from app.services.chat_service import ChatService, UnverifiedConversationError
+
+
+_MANAGED_OFFER_ID = "9001"
+_MANAGED_PROVENANCE_TOKEN = "abcdef0123456789abcdef0123456789"
 
 
 @pytest.fixture
@@ -21,6 +27,31 @@ async def auth_client():
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         client.cookies.set(COOKIE_NAME, token)
         yield client
+
+
+async def _ensure_managed_lot(session: AsyncSession) -> Lot:
+    lot = await session.scalar(
+        select(Lot).where(Lot.funpay_id == _MANAGED_OFFER_ID)
+    )
+    if lot is not None:
+        return lot
+    lot = Lot(
+        funpay_id=_MANAGED_OFFER_ID,
+        provenance_token=_MANAGED_PROVENANCE_TOKEN,
+        provenance_marker_synced=True,
+        funpay_node_id=55,
+        tier_id=1,
+        duration_id=1,
+        limit_scope_id=1,
+        price=100,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=True,
+    )
+    session.add(lot)
+    await session.flush()
+    return lot
 
 
 async def _seed_conversation(session: AsyncSession, *, message_id: int = 101) -> int:
@@ -46,8 +77,23 @@ async def _seed_sale(
     buyer_id: int = 700,
     order_id: str = "order-500",
 ) -> FunPaySale:
+    lot = await _ensure_managed_lot(session)
+    local_order = Order(
+        funpay_order_id=order_id,
+        funpay_chat_id=str(chat_id),
+        buyer_funpay_id=str(buyer_id),
+        buyer_locale="ru",
+        lot_id=lot.id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=lot.funpay_id,
+        price=100,
+        status="pending",
+    )
+    session.add(local_order)
+    await session.flush()
     sale = FunPaySale(
         funpay_order_id=order_id,
+        order_id=local_order.id,
         funpay_chat_id=str(chat_id),
         buyer_funpay_id=str(buyer_id),
         buyer_username="verified-buyer",
@@ -306,3 +352,54 @@ async def test_stale_verified_flag_without_sale_is_not_exposed(
     assert response.json() == []
     response = await auth_client.get(f"/api/chats/{stale.id}/messages")
     assert response.status_code == 404
+
+
+async def test_sale_for_order_without_bot_lot_cannot_expose_or_send_chat(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    foreign_order = Order(
+        funpay_order_id="foreign-order",
+        funpay_chat_id="778",
+        buyer_funpay_id="889",
+        buyer_locale="ru",
+        lot_id=None,
+        price=100,
+        status="pending",
+    )
+    session.add(foreign_order)
+    await session.flush()
+    session.add(FunPaySale(
+        funpay_order_id="foreign-order",
+        order_id=foreign_order.id,
+        funpay_chat_id="778",
+        buyer_funpay_id="889",
+        status="paid",
+    ))
+    foreign_chat = ChatConversation(
+        funpay_chat_id="778",
+        buyer_funpay_id="889",
+        verified_sale=True,
+    )
+    session.add(foreign_chat)
+    await session.commit()
+
+    gateway = FakeChatGateway()
+    app.dependency_overrides[get_online_chat_gateway] = lambda: gateway
+    try:
+        listing = await auth_client.get("/api/chats")
+        history = await auth_client.get(
+            f"/api/chats/{foreign_chat.id}/messages"
+        )
+        reply = await auth_client.post(
+            f"/api/chats/{foreign_chat.id}/messages",
+            json={"text": "This must never be sent"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_online_chat_gateway, None)
+
+    assert listing.status_code == 200
+    assert listing.json() == []
+    assert history.status_code == 404
+    assert reply.status_code == 404
+    assert gateway.sent_messages == []

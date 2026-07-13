@@ -7,9 +7,11 @@ from app.integrations.funpay.types import OfferInfo
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.lot import Lot
 from app.services.lot_sync import (
+    description_with_provenance_marker,
     build_offer_fields,
     LotSyncService,
     LotNotPublishedError,
+    provenance_marker,
 )
 
 
@@ -42,15 +44,38 @@ async def _make_lot(session: AsyncSession) -> Lot:
 async def test_build_offer_fields_new_lot(session: AsyncSession):
     lot = await _make_lot(session)
     fields = build_offer_fields(lot, offer_id=0, active=True)
+    marker = provenance_marker(lot.provenance_token)
     assert fields.offer_id == 0
     assert fields.subcategory_id == 55
     assert fields.title_ru == "Plus 7 дней"
     assert fields.title_en == "Plus 7 days"
-    assert fields.desc_ru == "Описание лота"
-    assert fields.desc_en == "Lot description"
+    assert fields.desc_ru == f"Описание лота\n\n{marker}"
+    assert fields.desc_en == f"Lot description\n\n{marker}"
     assert fields.price == 599.0
     assert fields.active is True
     assert fields.auto_delivery is False
+    assert lot.provenance_marker_synced is False
+
+
+async def test_description_marker_is_stable_deduplicated_and_bounded(
+    session: AsyncSession,
+):
+    lot = await _make_lot(session)
+    marker = provenance_marker(lot.provenance_token)
+    lot.description_ru = f"Описание\n\n{marker}\n\n{marker}"
+    lot.description_en = "X" * 5000
+
+    first = build_offer_fields(lot, offer_id=0, active=True)
+    second = build_offer_fields(lot, offer_id=0, active=True)
+
+    assert first.desc_ru == second.desc_ru == f"Описание\n\n{marker}"
+    assert first.desc_ru.count(marker) == 1
+    assert first.desc_en.count(marker) == 1
+    assert first.desc_en.endswith(marker)
+    assert len(first.desc_en) <= 4000
+    assert description_with_provenance_marker(first.desc_ru, lot.provenance_token) == (
+        first.desc_ru
+    )
 
 
 async def test_build_offer_fields_existing_lot(session: AsyncSession):
@@ -84,6 +109,8 @@ async def test_sync_creates_new_offer(session: AsyncSession, gateway: FakeChatGa
     saved = gateway.saved_offers[funpay_id]
     assert saved.active is True
     assert saved.title_ru == "Plus 7 дней"
+    assert saved.desc_ru.endswith(provenance_marker(lot.provenance_token))
+    assert lot.provenance_marker_synced is True
 
 
 async def test_sync_updates_existing_offer(session: AsyncSession, gateway: FakeChatGateway):
@@ -94,6 +121,7 @@ async def test_sync_updates_existing_offer(session: AsyncSession, gateway: FakeC
     funpay_id = await svc.sync_lot(session, gateway, lot.id, active=False)
     assert funpay_id == 100
     assert gateway.saved_offers[100].active is False
+    assert lot.provenance_marker_synced is True
 
 
 async def test_sync_recovers_exact_unclaimed_remote_offer_instead_of_duplicating(
@@ -131,10 +159,32 @@ async def test_sync_pause_uses_set_offer_active(session: AsyncSession, gateway: 
 async def test_sync_activate_uses_set_offer_active(session: AsyncSession, gateway: FakeChatGateway):
     lot = await _make_lot(session)
     lot.funpay_id = "300"
+    lot.provenance_marker_synced = True
     await session.flush()
     svc = LotSyncService()
     await svc.activate_lot(session, gateway, lot.id)
     assert (300, True) in gateway.activity_changes
+
+
+async def test_activate_unsynced_legacy_offer_performs_full_marker_sync(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    lot = await _make_lot(session)
+    lot.funpay_id = "301"
+    lot.status = "paused"
+    lot.provenance_marker_synced = False
+    await session.flush()
+
+    await LotSyncService().activate_lot(session, gateway, lot.id)
+
+    assert gateway.activity_changes == []
+    assert gateway.saved_offers[301].active is True
+    assert gateway.saved_offers[301].desc_en.endswith(
+        provenance_marker(lot.provenance_token)
+    )
+    assert lot.provenance_marker_synced is True
+    assert lot.status == "active"
 
 
 async def test_pause_lot_without_funpay_id_raises(session: AsyncSession, gateway: FakeChatGateway):

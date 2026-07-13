@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.funpay.types import MessageInfo
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.funpay_sale import FunPaySale
+from app.services.order_provenance import managed_sale_order_exists
 from app.services.sale_registry import SaleRegistryService
 
 
@@ -18,7 +19,7 @@ class ConversationNotFoundError(LookupError):
 
 
 class UnverifiedConversationError(LookupError):
-    """Message did not come from a peer proven by the sales feed."""
+    """Message did not come from a buyer of an exactly bound bot lot."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +163,7 @@ class ChatService:
                 await session.execute(
                     select(FunPaySale)
                     .where(
+                        managed_sale_order_exists(allow_pending_chat=True),
                         (FunPaySale.buyer_funpay_id.in_(buyer_ids))
                         | (FunPaySale.funpay_chat_id.in_(chat_ids))
                     )
@@ -229,22 +231,26 @@ class ChatService:
         self,
         session: AsyncSession,
         conversation_id: int,
+        *,
+        lock_route: bool = False,
     ) -> ChatConversation:
         matching_sale = (
             select(FunPaySale.id)
             .where(
+                managed_sale_order_exists(),
                 FunPaySale.funpay_chat_id == ChatConversation.funpay_chat_id,
                 FunPaySale.buyer_funpay_id == ChatConversation.buyer_funpay_id,
             )
             .exists()
         )
-        conversation = await session.scalar(
-            select(ChatConversation).where(
+        statement = select(ChatConversation).where(
                 ChatConversation.id == conversation_id,
                 ChatConversation.verified_sale.is_(True),
                 matching_sale,
             )
-        )
+        if lock_route:
+            statement = statement.with_for_update()
+        conversation = await session.scalar(statement)
         if conversation is None:
             raise ConversationNotFoundError(conversation_id)
         return conversation

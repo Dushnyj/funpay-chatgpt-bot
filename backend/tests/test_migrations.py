@@ -1,6 +1,9 @@
 import asyncio
+import io
+import re
 
 from alembic import command
+from alembic.script import ScriptDirectory
 import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -61,6 +64,456 @@ async def test_0016_backfills_only_exact_sale_conversations(tmp_path, monkeypatc
         2: False,
         3: False,
     }
+
+
+async def test_0018_quarantines_legacy_sales_and_round_trips_contract(
+    tmp_path,
+    monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'managed-sales-0018.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260714_0017")
+
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tier_id = (
+            await connection.execute(
+                text("SELECT id FROM subscription_tiers WHERE code = 'plus'")
+            )
+        ).scalar_one()
+        await connection.execute(text(
+            "INSERT INTO durations (id, minutes, is_enabled, sort_order) "
+            "VALUES (1801, 60, 1, 60)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO limit_scopes "
+            "(id, code, name, is_enabled, sort_order) VALUES "
+            "(1801, 'managed-sale-test', 'Managed sale test', 1, 1801)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO lots "
+            "(id, funpay_id, funpay_node_id, tier_id, duration_id, "
+            "limit_scope_id, price, title_ru, title_en, description_ru, "
+            "description_en, status, auto_created, config_key) VALUES "
+            "(1801, 'offer-1801', 1355, :tier_id, 1801, 1801, 100, "
+            "'Managed', 'Managed', '', '', 'active', 1, 'managed-1801')"
+        ), {"tier_id": tier_id})
+        await connection.execute(text(
+            "INSERT INTO orders "
+            "(id, funpay_order_id, funpay_chat_id, buyer_funpay_id, "
+            "buyer_locale, lot_id, tier_id, duration_id, limit_scope_id, "
+            "price, status, fulfillment_attempts, created_at) VALUES "
+            "(1801, 'LEGACY01', 'chat-legacy', 'buyer-legacy', 'ru', "
+            "1801, :tier_id, 1801, 1801, 100, 'completed', 0, "
+            "CURRENT_TIMESTAMP)"
+        ), {"tier_id": tier_id})
+        await connection.execute(text(
+            "INSERT INTO funpay_sales "
+            "(id, funpay_order_id, order_id, funpay_chat_id, "
+            "buyer_funpay_id, status, created_at, detail_attempts, "
+            "updated_at) VALUES "
+            "(1801, 'LEGACY01', 1801, 'chat-legacy', 'buyer-legacy', "
+            "'completed', CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP), "
+            "(1802, 'ORPHAN01', NULL, 'chat-orphan', 'buyer-orphan', "
+            "'completed', CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO chat_conversations "
+            "(id, funpay_chat_id, buyer_funpay_id, funpay_order_id, "
+            "order_id, unread_count, profile_attempts, verified_sale, "
+            "created_at, updated_at) VALUES "
+            "(1801, 'chat-legacy', 'buyer-legacy', 'LEGACY01', 1801, "
+            "1, 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+            "(1802, 'chat-orphan', 'buyer-orphan', 'ORPHAN01', NULL, "
+            "0, 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+            "(1804, 'chat-empty-stale', 'buyer-stale', NULL, NULL, "
+            "0, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO chat_messages "
+            "(id, conversation_id, direction, text, delivery_status, "
+            "is_read, created_at) VALUES "
+            "(1801, 1801, 'incoming', 'retained audit message', "
+            "'received', 0, CURRENT_TIMESTAMP)"
+        ))
+        await connection.execute(text(
+            "UPDATE funpay_sale_sync_state SET "
+            "backfill_cursor='legacy-cursor', backfill_complete=0 WHERE id=1"
+        ))
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260714_0018")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        sales = (await connection.execute(text(
+            "SELECT funpay_order_id FROM funpay_sales"
+        ))).all()
+        conversations = {
+            row.id: bool(row.verified_sale)
+            for row in (
+                await connection.execute(text(
+                    "SELECT id, verified_sale FROM chat_conversations ORDER BY id"
+                ))
+            )
+        }
+        message_conversations = set((await connection.execute(text(
+            "SELECT conversation_id FROM chat_messages"
+        ))).scalars())
+        lot_state = (
+            await connection.execute(text(
+                "SELECT provenance_token, provenance_marker_synced "
+                "FROM lots WHERE id=1801"
+            ))
+        ).one()
+        order_state = (
+            await connection.execute(text(
+                "SELECT lot_binding_method, funpay_offer_id, "
+                "lot_provenance_token FROM orders WHERE id=1801"
+            ))
+        ).one()
+        sync_state = (
+            await connection.execute(text(
+                "SELECT backfill_cursor, backfill_complete "
+                "FROM funpay_sale_sync_state WHERE id=1"
+            ))
+        ).one()
+        schema = await connection.run_sync(
+            lambda sync_connection: {
+                "order_column": next(
+                    column
+                    for column in inspect(sync_connection).get_columns(
+                        "funpay_sales"
+                    )
+                    if column["name"] == "order_id"
+                ),
+                "order_fk": next(
+                    foreign_key
+                    for foreign_key in inspect(sync_connection).get_foreign_keys(
+                        "funpay_sales"
+                    )
+                    if foreign_key["constrained_columns"] == ["order_id"]
+                ),
+                "lot_columns": {
+                    column["name"]: column
+                    for column in inspect(sync_connection).get_columns("lots")
+                },
+                "order_columns": {
+                    column["name"]: column
+                    for column in inspect(sync_connection).get_columns("orders")
+                },
+                "lot_unique_names": {
+                    constraint["name"]
+                    for constraint in inspect(sync_connection)
+                    .get_unique_constraints("lots")
+                },
+            }
+        )
+    await engine.dispose()
+
+    assert sales == []
+    assert conversations == {1801: False}
+    assert message_conversations == {1801}
+    assert re.fullmatch(r"[0-9a-f]{32}", lot_state.provenance_token)
+    assert lot_state.provenance_marker_synced == 0
+    assert tuple(order_state) == (None, None, None)
+    assert tuple(sync_state) == (None, 1)
+    assert schema["order_column"]["nullable"] is False
+    assert schema["order_fk"]["referred_table"] == "orders"
+    assert schema["order_fk"]["options"].get("ondelete") == "CASCADE"
+    assert schema["lot_columns"]["provenance_token"]["nullable"] is False
+    assert schema["lot_columns"]["provenance_token"]["type"].length == 32
+    assert (
+        schema["lot_columns"]["provenance_marker_synced"]["nullable"]
+        is False
+    )
+    assert "uq_lots_provenance_token" in schema["lot_unique_names"]
+    assert {
+        "lot_binding_method",
+        "funpay_offer_id",
+        "lot_provenance_token",
+    } <= set(schema["order_columns"])
+    assert all(
+        schema["order_columns"][name]["nullable"] is True
+        for name in (
+            "lot_binding_method",
+            "funpay_offer_id",
+            "lot_provenance_token",
+        )
+    )
+    assert schema["order_columns"]["lot_provenance_token"]["type"].length == 32
+
+    await asyncio.to_thread(command.downgrade, config, "20260714_0017")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        downgraded = await connection.run_sync(
+            lambda sync_connection: {
+                "order_column": next(
+                    column
+                    for column in inspect(sync_connection).get_columns(
+                        "funpay_sales"
+                    )
+                    if column["name"] == "order_id"
+                ),
+                "order_fk": next(
+                    foreign_key
+                    for foreign_key in inspect(sync_connection).get_foreign_keys(
+                        "funpay_sales"
+                    )
+                    if foreign_key["constrained_columns"] == ["order_id"]
+                ),
+                "lot_columns": {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns("lots")
+                },
+                "order_columns": {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns("orders")
+                },
+            }
+        )
+        downgraded_state = (
+            await connection.execute(text(
+                "SELECT backfill_cursor, backfill_complete "
+                "FROM funpay_sale_sync_state WHERE id=1"
+            ))
+        ).one()
+        version = (
+            await connection.execute(text("SELECT version_num FROM alembic_version"))
+        ).scalar_one()
+    await engine.dispose()
+
+    assert downgraded["order_column"]["nullable"] is True
+    assert downgraded["order_fk"]["options"].get("ondelete") == "SET NULL"
+    assert "provenance_token" not in downgraded["lot_columns"]
+    assert "provenance_marker_synced" not in downgraded["lot_columns"]
+    assert {
+        "lot_binding_method",
+        "funpay_offer_id",
+        "lot_provenance_token",
+    }.isdisjoint(downgraded["order_columns"])
+    assert tuple(downgraded_state) == (None, 0)
+    assert version == "20260714_0017"
+
+
+async def test_0018_exact_binding_cleanup_blocks_quarantine_resurrection(
+    tmp_path,
+    monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'exact-sales-0018.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260714_0018")
+    migration = ScriptDirectory.from_config(config).get_revision(
+        "20260714_0018"
+    ).module
+
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tier_id = (
+            await connection.execute(text(
+                "SELECT id FROM subscription_tiers WHERE code='plus'"
+            ))
+        ).scalar_one()
+        await connection.execute(text(
+            "INSERT INTO durations (id, minutes, is_enabled, sort_order) "
+            "VALUES (1901, 60, 1, 60)"
+        ))
+        await connection.execute(text(
+            "INSERT INTO limit_scopes "
+            "(id, code, name, is_enabled, sort_order) VALUES "
+            "(1901, 'exact-sale-test', 'Exact sale test', 1, 1901)"
+        ))
+        for lot_id in range(1901, 1910):
+            await connection.execute(text(
+                "INSERT INTO lots "
+                "(id, funpay_id, provenance_token, provenance_marker_synced, "
+                "funpay_node_id, tier_id, duration_id, limit_scope_id, price, "
+                "title_ru, title_en, description_ru, description_en, status, "
+                "auto_created, config_key) VALUES "
+                "(:id, :offer, :token, :marker, 1355, :tier, 1901, 1901, 100, "
+                "'Exact', 'Exact', '', '', 'active', 1, :config)"
+            ), {
+                "id": lot_id,
+                "offer": f"offer-{lot_id}" if lot_id != 1902 else None,
+                "token": f"token-{lot_id}",
+                "marker": 0 if lot_id in {1901, 1909} else 1,
+                "tier": tier_id,
+                "config": f"exact-{lot_id}",
+            })
+
+        bindings = (
+            (1901, "offer_id", "offer-1901", None),
+            (1902, "provenance_token", None, "token-1902"),
+            (1903, "offer_id", "wrong-offer", None),
+            (1904, "provenance_token", None, "wrong-token"),
+            # Legacy all-NULL snapshots remain insertable for audit, but the
+            # cleanup must never trust them. Invalid mixed shapes are blocked
+            # directly by ck_orders_bot_lot_binding_shape.
+            (1905, None, None, None),
+            (1906, "offer_id", "offer-1906", None),
+            (1907, "offer_id", "offer-1907", None),
+            (1908, "offer_id", "offer-1908", None),
+            (1909, "provenance_token", None, "token-1909"),
+        )
+        for order_id, method, offer_snapshot, token_snapshot in bindings:
+            await connection.execute(text(
+                "INSERT INTO orders "
+                "(id, funpay_order_id, funpay_chat_id, buyer_funpay_id, "
+                "buyer_locale, lot_id, lot_binding_method, funpay_offer_id, "
+                "lot_provenance_token, tier_id, duration_id, limit_scope_id, "
+                "price, status, fulfillment_attempts, created_at) VALUES "
+                "(:id, :remote, :chat, :buyer, 'ru', :id, :method, :offer, "
+                ":token, :tier, 1901, 1901, 100, 'completed', 0, "
+                "CURRENT_TIMESTAMP)"
+            ), {
+                "id": order_id,
+                "remote": f"ORDER{order_id}",
+                "chat": f"chat-{order_id}",
+                "buyer": f"buyer-{order_id}",
+                "method": method,
+                "offer": offer_snapshot,
+                "token": token_snapshot,
+                "tier": tier_id,
+            })
+            sale_buyer = (
+                "tampered-buyer" if order_id == 1906 else f"buyer-{order_id}"
+            )
+            sale_remote = (
+                "TAMPER1907" if order_id == 1907 else f"ORDER{order_id}"
+            )
+            sale_chat = (
+                "tampered-chat" if order_id == 1908 else f"chat-{order_id}"
+            )
+            await connection.execute(text(
+                "INSERT INTO funpay_sales "
+                "(id, funpay_order_id, order_id, funpay_chat_id, "
+                "buyer_funpay_id, status, created_at, detail_attempts, "
+                "updated_at) VALUES "
+                "(:id, :remote, :id, :chat, :buyer, 'completed', "
+                "CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP)"
+            ), {
+                "id": order_id,
+                "remote": sale_remote,
+                "chat": sale_chat,
+                "buyer": sale_buyer,
+            })
+            await connection.execute(text(
+                "INSERT INTO chat_conversations "
+                "(id, funpay_chat_id, buyer_funpay_id, funpay_order_id, "
+                "order_id, unread_count, profile_attempts, verified_sale, "
+                "created_at, updated_at) VALUES "
+                "(:id, :chat, :buyer, :remote, :id, 0, 0, 1, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ), {
+                "id": order_id,
+                "chat": sale_chat,
+                "buyer": sale_buyer,
+                "remote": sale_remote,
+            })
+        await connection.execute(text(
+            "INSERT INTO chat_messages "
+            "(id, conversation_id, direction, text, delivery_status, "
+            "is_read, created_at) VALUES "
+            "(1904, 1904, 'incoming', 'quarantined audit message', "
+            "'received', 0, CURRENT_TIMESTAMP)"
+        ))
+
+        await connection.run_sync(migration._quarantine_unmanaged_sales)
+
+        # Simulate an old importer trying to resurrect the quarantined chat.
+        await connection.execute(text(
+            "INSERT INTO funpay_sales "
+            "(id, funpay_order_id, order_id, funpay_chat_id, buyer_funpay_id, "
+            "status, created_at, detail_attempts, updated_at) VALUES "
+            "(1914, 'ORDER1904', 1904, 'chat-1904', 'buyer-1904', "
+            "'completed', CURRENT_TIMESTAMP, 0, CURRENT_TIMESTAMP)"
+        ))
+        await connection.execute(text(
+            "UPDATE chat_conversations SET verified_sale=1 WHERE id=1904"
+        ))
+        await connection.run_sync(migration._quarantine_unmanaged_sales)
+
+        sales = set((await connection.execute(text(
+            "SELECT funpay_order_id FROM funpay_sales"
+        ))).scalars())
+        conversations = {
+            row.id: bool(row.verified_sale)
+            for row in (await connection.execute(text(
+                "SELECT id, verified_sale FROM chat_conversations ORDER BY id"
+            )))
+        }
+        message_conversations = set((await connection.execute(text(
+            "SELECT conversation_id FROM chat_messages"
+        ))).scalars())
+    await engine.dispose()
+
+    assert sales == {"ORDER1901", "ORDER1902"}
+    assert conversations == {1901: True, 1902: True, 1904: False}
+    assert message_conversations == {1904}
+
+
+def test_0018_generates_transactional_postgresql_upgrade_and_downgrade_sql():
+    database_url = "postgresql+asyncpg://migration:test@localhost/migration"
+
+    upgrade_output = io.StringIO()
+    upgrade_config = _alembic_config(database_url)
+    upgrade_config.output_buffer = upgrade_output
+    command.upgrade(
+        upgrade_config,
+        "20260714_0017:20260714_0018",
+        sql=True,
+    )
+    upgrade_sql = upgrade_output.getvalue()
+
+    assert "BEGIN;" in upgrade_sql
+    assert "ADD COLUMN provenance_token VARCHAR(32)" in upgrade_sql
+    assert "ADD COLUMN provenance_marker_synced BOOLEAN DEFAULT false NOT NULL" in upgrade_sql
+    assert (
+        "md5(random()::text || clock_timestamp()::text || id::text)"
+        in upgrade_sql
+    )
+    assert "ADD CONSTRAINT uq_lots_provenance_token UNIQUE" in upgrade_sql
+    assert "ADD COLUMN lot_binding_method VARCHAR(32)" in upgrade_sql
+    assert "ADD COLUMN funpay_offer_id VARCHAR(64)" in upgrade_sql
+    assert "ADD COLUMN lot_provenance_token VARCHAR(32)" in upgrade_sql
+    assert "JOIN lots ON lots.id = orders.lot_id" in upgrade_sql
+    assert "orders.funpay_order_id = funpay_sales.funpay_order_id" in upgrade_sql
+    assert "orders.buyer_funpay_id = funpay_sales.buyer_funpay_id" in upgrade_sql
+    assert "orders.funpay_chat_id = funpay_sales.funpay_chat_id" in upgrade_sql
+    assert "orders.lot_binding_method = 'offer_id'" in upgrade_sql
+    assert "orders.funpay_offer_id = lots.funpay_id" in upgrade_sql
+    assert "orders.lot_binding_method = 'provenance_token'" in upgrade_sql
+    assert "lots.provenance_marker_synced = true" in upgrade_sql
+    assert "orders.lot_provenance_token = lots.provenance_token" in upgrade_sql
+    assert "ALTER COLUMN order_id SET NOT NULL" in upgrade_sql
+    assert "ON DELETE CASCADE" in upgrade_sql
+    assert "backfill_complete = true" in upgrade_sql
+    assert "COMMIT;" in upgrade_sql
+
+    downgrade_output = io.StringIO()
+    downgrade_config = _alembic_config(database_url)
+    downgrade_config.output_buffer = downgrade_output
+    command.downgrade(
+        downgrade_config,
+        "20260714_0018:20260714_0017",
+        sql=True,
+    )
+    downgrade_sql = downgrade_output.getvalue()
+
+    assert "BEGIN;" in downgrade_sql
+    assert "ALTER COLUMN order_id DROP NOT NULL" in downgrade_sql
+    assert "ON DELETE SET NULL" in downgrade_sql
+    assert "backfill_complete = false" in downgrade_sql
+    assert "DROP COLUMN lot_provenance_token" in downgrade_sql
+    assert "DROP COLUMN funpay_offer_id" in downgrade_sql
+    assert "DROP COLUMN lot_binding_method" in downgrade_sql
+    assert "DROP CONSTRAINT uq_lots_provenance_token" in downgrade_sql
+    assert "DROP COLUMN provenance_marker_synced" in downgrade_sql
+    assert "DROP COLUMN provenance_token" in downgrade_sql
+    assert "COMMIT;" in downgrade_sql
 
 
 async def _schema(engine):
@@ -134,7 +587,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 )
             }
         )
-    assert version == "20260714_0017"
+    assert version == "20260714_0018"
     assert "funpay_sales" in tables
     assert "funpay_sale_sync_state" in tables
     assert {
@@ -813,7 +1266,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260714_0017"
+    assert version == "20260714_0018"
     await engine.dispose()
 
 
@@ -902,7 +1355,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 4: 1}
-    assert version == "20260714_0017"
+    assert version == "20260714_0018"
     await engine.dispose()
 
 

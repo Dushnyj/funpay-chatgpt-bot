@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -22,6 +23,23 @@ OCCUPYING_RENTAL_STATUSES: tuple[str, str] = ("active", "expiry_pending")
 
 class Order(Base):
     __tablename__ = "orders"
+    __table_args__ = (
+        CheckConstraint(
+            "(lot_binding_method IS NULL AND funpay_offer_id IS NULL "
+            "AND lot_provenance_token IS NULL) OR "
+            "(lot_binding_method = 'offer_id' AND lot_id IS NOT NULL "
+            "AND funpay_offer_id IS NOT NULL "
+            "AND lot_provenance_token IS NULL) OR "
+            "(lot_binding_method = 'provenance_token' AND lot_id IS NOT NULL "
+            "AND funpay_offer_id IS NULL "
+            "AND lot_provenance_token IS NOT NULL)",
+            name="bot_lot_binding_shape",
+        ),
+        Index(
+            "ix_orders_fulfillment_next_attempt_at",
+            "fulfillment_next_attempt_at",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     # Идемпотентность обработки заказов FunPay: дубль события не создаст дубль-строку
@@ -30,6 +48,17 @@ class Order(Base):
     buyer_funpay_id: Mapped[str] = mapped_column(String(64))
     buyer_locale: Mapped[str] = mapped_column(String(8), default="ru")
     lot_id: Mapped[int | None] = mapped_column(ForeignKey("lots.id"), default=None)
+    # Immutable proof captured when the remote sale is first bound. Legacy
+    # rows remain NULL and must never become trusted merely from lot_id.
+    lot_binding_method: Mapped[str | None] = mapped_column(
+        String(32), default=None
+    )
+    funpay_offer_id: Mapped[str | None] = mapped_column(
+        String(64), default=None
+    )
+    lot_provenance_token: Mapped[str | None] = mapped_column(
+        String(32), default=None
+    )
     tier_id: Mapped[int | None] = mapped_column(ForeignKey("subscription_tiers.id"), default=None)
     duration_id: Mapped[int | None] = mapped_column(ForeignKey("durations.id"), default=None)
     limit_scope_id: Mapped[int | None] = mapped_column(ForeignKey("limit_scopes.id"), default=None)
@@ -67,6 +96,11 @@ class Rental(Base):
             sqlite_where=text(
                 "status IN ('active', 'expiry_pending')"
             ),
+        ),
+        Index(
+            "ix_rentals_credentials_delivery_retry",
+            "credentials_delivery_status",
+            "credentials_delivery_next_attempt_at",
         ),
     )
 

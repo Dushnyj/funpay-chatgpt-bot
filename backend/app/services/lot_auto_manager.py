@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,13 @@ from app.services.lot_templates import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+class ProvenanceMarkerSyncError(RuntimeError):
+    """One or more active published lots still lack the ownership marker."""
+
+
 @dataclass(frozen=True)
 class LotAction:
     """Action performed by the automatic lot reconciler."""
@@ -47,6 +55,9 @@ class LotAutoManager:
         gateway: ChatGateway,
     ) -> list[LotAction]:
         actions = await self._pause_catalog_invalid_lots(session, gateway)
+        actions.extend(
+            await self.sync_missing_provenance_markers(session, gateway)
+        )
         if self._funpay_node_id <= 0:
             # Without a configured global node we can still make unsafe offers
             # unavailable, but must not rewrite/sync otherwise valid auto lots:
@@ -141,6 +152,55 @@ class LotAutoManager:
                 actions.append(LotAction(lot.id, "update" if changed else "none"))
 
         await session.flush()
+        return actions
+
+    async def sync_missing_provenance_markers(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        *,
+        strict: bool = False,
+    ) -> list[LotAction]:
+        """Publish pre-migration markers with per-lot transaction isolation.
+
+        Periodic reconciliation logs and retries individual failures. Startup
+        uses ``strict=True`` and will not enable the listener while an active
+        sellable lot remains unmarked.
+        """
+
+        result = await session.execute(
+            select(Lot.id, Lot.status).where(
+                Lot.funpay_id.is_not(None),
+                Lot.status != "deleted",
+                Lot.provenance_marker_synced.is_(False),
+            )
+        )
+        actions: list[LotAction] = []
+        failed_active: list[int] = []
+        for lot_id, status in result.all():
+            try:
+                await self._sync.sync_lot(
+                    session,
+                    gateway,
+                    lot_id,
+                    active=status == "active",
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.exception(
+                    "Failed to publish provenance marker for lot %s",
+                    lot_id,
+                )
+                if status == "active":
+                    failed_active.append(lot_id)
+                continue
+            actions.append(LotAction(lot_id, "update"))
+        if strict and failed_active:
+            raise ProvenanceMarkerSyncError(
+                "Active lots without a synced provenance marker: "
+                + ", ".join(str(item) for item in failed_active)
+            )
         return actions
 
     async def _pause_catalog_invalid_lots(

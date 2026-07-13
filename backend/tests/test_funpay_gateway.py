@@ -253,3 +253,30 @@ def test_map_order_status_paid():
 def test_map_order_status_unknown_default():
     from funpayparsers.types.enums import OrderStatus as FPOrderStatus
     assert _map_order_status(FPOrderStatus.UNKNOWN) is SaleStatus.UNKNOWN
+
+
+def test_build_order_info_preserves_full_description_for_provenance():
+    from funpayparsers.types.enums import OrderStatus as FPOrderStatus
+
+    buyer = SimpleNamespace(
+        id=5,
+        username="buyer",
+        avatar_url=None,
+        online=True,
+        status_text="online",
+    )
+    page = SimpleNamespace(
+        order_id="ORDER42",
+        order_status=FPOrderStatus.PAID,
+        chat=SimpleNamespace(id=10, interlocutor=buyer),
+        order_total=SimpleNamespace(value=100),
+        order_subcategory_id=55,
+        short_description="Display title",
+        full_description="Details\n\n[FPBOT:0123456789abcdef0123456789abcdef]",
+        data={},
+    )
+
+    info = _build_order_info(page)
+
+    assert info.full_description == page.full_description
+    assert info.offer_id is None

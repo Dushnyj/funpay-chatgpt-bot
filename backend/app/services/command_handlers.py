@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from collections.abc import Awaitable, Callable
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.email.provider import (
@@ -20,7 +20,6 @@ from app.integrations.funpay.gateway import ChatGateway
 from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier
-from app.models.funpay_sale import FunPaySale
 from app.models.rental import Order, Rental
 from app.services.command_router import CommandContext
 from app.services.account_limits import MeasureResult, measure_account_limits
@@ -30,6 +29,11 @@ from app.services.durations import (
     format_remaining_seconds,
 )
 from app.services.messages import render_message, usage_template_variables
+from app.services.order_provenance import (
+    exact_lot_binding_exists,
+    is_verified_bot_sale_order,
+    verified_sale_for_order_exists,
+)
 from app.services.totp import generate_totp
 from app.telegram_notifier import TelegramNotifier
 
@@ -95,19 +99,17 @@ async def _find_rental_for_context(
 ) -> Rental | None:
     """Resolve the rental by order first; never guess between active rentals."""
 
-    verified_buyer_fallback = and_(
-        Rental.buyer_funpay_id == str(ctx.sender_id),
-        select(FunPaySale.id)
-        .where(
-            FunPaySale.funpay_order_id == Order.funpay_order_id,
-            FunPaySale.buyer_funpay_id == str(ctx.sender_id),
-            FunPaySale.funpay_chat_id == str(ctx.chat_id),
-        )
-        .exists(),
-    )
-    context_identity = or_(
-        Rental.buyer_funpay_chat_id == str(ctx.chat_id),
-        verified_buyer_fallback,
+    if ctx.sender_id is None:
+        return None
+    sender_id = str(ctx.sender_id)
+    chat_id = str(ctx.chat_id)
+    context_identity = and_(
+        exact_lot_binding_exists(Order),
+        verified_sale_for_order_exists(Order),
+        Order.buyer_funpay_id == sender_id,
+        Order.funpay_chat_id == chat_id,
+        Rental.buyer_funpay_id == sender_id,
+        Rental.buyer_funpay_chat_id == chat_id,
     )
 
     if ctx.order_id:
@@ -173,7 +175,7 @@ async def _lock_resolved_rental(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if order is None:
+    if order is None or not await is_verified_bot_sale_order(session, order):
         return None
     rental = (
         await session.execute(
@@ -185,19 +187,12 @@ async def _lock_resolved_rental(
     ).scalar_one_or_none()
     if rental is None:
         return None
-    verified_buyer_fallback = await session.scalar(
-        select(FunPaySale.id).where(
-            FunPaySale.funpay_order_id == order.funpay_order_id,
-            FunPaySale.buyer_funpay_id == str(ctx.sender_id),
-            FunPaySale.funpay_chat_id == str(ctx.chat_id),
-        )
-    )
     identity_matches = (
-        rental.buyer_funpay_chat_id == str(ctx.chat_id)
-        or (
-            rental.buyer_funpay_id == str(ctx.sender_id)
-            and verified_buyer_fallback is not None
-        )
+        ctx.sender_id is not None
+        and order.buyer_funpay_id == str(ctx.sender_id)
+        and order.funpay_chat_id == str(ctx.chat_id)
+        and rental.buyer_funpay_id == str(ctx.sender_id)
+        and rental.buyer_funpay_chat_id == str(ctx.chat_id)
     )
     if (
         rental.order_id != order.id
@@ -210,19 +205,12 @@ async def _lock_resolved_rental(
             select(Rental.id)
             .join(Order, Order.id == Rental.order_id)
             .where(
-                or_(
-                    Rental.buyer_funpay_chat_id == str(ctx.chat_id),
-                    and_(
-                        Rental.buyer_funpay_id == str(ctx.sender_id),
-                        select(FunPaySale.id)
-                        .where(
-                            FunPaySale.funpay_order_id == Order.funpay_order_id,
-                            FunPaySale.buyer_funpay_id == str(ctx.sender_id),
-                            FunPaySale.funpay_chat_id == str(ctx.chat_id),
-                        )
-                        .exists(),
-                    ),
-                ),
+                exact_lot_binding_exists(Order),
+                verified_sale_for_order_exists(Order),
+                Order.buyer_funpay_id == str(ctx.sender_id),
+                Order.funpay_chat_id == str(ctx.chat_id),
+                Rental.buyer_funpay_id == str(ctx.sender_id),
+                Rental.buyer_funpay_chat_id == str(ctx.chat_id),
                 Rental.status.in_(["active", "expiry_pending"]),
             )
             .order_by(Rental.started_at.desc(), Rental.id.desc())

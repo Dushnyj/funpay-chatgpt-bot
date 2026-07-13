@@ -70,6 +70,7 @@ class FunPayRunner:
         self._reconnect_delay = reconnect_delay
         self._stopping = False
         self._handlers_registered = False
+        self._prepared = False
         self._started = False
         self.last_error: str | None = None
 
@@ -94,13 +95,21 @@ class FunPayRunner:
             raise RuntimeError("callbacks must be configured before runner start")
         self.callbacks = callbacks
 
+    async def prepare(self) -> None:
+        """Authenticate the Bot without enabling event callbacks yet."""
+
+        if self._prepared:
+            return
+        self._ensure_components()
+        await self._bot.update()
+        self._prepared = True
+
     async def start(self) -> None:
         """Initialize Bot and start a tracked, reconnecting listener task."""
         if self._started:
             return
-        self._ensure_components()
+        await self.prepare()
         self._register_handlers()
-        await self._bot.update()
         self._stopping = False
         self.last_error = None
         self._listener_task = asyncio.create_task(

@@ -10,7 +10,62 @@ from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.lot import Lot, LotTemplate, PriceMatrix
 from app.models.rental import Order, Rental
-from app.services.lot_auto_manager import LotAutoManager
+from app.services.lot_auto_manager import (
+    LotAutoManager,
+    ProvenanceMarkerSyncError,
+)
+
+
+async def test_marker_startup_barrier_isolates_lot_failures(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    active = Lot(
+        funpay_id="101",
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        title_ru="Active",
+        title_en="Active",
+        status="active",
+        provenance_marker_synced=False,
+        config_key="marker-active",
+    )
+    paused = Lot(
+        funpay_id="102",
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        title_ru="Paused",
+        title_en="Paused",
+        status="paused",
+        provenance_marker_synced=False,
+        config_key="marker-paused",
+    )
+    session.add_all([active, paused])
+    await session.commit()
+
+    class OneBrokenOfferGateway(FakeChatGateway):
+        async def save_offer_fields(self, fields):
+            if fields.offer_id == 101:
+                raise RuntimeError("remote update failed")
+            return await super().save_offer_fields(fields)
+
+    with pytest.raises(ProvenanceMarkerSyncError):
+        await LotAutoManager(55).sync_missing_provenance_markers(
+            session,
+            OneBrokenOfferGateway(),
+            strict=True,
+        )
+
+    await session.refresh(active)
+    await session.refresh(paused)
+    assert active.provenance_marker_synced is False
+    assert paused.provenance_marker_synced is True
 
 
 async def _seed_catalog(session: AsyncSession):

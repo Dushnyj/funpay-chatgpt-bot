@@ -16,6 +16,7 @@ from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.funpay_sale import FunPaySale
+from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.services.command_handlers import (
     CodeHandler,
@@ -57,15 +58,40 @@ async def _seed_rental(session: AsyncSession, chat_id: int = 100) -> Rental:
         measured_at=datetime.now(timezone.utc),
         refresh_status="ok",
     ))
+    lot = Lot(
+        funpay_id="5001",
+        provenance_token="1" * 32,
+        provenance_marker_synced=True,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=100,
+        title_ru="Аренда Plus",
+        title_en="Plus rental",
+        status="active",
+    )
+    session.add(lot)
+    await session.flush()
     order = Order(
         funpay_order_id="o1",
         funpay_chat_id=str(chat_id),
         buyer_funpay_id="200",
-        lot_id=None, tier_id=tier.id, duration_id=duration.id,
+        lot_id=lot.id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=lot.funpay_id,
+        tier_id=tier.id, duration_id=duration.id,
         limit_scope_id=scope.id, price=100, status="pending",
     )
     session.add(order)
     await session.flush()
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id=order.funpay_chat_id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        status="paid",
+    ))
     rental = Rental(
         order_id=order.id, account_id=acc.id,
         buyer_funpay_id="200", buyer_funpay_chat_id=str(chat_id),
@@ -112,10 +138,15 @@ async def _add_second_rental_in_same_chat(
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
     )
     session.add(account)
+    first_order = await session.get(Order, first.order_id)
+    lot = await session.get(Lot, first_order.lot_id)
     order = Order(
         funpay_order_id="o2",
         funpay_chat_id=first.buyer_funpay_chat_id,
         buyer_funpay_id=first.buyer_funpay_id,
+        lot_id=lot.id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=lot.funpay_id,
         tier_id=first.tier_id,
         duration_id=first.duration_id,
         limit_scope_id=first.limit_scope_id,
@@ -124,6 +155,13 @@ async def _add_second_rental_in_same_chat(
     )
     session.add(order)
     await session.flush()
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id=order.funpay_chat_id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        status="paid",
+    ))
     rental = Rental(
         order_id=order.id,
         account_id=account.id,
@@ -254,13 +292,12 @@ async def test_orderless_direct_chat_uses_verified_buyer_identity(
     await seed_message_templates(session)
     rental = await _seed_rental(session, chat_id=100)
     order = await session.get(Order, rental.order_id)
-    session.add(FunPaySale(
-        funpay_order_id=order.funpay_order_id,
-        order_id=order.id,
-        funpay_chat_id="999",
-        buyer_funpay_id="200",
-        status="paid",
-    ))
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    order.funpay_chat_id = "999"
+    rental.buyer_funpay_chat_id = "999"
+    sale.funpay_chat_id = "999"
     await session.flush()
     gateway = FakeChatGateway()
 
@@ -285,22 +322,17 @@ async def test_orderless_direct_chat_keeps_multiple_rentals_ambiguous(
     second, _ = await _add_second_rental_in_same_chat(session, first)
     first_order = await session.get(Order, first.order_id)
     second_order = await session.get(Order, second.order_id)
-    session.add_all([
-        FunPaySale(
-            funpay_order_id=first_order.funpay_order_id,
-            order_id=first_order.id,
-            funpay_chat_id="999",
-            buyer_funpay_id="200",
-            status="paid",
-        ),
-        FunPaySale(
-            funpay_order_id=second_order.funpay_order_id,
-            order_id=second_order.id,
-            funpay_chat_id="999",
-            buyer_funpay_id="200",
-            status="paid",
-        ),
-    ])
+    sales = list((await session.execute(
+        select(FunPaySale).where(
+            FunPaySale.order_id.in_([first_order.id, second_order.id])
+        )
+    )).scalars())
+    for order in (first_order, second_order):
+        order.funpay_chat_id = "999"
+    for active_rental in (first, second):
+        active_rental.buyer_funpay_chat_id = "999"
+    for sale in sales:
+        sale.funpay_chat_id = "999"
     await session.flush()
     gateway = FakeChatGateway()
 

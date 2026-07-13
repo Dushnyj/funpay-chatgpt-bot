@@ -224,6 +224,7 @@ def _build_order_info(page) -> OrderInfo:
         subcategory_id=page.order_subcategory_id,
         title=page.short_description,
         price=price,
+        full_description=getattr(page, "full_description", None),
         offer_id=_extract_order_offer_id(page),
         buyer_username=getattr(buyer, "username", None),
         buyer_avatar_url=getattr(buyer, "avatar_url", None),

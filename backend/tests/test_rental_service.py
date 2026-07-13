@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.integrations.funpay.gateway import FakeChatGateway
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
+from app.models.funpay_sale import FunPaySale
+from app.models.lot import Lot
 from app.models.message import MessageTemplate
 from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
@@ -55,12 +57,29 @@ async def _seed_full(session: AsyncSession):
         expected_long_window_seconds=7 * 24 * 60 * 60,
     )
     session.add(limits)
+    lot = Lot(
+        funpay_id="5001",
+        provenance_token="1" * 32,
+        provenance_marker_synced=True,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="Аренда Plus",
+        title_en="Plus rental",
+        status="active",
+    )
+    session.add(lot)
+    await session.flush()
     order = Order(
         funpay_order_id="ord-1",
         funpay_chat_id="100",
         buyer_funpay_id="200",
         buyer_locale="ru",
-        lot_id=None,
+        lot_id=lot.id,
+        lot_binding_method="offer_id",
+        funpay_offer_id=lot.funpay_id,
         tier_id=tier.id,
         duration_id=duration.id,
         limit_scope_id=scope.id,
@@ -68,6 +87,14 @@ async def _seed_full(session: AsyncSession):
         status="pending",
     )
     session.add(order)
+    await session.flush()
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id=order.funpay_chat_id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        status="paid",
+    ))
     await session.flush()
     return tier, duration, scope, acc, order
 

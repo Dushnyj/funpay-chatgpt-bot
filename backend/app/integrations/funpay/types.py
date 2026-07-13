@@ -25,10 +25,13 @@ class OrderInfo:
     subcategory_id: int
     title: str | None
     price: float | None
+    # Immutable detailed description copied into the FunPay order page.  The
+    # bot provenance marker lives here when the stock parser omits offer_id.
+    full_description: str | None = None
     # FunPayBotEngine 0.7 OrderPage does not currently expose this field, but
     # keeping it in the boundary DTO lets adapters use it when FunPay adds it
-    # (or when another parser can recover it).  Domain matching always prefers
-    # this stable remote identifier over title/price fallbacks.
+    # (or when another parser can recover it). Domain matching prefers this
+    # stable remote identifier and otherwise requires the description marker.
     offer_id: int | None = None
     buyer_username: str | None = None
     buyer_avatar_url: str | None = None

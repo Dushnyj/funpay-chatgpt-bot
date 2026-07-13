@@ -115,6 +115,11 @@ async def test_runner_tracks_listener_and_gateway_uses_same_bot():
         bot=bot, dispatcher=object(), reconnect_delay=0.01,
     )
 
+    await runner.prepare()
+    assert runner.started is False
+    assert runner.listener_task is None
+    bot.update.assert_awaited_once()
+
     await runner.start()
 
     assert runner.started is True
@@ -124,6 +129,7 @@ async def test_runner_tracks_listener_and_gateway_uses_same_bot():
     assert seen_config is not None
     assert seen_config.discover_sales is True
     assert seen_config.discover_purchases is False
+    bot.update.assert_awaited_once()
     await runner.stop()
     assert runner.listener_task is None
     bot.stop_listening.assert_awaited_once()

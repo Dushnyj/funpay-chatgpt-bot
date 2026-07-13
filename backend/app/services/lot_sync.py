@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +9,43 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.funpay.gateway import ChatGateway
 from app.integrations.funpay.types import OfferFieldsDTO
 from app.models.lot import Lot
+
+
+_PROVENANCE_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+_PROVENANCE_MARKER_RE = re.compile(r"\[FPBOT:([0-9a-f]{32})\]")
+_FUNPAY_DESCRIPTION_MAX_LENGTH = 4000
+
+
+def provenance_marker(token: str) -> str:
+    """Return the canonical marker for one persisted lot token."""
+
+    if not _PROVENANCE_TOKEN_RE.fullmatch(token):
+        raise ValueError("Lot provenance token must be 32 lowercase hex characters")
+    return f"[FPBOT:{token}]"
+
+
+def description_with_provenance_marker(
+    description: str | None,
+    token: str,
+) -> str:
+    """Append exactly one stable marker without exceeding FunPay's limit."""
+
+    marker = provenance_marker(token)
+    # Operator text may have been copied back from FunPay. Remove every old
+    # canonical marker before appending the authoritative current one.
+    clean = _PROVENANCE_MARKER_RE.sub("", description or "").strip()
+    separator = "\n\n" if clean else ""
+    available = _FUNPAY_DESCRIPTION_MAX_LENGTH - len(separator) - len(marker)
+    clean = clean[: max(0, available)].rstrip()
+    separator = "\n\n" if clean else ""
+    return f"{clean}{separator}{marker}"
+
+
+def extract_provenance_token(full_description: str | None) -> str | None:
+    """Extract one exact canonical marker; duplicates fail closed."""
+
+    matches = _PROVENANCE_MARKER_RE.findall(full_description or "")
+    return matches[0] if len(matches) == 1 else None
 
 
 def build_offer_fields(lot: Lot, offer_id: int, active: bool) -> OfferFieldsDTO:
@@ -21,8 +59,14 @@ def build_offer_fields(lot: Lot, offer_id: int, active: bool) -> OfferFieldsDTO:
         subcategory_id=lot.funpay_node_id or 0,
         title_ru=lot.title_ru,
         title_en=lot.title_en,
-        desc_ru=lot.description_ru or "",
-        desc_en=lot.description_en or "",
+        desc_ru=description_with_provenance_marker(
+            lot.description_ru,
+            lot.provenance_token,
+        ),
+        desc_en=description_with_provenance_marker(
+            lot.description_en,
+            lot.provenance_token,
+        ),
         price=float(lot.price),
         active=active,
         auto_delivery=False,
@@ -64,7 +108,8 @@ class LotSyncService:
             raise RuntimeError("FunPay did not return a valid offer id")
         if not lot.funpay_id:
             lot.funpay_id = str(result_id)
-            await session.flush()
+        lot.provenance_marker_synced = True
+        await session.flush()
         return result_id
 
     async def _recover_uncommitted_remote_offer(
@@ -134,6 +179,14 @@ class LotSyncService:
         lot = await self._get_lot(session, lot_id)
         if not lot.funpay_id:
             raise LotNotPublishedError(f"Lot {lot_id} has no funpay_id")
+        if not lot.provenance_marker_synced:
+            # A plain activation would leave a legacy offer without the
+            # mandatory ownership marker. Full sync publishes the marker and
+            # activates the same remote offer atomically from our perspective.
+            await self.sync_lot(session, gateway, lot_id, active=True)
+            lot.status = "active"
+            await session.flush()
+            return
         changed = await gateway.set_offer_active(int(lot.funpay_id), active=True)
         if not changed:
             raise RuntimeError(f"FunPay did not activate offer {lot.funpay_id}")

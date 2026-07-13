@@ -33,12 +33,17 @@ from app.services.durations import (
 )
 from app.services.limit_eligibility import apply_limit_scope_filters
 from app.services.messages import issued_usage_template_variables, render_message
+from app.services.order_provenance import is_verified_bot_sale_order
 
 
 CREDENTIAL_DELIVERY_LEASE = timedelta(minutes=5)
 INITIAL_DELIVERY_SUBSCRIPTION_HEADROOM = DELIVERY_ALLOCATION_HEADROOM
 REPLACEMENT_DELIVERY_MIN_REMAINING = timedelta(minutes=2)
 _FULFILLABLE_ORDER_STATUSES = {"pending", "completed"}
+
+
+class UnverifiedOrderProvenanceError(RuntimeError):
+    """Credential delivery was requested for a non-bot or legacy order."""
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -80,6 +85,14 @@ class RentalService:
         if order is None:
             raise KeyError(f"Order {order_id} not found")
         rental = await self._find_rental_by_order(session, order_id)
+        if not await is_verified_bot_sale_order(session, order):
+            if rental is not None:
+                self._quarantine_unverified_rental(rental)
+                await session.commit()
+                return rental
+            raise UnverifiedOrderProvenanceError(
+                f"Order {order_id} has no exact verified bot-sale provenance"
+            )
         if rental is not None:
             if not self._claim_existing_delivery(order, rental):
                 return rental
@@ -265,6 +278,10 @@ class RentalService:
         ).scalar_one_or_none()
         if rental is None:
             raise KeyError(f"Rental {rental_id} not found")
+        if not await is_verified_bot_sale_order(session, order):
+            self._quarantine_unverified_rental(rental)
+            await session.commit()
+            return rental
         if (
             order.status not in _FULFILLABLE_ORDER_STATUSES
             or rental.status != "active"
@@ -330,6 +347,10 @@ class RentalService:
                         .execution_options(populate_existing=True)
                     )
                 ).scalar_one()
+                if not await is_verified_bot_sale_order(session, order):
+                    self._quarantine_unverified_rental(rental)
+                    await session.commit()
+                    return rental
                 if (
                     order.status not in _FULFILLABLE_ORDER_STATUSES
                     or rental.status != "active"
@@ -404,6 +425,10 @@ class RentalService:
                 .execution_options(populate_existing=True)
             )
         ).scalar_one()
+        if not await is_verified_bot_sale_order(session, order):
+            self._quarantine_unverified_rental(rental)
+            await session.commit()
+            return rental
         if (
             order.status not in _FULFILLABLE_ORDER_STATUSES
             or rental.status != "active"
@@ -517,6 +542,15 @@ class RentalService:
             rental.expires_at = access_expires_at
         await session.commit()
         return rental
+
+    @staticmethod
+    def _quarantine_unverified_rental(rental: Rental) -> None:
+        """Make every automatic delivery retry fail closed without deleting audit data."""
+
+        if rental.credentials_delivery_status != "sent":
+            rental.credentials_delivery_status = "manual"
+        rental.credentials_delivery_last_error = "unverified_order_provenance"
+        rental.credentials_delivery_next_attempt_at = None
 
     async def _delivery_limits_if_eligible(
         self,

@@ -38,6 +38,7 @@ def gateway() -> FakeChatGateway:
         subcategory_id=55,
         title="Plus 7d",
         price=599.0,
+        offer_id=9001,
     ))
     return gw
 
@@ -52,6 +53,7 @@ async def _seed_catalog_and_lot(session: AsyncSession, funpay_node_id: int = 55)
     session.add(scope)
     await session.flush()
     lot = Lot(
+        funpay_id="9001",
         funpay_node_id=funpay_node_id,
         tier_id=tier.id,
         duration_id=duration.id,
@@ -109,6 +111,9 @@ async def test_process_new_sale_creates_order(session: AsyncSession, gateway: Fa
     assert order.funpay_chat_id == "100"
     assert order.buyer_funpay_id == "200"
     assert order.lot_id is not None
+    assert order.lot_binding_method == "offer_id"
+    assert order.funpay_offer_id == "9001"
+    assert order.lot_provenance_token is None
     assert order.status == "pending"
 
 
@@ -120,6 +125,45 @@ async def test_process_new_sale_idempotent(session: AsyncSession, gateway: FakeC
     assert first.id == second.id
     result = await session.execute(select(Order).where(Order.funpay_order_id == "ord-1"))
     assert len(result.scalars().all()) == 1
+
+
+async def test_existing_legacy_order_is_not_promoted_without_snapshot(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    lot_id = await _seed_catalog_and_lot(session)
+    legacy = Order(
+        funpay_order_id="legacy-order",
+        funpay_chat_id="100",
+        buyer_funpay_id="200",
+        buyer_locale="ru",
+        lot_id=lot_id,
+        price=599,
+        status="pending",
+    )
+    session.add(legacy)
+    await session.flush()
+
+    returned = await OrderProcessor().process_new_sale(
+        session,
+        gateway,
+        "legacy-order",
+        info=OrderInfo(
+            order_id="legacy-order",
+            status=SaleStatus.PAID,
+            chat_id=100,
+            buyer_id=200,
+            subcategory_id=55,
+            title="Plus 7d",
+            price=599,
+            offer_id=9001,
+        ),
+    )
+
+    assert returned.id == legacy.id
+    assert returned.lot_binding_method is None
+    assert returned.funpay_offer_id is None
+    assert returned.lot_provenance_token is None
 
 
 async def test_process_new_sale_rejects_unmatched_sole_subcategory_lot(
@@ -293,6 +337,7 @@ async def test_process_new_sale_records_english_offer_locale(
         subcategory_id=55,
         title="Plus for 7 days",
         price=599.0,
+        offer_id=9001,
     ))
 
     order = await OrderProcessor().process_new_sale(session, gateway, "ord-en")
@@ -324,46 +369,182 @@ async def test_process_new_sale_prefers_remote_offer_id(
     order = await OrderProcessor().process_new_sale(session, gateway, "ord-remote")
 
     assert order.lot_id == second.id
+    assert order.lot_binding_method == "offer_id"
+    assert order.funpay_offer_id == "202"
+    assert order.lot_provenance_token is None
 
 
-async def test_process_new_sale_requires_matching_title_and_price_fallback(
+async def test_process_new_sale_accepts_exact_provenance_marker(
     session: AsyncSession, gateway: FakeChatGateway,
 ):
     first_id = await _seed_catalog_and_lot(session)
     first = await session.get(Lot, first_id)
     second = Lot(
-        funpay_node_id=55, tier_id=first.tier_id, duration_id=first.duration_id,
+        funpay_id="9002", funpay_node_id=55,
+        tier_id=first.tier_id, duration_id=first.duration_id,
         limit_scope_id=first.limit_scope_id, price=699,
         title_ru="Other", title_en="Other", status="active", auto_created=False,
         config_key="price-fallback-second",
+        provenance_marker_synced=True,
     )
     session.add(second)
     await session.flush()
     gateway.set_order(OrderInfo(
-        order_id="ord-price", status=SaleStatus.PAID, chat_id=100,
-        buyer_id=200, subcategory_id=55, title="Other", price=699,
+        order_id="ord-token", status=SaleStatus.PAID, chat_id=100,
+        buyer_id=200, subcategory_id=999, title="Unrelated display title", price=1,
+        full_description=(
+            f"Remote description\n\n[FPBOT:{second.provenance_token}]"
+        ),
     ))
 
-    order = await OrderProcessor().process_new_sale(session, gateway, "ord-price")
+    order = await OrderProcessor().process_new_sale(session, gateway, "ord-token")
 
     assert order.lot_id == second.id
+    assert order.lot_binding_method == "provenance_token"
+    assert order.funpay_offer_id is None
+    assert order.lot_provenance_token == second.provenance_token
 
 
-async def test_process_new_sale_rejects_ambiguous_multi_lot_fallback(
+async def test_title_category_and_price_never_authorize_a_sale(
     session: AsyncSession, gateway: FakeChatGateway,
+):
+    await _seed_catalog_and_lot(session)
+    gateway.set_order(OrderInfo(
+        order_id="display-only",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Plus 7d",
+        price=599,
+        full_description="Same visible description, but no bot marker",
+    ))
+
+    with pytest.raises(LotNotFoundError):
+        await OrderProcessor().process_new_sale(session, gateway, "display-only")
+
+
+@pytest.mark.parametrize(
+    ("funpay_id", "marker_synced"),
+    [
+        (None, True),
+        ("9001", False),
+    ],
+)
+async def test_provenance_marker_requires_published_synced_lot(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+    funpay_id: str | None,
+    marker_synced: bool,
+):
+    lot_id = await _seed_catalog_and_lot(session)
+    lot = await session.get(Lot, lot_id)
+    assert lot is not None
+    lot.funpay_id = funpay_id
+    lot.provenance_marker_synced = marker_synced
+    await session.flush()
+    gateway.set_order(OrderInfo(
+        order_id="untrusted-token",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Anything",
+        price=1,
+        full_description=f"[FPBOT:{lot.provenance_token}]",
+    ))
+
+    with pytest.raises(LotNotFoundError):
+        await OrderProcessor().process_new_sale(
+            session,
+            gateway,
+            "untrusted-token",
+        )
+
+    assert await session.scalar(
+        select(Order).where(Order.funpay_order_id == "untrusted-token")
+    ) is None
+
+
+async def test_duplicate_provenance_markers_fail_closed(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    lot_id = await _seed_catalog_and_lot(session)
+    lot = await session.get(Lot, lot_id)
+    assert lot is not None
+    lot.provenance_marker_synced = True
+    await session.flush()
+    marker = f"[FPBOT:{lot.provenance_token}]"
+    gateway.set_order(OrderInfo(
+        order_id="duplicate-marker",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Anything",
+        price=1,
+        full_description=f"{marker}\n{marker}",
+    ))
+
+    with pytest.raises(LotNotFoundError):
+        await OrderProcessor().process_new_sale(session, gateway, "duplicate-marker")
+
+
+async def test_conflicting_offer_id_and_marker_fail_closed(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
 ):
     first_id = await _seed_catalog_and_lot(session)
     first = await session.get(Lot, first_id)
-    session.add(Lot(
-        funpay_node_id=55, tier_id=first.tier_id, duration_id=first.duration_id,
-        limit_scope_id=first.limit_scope_id, price=599,
-        title_ru="Plus 7d", title_en="Plus 7d", status="active",
-        auto_created=False, config_key="ambiguous-second",
-    ))
+    assert first is not None
+    second = Lot(
+        funpay_id="9002",
+        funpay_node_id=55,
+        tier_id=first.tier_id,
+        duration_id=first.duration_id,
+        limit_scope_id=first.limit_scope_id,
+        price=699,
+        title_ru="Other",
+        title_en="Other",
+        status="active",
+        auto_created=False,
+        config_key="conflicting-proof-second",
+        provenance_marker_synced=True,
+    )
+    session.add(second)
     await session.flush()
+    gateway.set_order(OrderInfo(
+        order_id="conflicting-proof",
+        status=SaleStatus.PAID,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Anything",
+        price=1,
+        offer_id=9001,
+        full_description=f"[FPBOT:{second.provenance_token}]",
+    ))
 
     with pytest.raises(LotNotFoundError):
-        await OrderProcessor().process_new_sale(session, gateway, "ord-1")
+        await OrderProcessor().process_new_sale(session, gateway, "conflicting-proof")
+
+
+@pytest.mark.parametrize("status", ["paused", "deleted"])
+async def test_process_new_sale_accepts_delayed_event_for_published_lot(
+    session: AsyncSession, gateway: FakeChatGateway, status: str,
+):
+    lot_id = await _seed_catalog_and_lot(session)
+    lot = await session.get(Lot, lot_id)
+    assert lot is not None
+    lot.status = status
+    await session.flush()
+
+    order = await OrderProcessor().process_new_sale(session, gateway, "ord-1")
+
+    assert order.lot_id == lot_id
+    assert order.lot_binding_method == "offer_id"
+    assert order.funpay_offer_id == "9001"
 
 
 async def test_refund_retries_revoke_before_releasing_active_rental(

@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
-import math
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +15,7 @@ from app.models.audit import AuditLog
 from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.services.kick_service import KickResult, KickService
+from app.services.lot_sync import extract_provenance_token
 
 
 logger = logging.getLogger(__name__)
@@ -31,14 +31,23 @@ class _RefundRevokeClaim:
     started_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _LotBinding:
+    lot: Lot
+    method: str
+    funpay_offer_id: str | None = None
+    provenance_token: str | None = None
+
+
 class LotNotFoundError(Exception):
-    """Для заказа не найден Lot с matching funpay_node_id."""
+    """The sale has no exact offer-id or provenance-token lot binding."""
 
 
 class OrderProcessor:
     """Обработка событий заказа: создание, обновление статуса.
 
-    Создание идемпотентно по funpay_order_id. Определяет lot по funpay_node_id.
+    Создание идемпотентно по funpay_order_id. Lot определяется только точным
+    offer id или стабильным bot provenance marker.
     НЕ выдаёт аккаунт — это ответственность Фазы 4 (AccountPool).
     """
 
@@ -62,18 +71,21 @@ class OrderProcessor:
             return existing
 
         info = info or await gateway.get_order(order_id)
-        lot = await self._find_lot(session, info)
-        if lot is None:
+        binding = await self._find_lot(session, info)
+        if binding is None:
             raise LotNotFoundError(
-                f"No unambiguous active Lot for funpay_node_id={info.subcategory_id} "
-                f"(order {order_id})"
+                f"No exact bot-lot provenance for FunPay order {order_id}"
             )
+        lot = binding.lot
         order = Order(
             funpay_order_id=info.order_id,
             funpay_chat_id=str(info.chat_id),
             buyer_funpay_id=str(info.buyer_id),
             buyer_locale=_infer_buyer_locale(info.title, lot),
             lot_id=lot.id,
+            lot_binding_method=binding.method,
+            funpay_offer_id=binding.funpay_offer_id,
+            lot_provenance_token=binding.provenance_token,
             tier_id=lot.tier_id,
             duration_id=lot.duration_id,
             limit_scope_id=lot.limit_scope_id,
@@ -329,54 +341,64 @@ class OrderProcessor:
         self,
         session: AsyncSession,
         info: OrderInfo,
-    ) -> Lot | None:
-        """Map a remote order to exactly one local lot.
+    ) -> _LotBinding | None:
+        """Bind only by immutable remote offer id or bot description marker.
 
-        A remote offer id is authoritative.  FunPayBotEngine 0.7 does not
-        expose it on a stock OrderPage, so the fallback progressively narrows
-        candidates by subcategory, exact normalized title and exact price.
-        Ambiguity is rejected: issuing credentials for the wrong duration or
-        threshold is worse than leaving the order for manual intervention.
+        Category, title and price are deliberately ignored for authorization:
+        seller-wide manual offers can have identical display attributes.
         """
+        offer_lot: Lot | None = None
         if info.offer_id is not None:
             result = await session.execute(
                 select(Lot).where(
                     Lot.funpay_id == str(info.offer_id),
-                    Lot.status == "active",
                 )
             )
             exact = result.scalars().all()
-            return exact[0] if len(exact) == 1 else None
+            if len(exact) > 1:
+                return None
+            if exact:
+                offer_lot = exact[0]
 
-        result = await session.execute(
-            select(Lot).where(
-                Lot.funpay_node_id == info.subcategory_id,
-                Lot.status == "active",
+        token = extract_provenance_token(info.full_description)
+        token_lot: Lot | None = None
+        if token is not None:
+            token_result = await session.execute(
+                select(Lot).where(
+                    Lot.provenance_token == token,
+                    Lot.funpay_id.is_not(None),
+                    Lot.provenance_marker_synced.is_(True),
+                )
             )
-        )
-        candidates = list(result.scalars().all())
-        if not candidates:
-            return None
+            token_matches = token_result.scalars().all()
+            if len(token_matches) > 1:
+                return None
+            if token_matches:
+                token_lot = token_matches[0]
 
-        title = _normalize_title(info.title)
-        if title:
-            candidates = [
-                lot for lot in candidates
-                if title in {_normalize_title(lot.title_ru), _normalize_title(lot.title_en)}
-            ]
-        else:
-            # The stock parser normally lacks a stable offer id. Without a
-            # title there is no safe way to bind a purchase to a local lot.
-            return None
-
-        if info.price is not None:
-            candidates = [
-                lot for lot in candidates
-                if math.isclose(float(lot.price), float(info.price), abs_tol=0.01)
-            ]
-        else:
-            return None
-        return candidates[0] if len(candidates) == 1 else None
+        if offer_lot is not None and token_lot is not None:
+            if offer_lot.id != token_lot.id:
+                # Two individually valid proofs that point at different lots
+                # indicate corrupt or tampered order data.
+                return None
+            return _LotBinding(
+                lot=offer_lot,
+                method="offer_id",
+                funpay_offer_id=str(info.offer_id),
+            )
+        if offer_lot is not None:
+            return _LotBinding(
+                lot=offer_lot,
+                method="offer_id",
+                funpay_offer_id=str(info.offer_id),
+            )
+        if token_lot is not None:
+            return _LotBinding(
+                lot=token_lot,
+                method="provenance_token",
+                provenance_token=token,
+            )
+        return None
 
 
 def _normalize_title(value: str | None) -> str:

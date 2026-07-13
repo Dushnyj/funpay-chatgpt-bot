@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -13,15 +21,26 @@ def _utcnow() -> datetime:
 
 
 class FunPaySale(Base):
-    """Authoritative provenance that a FunPay peer bought from this seller.
+    """A FunPay sale proven to belong to a lot managed by this bot.
 
-    Rows are created only from ``NewSaleEvent`` or ``Bot.get_sales()``.  Local
-    ``Order`` rows are fulfillment state and may be absent when a sale cannot
-    be matched to a configured lot.
+    A seller-wide FunPay sales preview is not sufficient provenance.  Every
+    row must point at the local ``Order`` created only after an exact,
+    fail-closed lot match.  This database invariant keeps unrelated sales from
+    authorising admin chat history or buyer commands.
     """
 
     __tablename__ = "funpay_sales"
     __table_args__ = (
+        UniqueConstraint(
+            "funpay_order_id",
+            name="uq_funpay_sales_funpay_order_id",
+        ),
+        UniqueConstraint("order_id", name="uq_funpay_sales_order_id"),
+        Index(
+            "ix_funpay_sales_funpay_order_id",
+            "funpay_order_id",
+            unique=True,
+        ),
         Index(
             "ix_funpay_sales_chat_buyer",
             "funpay_chat_id",
@@ -31,14 +50,12 @@ class FunPaySale(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    funpay_order_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    order_id: Mapped[int | None] = mapped_column(
-        ForeignKey("orders.id", ondelete="SET NULL"),
-        unique=True,
-        default=None,
+    funpay_order_id: Mapped[str] = mapped_column(String(64))
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("orders.id", ondelete="CASCADE"),
     )
-    # ``get_sales`` does not expose a chat node. It is filled lazily from the
-    # order page in a rate-limited enrichment pass or from a verified message.
+    # Legacy rows may lack a chat node until the order page is enriched, but
+    # they are still backed by a managed local Order.
     funpay_chat_id: Mapped[str | None] = mapped_column(String(64), default=None)
     buyer_funpay_id: Mapped[str] = mapped_column(String(64))
     buyer_username: Mapped[str | None] = mapped_column(String(128), default=None)

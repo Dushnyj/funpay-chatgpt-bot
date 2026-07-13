@@ -12,6 +12,10 @@ from app.integrations.funpay.runner import RunnerCallbacks
 from app.integrations.funpay.types import MessageInfo
 from app.models.lot import Lot
 from app.models.rental import Order, Rental
+from app.services.order_provenance import (
+    exact_lot_binding_exists,
+    verified_sale_for_order_exists,
+)
 from app.services.command_handlers import (
     CodeHandler,
     HelpHandler,
@@ -62,32 +66,32 @@ def build_callbacks(
 
     async def on_new_sale(order_id: str) -> None:
         async with session_factory() as session:
-            logger.info("Processing verified FunPay NewSale %s", order_id)
+            logger.info("Checking FunPay NewSale against bot-managed lots: %s", order_id)
             try:
-                sale, info = await sale_registry.register_new_sale(
-                    session, gateway, order_id
-                )
-                # Provenance survives an unconfigured/ambiguous lot. Never
-                # make the buyer registry depend on successful fulfillment.
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                logger.exception("Failed to persist NewSale provenance %s", order_id)
-                return
-
-            try:
+                info = await gateway.get_order(order_id)
                 order = await order_processor.process_new_sale(
                     session, gateway, order_id, info=info,
                 )
-                await sale_registry.attach_local_order(session, sale, order)
+                await sale_registry.register_new_sale(
+                    session,
+                    gateway,
+                    order_id,
+                    order=order,
+                    info=info,
+                )
                 # Order создаётся и коммитится отдельно от fulfill_order,
                 # чтобы сбой выдачи аккаунта не откатил сам заказ
                 # (Order нужен для последующих on_sale_closed/refunded).
                 await session.commit()
             except LotNotFoundError:
-                logger.warning("New sale %s: no matching lot", order_id)
+                await session.rollback()
+                logger.info(
+                    "Ignored FunPay sale %s: it is not a published bot lot",
+                    order_id,
+                )
                 return
             except Exception:
+                await session.rollback()
                 logger.exception("Failed to process new sale %s", order_id)
                 return
 
@@ -123,23 +127,24 @@ def build_callbacks(
                     session, order_id, "completed"
                 )
                 if sale is None:
-                    await sale_registry.sync_order(session, gateway, order_id)
-                    await sale_registry.update_status(session, order_id, "completed")
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                logger.exception("Failed to update sale registry for close %s", order_id)
-            try:
+                    logger.info(
+                        "Ignored close for unmanaged FunPay sale %s",
+                        order_id,
+                    )
+                    await session.rollback()
+                    return
                 await order_processor.process_sale_closed(session, order_id)
                 await session.commit()
                 notifier = await TelegramNotifier.from_settings(session)
                 if notifier is not None:
                     await notifier.notify_order_confirmed(order_id)
             except KeyError:
+                await session.rollback()
                 logger.info(
                     "Closed sale %s has no local fulfillment order", order_id
                 )
             except Exception:
+                await session.rollback()
                 logger.exception("Failed to process sale closed %s", order_id)
 
     async def on_sale_refunded(order_id: str) -> None:
@@ -149,13 +154,12 @@ def build_callbacks(
                     session, order_id, "refunded"
                 )
                 if sale is None:
-                    await sale_registry.sync_order(session, gateway, order_id)
-                    await sale_registry.update_status(session, order_id, "refunded")
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                logger.exception("Failed to update sale registry for refund %s", order_id)
-            try:
+                    logger.info(
+                        "Ignored refund for unmanaged FunPay sale %s",
+                        order_id,
+                    )
+                    await session.rollback()
+                    return
                 order = await order_processor.process_sale_refunded(session, order_id)
                 await session.commit()
                 notifier = await TelegramNotifier.from_settings(session)
@@ -165,10 +169,12 @@ def build_callbacks(
                         pending=order.status == "refund_pending",
                     )
             except KeyError:
+                await session.rollback()
                 logger.info(
                     "Refunded sale %s has no local fulfillment order", order_id
                 )
             except Exception:
+                await session.rollback()
                 logger.exception("Failed to process sale refunded %s", order_id)
 
     async def on_message(msg: MessageInfo) -> None:
@@ -219,7 +225,13 @@ def build_callbacks(
                 # Persist it for later automated messages in the same order.
                 order = (
                     await session.execute(
-                        select(Order).where(Order.funpay_order_id == msg.order_id)
+                        select(Order).where(
+                            Order.funpay_order_id == msg.order_id,
+                            Order.buyer_funpay_id == str(msg.sender_id),
+                            Order.funpay_chat_id == str(msg.chat_id),
+                            exact_lot_binding_exists(Order),
+                            verified_sale_for_order_exists(Order),
+                        )
                     )
                 ).scalar_one_or_none()
                 if order is not None:

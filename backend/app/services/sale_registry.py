@@ -19,6 +19,11 @@ from app.integrations.funpay.types import (
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.funpay_sale import FunPaySale, FunPaySaleSyncState
 from app.models.rental import Order, Rental
+from app.services.order_provenance import (
+    exact_lot_binding_exists,
+    is_exactly_bound_order,
+    managed_sale_order_exists,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -82,19 +87,36 @@ class SaleRegistryService:
         gateway: ChatGateway,
         order_id: str,
         *,
+        order: Order,
         info: OrderInfo | None = None,
     ) -> tuple[FunPaySale, OrderInfo]:
-        """Record NewSale provenance before fulfillment touches local orders."""
+        """Record provenance only after a bot-managed local Order exists."""
 
         info = info or await gateway.get_order(order_id)
         if info.order_id != order_id or info.buyer_id <= 0 or info.chat_id <= 0:
             raise InvalidSaleProvenanceError(
                 f"Incomplete sale identity for order {order_id}"
             )
+        if order.id is None:
+            await session.flush()
+        if (
+            order.lot_id is None
+            or order.funpay_order_id != order_id
+            or order.funpay_chat_id != str(info.chat_id)
+            or order.buyer_funpay_id != str(info.buyer_id)
+        ):
+            raise InvalidSaleProvenanceError(
+                f"Order {order_id} is not bound to the matching bot lot/buyer/chat"
+            )
+        if not await is_exactly_bound_order(session, order):
+            raise InvalidSaleProvenanceError(
+                f"Order {order_id} has no exact bot-lot provenance"
+            )
         sale = await self._get_by_remote_order(session, order_id)
         if sale is None:
             candidate = FunPaySale(
                 funpay_order_id=order_id,
+                order_id=order.id,
                 funpay_chat_id=str(info.chat_id),
                 buyer_funpay_id=str(info.buyer_id),
                 status=_status_value(info.status),
@@ -115,13 +137,13 @@ class SaleRegistryService:
             raise InvalidSaleProvenanceError(
                 f"Buyer identity changed for sale {order_id}"
             )
+        if sale.order_id not in (None, order.id):
+            raise InvalidSaleProvenanceError(
+                f"Sale {order_id} is already attached to another local order"
+            )
 
         self._apply_order_info(sale, info)
-        local_order = await session.scalar(
-            select(Order).where(Order.funpay_order_id == order_id)
-        )
-        if local_order is not None:
-            sale.order_id = local_order.id
+        sale.order_id = order.id
         await session.flush()
         await self._verify_conversation(session, sale)
         return sale, info
@@ -134,6 +156,19 @@ class SaleRegistryService:
     ) -> None:
         if sale.funpay_order_id != order.funpay_order_id:
             raise InvalidSaleProvenanceError("Local and remote order IDs differ")
+        if order.lot_id is None:
+            raise InvalidSaleProvenanceError("Local order has no bot-managed lot")
+        if sale.buyer_funpay_id != order.buyer_funpay_id:
+            raise InvalidSaleProvenanceError("Local and remote buyer IDs differ")
+        if (
+            sale.funpay_chat_id is not None
+            and sale.funpay_chat_id != order.funpay_chat_id
+        ):
+            raise InvalidSaleProvenanceError("Local and remote chat IDs differ")
+        if not await is_exactly_bound_order(session, order):
+            raise InvalidSaleProvenanceError(
+                "Local order has no exact bot-lot provenance"
+            )
         sale.order_id = order.id
         if sale.funpay_chat_id is None:
             sale.funpay_chat_id = order.funpay_chat_id
@@ -143,7 +178,13 @@ class SaleRegistryService:
     async def bootstrap_from_orders(self, session: AsyncSession) -> int:
         """Import legacy Order rows created by the old NewSale-only callback."""
 
-        orders = list((await session.execute(select(Order))).scalars())
+        orders = list(
+            (
+                await session.execute(
+                    select(Order).where(exact_lot_binding_exists(Order))
+                )
+            ).scalars()
+        )
         imported = 0
         for order in orders:
             sale = await self._get_by_remote_order(session, order.funpay_order_id)
@@ -268,6 +309,7 @@ class SaleRegistryService:
                     await session.execute(
                         select(FunPaySale)
                         .where(
+                            managed_sale_order_exists(allow_pending_chat=True),
                             FunPaySale.funpay_chat_id.is_(None),
                             or_(
                                 FunPaySale.detail_next_attempt_at.is_(None),
@@ -289,6 +331,7 @@ class SaleRegistryService:
                 newest = await session.scalar(
                     select(FunPaySale)
                     .where(
+                        managed_sale_order_exists(allow_pending_chat=True),
                         FunPaySale.funpay_chat_id.is_(None),
                         or_(
                             FunPaySale.detail_next_attempt_at.is_(None),
@@ -339,11 +382,13 @@ class SaleRegistryService:
             sale.detail_next_attempt_at = None
             local_order = await session.scalar(
                 select(Order).where(
-                    Order.funpay_order_id == sale.funpay_order_id
+                    Order.funpay_order_id == sale.funpay_order_id,
+                    exact_lot_binding_exists(Order),
                 )
             )
             if local_order is not None:
                 sale.order_id = local_order.id
+                local_order.funpay_chat_id = str(info.chat_id)
             await session.flush()
             await self._verify_conversation(session, sale)
             sync_state.page_backoff_attempts = 0
@@ -413,6 +458,7 @@ class SaleRegistryService:
             and_(
                 FunPaySale.funpay_chat_id == ChatConversation.funpay_chat_id,
                 FunPaySale.buyer_funpay_id == ChatConversation.buyer_funpay_id,
+                managed_sale_order_exists(),
             )
         )
         candidates = list(
@@ -480,7 +526,10 @@ class SaleRegistryService:
                 )
                 await session.execute(
                     update(FunPaySale)
-                    .where(FunPaySale.buyer_funpay_id == buyer_key)
+                    .where(
+                        FunPaySale.buyer_funpay_id == buyer_key,
+                        managed_sale_order_exists(),
+                    )
                     .values(
                         buyer_is_online=None,
                         buyer_status_text=None,
@@ -517,7 +566,10 @@ class SaleRegistryService:
             )
             await session.execute(
                 update(FunPaySale)
-                .where(FunPaySale.buyer_funpay_id == buyer_key)
+                .where(
+                    FunPaySale.buyer_funpay_id == buyer_key,
+                    managed_sale_order_exists(),
+                )
                 .values(
                     buyer_username=profile.username,
                     buyer_avatar_url=profile.avatar_url,
@@ -681,7 +733,11 @@ class SaleRegistryService:
         sender_id = str(message.sender_id) if message.sender_id is not None else None
         if message.order_id:
             sale = await self._get_by_remote_order(session, message.order_id)
-            if sale is not None and self._sender_matches(sale, sender_id, message.from_me):
+            if (
+                sale is not None
+                and self._sender_matches(sale, sender_id, message.from_me)
+                and self._message_role_matches(sale, message, sender_id)
+            ):
                 if sale.funpay_chat_id != str(message.chat_id):
                     if message.from_me or sender_id != sale.buyer_funpay_id:
                         return None
@@ -690,22 +746,38 @@ class SaleRegistryService:
                     ):
                         return None
                 return sale
+            # An explicit order id is authoritative role evidence. Never fall
+            # back to a historical buyer match for purchases, manual offers,
+            # or any other order that was not created from a bot-managed lot.
+            return None
 
         sale = await session.scalar(
             select(FunPaySale)
-            .where(FunPaySale.funpay_chat_id == str(message.chat_id))
+            .where(
+                FunPaySale.funpay_chat_id == str(message.chat_id),
+                managed_sale_order_exists(),
+            )
             .order_by(FunPaySale.created_at.desc(), FunPaySale.id.desc())
         )
-        if sale is not None and self._sender_matches(sale, sender_id, message.from_me):
+        if (
+            sale is not None
+            and self._sender_matches(sale, sender_id, message.from_me)
+            and self._message_role_matches(sale, message, sender_id)
+        ):
             return sale
 
         if not message.from_me and sender_id is not None:
             sale = await session.scalar(
                 select(FunPaySale)
-                .where(FunPaySale.buyer_funpay_id == sender_id)
+                .where(
+                    FunPaySale.buyer_funpay_id == sender_id,
+                    managed_sale_order_exists(),
+                )
                 .order_by(FunPaySale.created_at.desc(), FunPaySale.id.desc())
             )
-            if sale is not None:
+            if sale is not None and self._message_role_matches(
+                sale, message, sender_id
+            ):
                 # A plain /chat/?node= message often has no order meta. The
                 # stable, verified sender ID is the authority when FunPay has
                 # rotated the chat node. Merge the old inbox row before moving
@@ -735,6 +807,30 @@ class SaleRegistryService:
             )
         if not valid:
             return [], 0
+        # ``get_sales`` is seller-wide and includes unrelated manual/external
+        # offers.  A preview may update only an Order that has already passed
+        # the bot-lot matcher; it must never create buyer/chat provenance by
+        # itself.
+        managed_orders = list(
+            (
+                await session.execute(
+                    select(Order).where(
+                        Order.funpay_order_id.in_(list(valid)),
+                        exact_lot_binding_exists(Order),
+                    )
+                )
+            ).scalars()
+        )
+        orders_by_remote_id = {
+            order.funpay_order_id: order for order in managed_orders
+        }
+        valid = {
+            order_id: preview
+            for order_id, preview in valid.items()
+            if order_id in orders_by_remote_id
+        }
+        if not valid:
+            return [], 0
         existing = list(
             (
                 await session.execute(
@@ -749,11 +845,20 @@ class SaleRegistryService:
         imported = 0
         now = _utcnow()
         for order_id, preview in valid.items():
+            order = orders_by_remote_id[order_id]
             buyer_id = str(preview.buyer_id)
+            if order.buyer_funpay_id != buyer_id:
+                logger.error(
+                    "Ignoring changed buyer identity for managed FunPay order %s",
+                    order_id,
+                )
+                continue
             sale = by_order.get(order_id)
             if sale is None:
                 sale = FunPaySale(
                     funpay_order_id=order_id,
+                    order_id=order.id,
+                    funpay_chat_id=order.funpay_chat_id,
                     buyer_funpay_id=buyer_id,
                     status=_status_value(preview.status),
                     created_at=preview.created_at or now,
@@ -767,7 +872,18 @@ class SaleRegistryService:
                     order_id,
                 )
                 continue
+            elif sale.order_id != order.id:
+                logger.error(
+                    "Ignoring conflicting local order for managed FunPay sale %s",
+                    order_id,
+                )
+                continue
             sale.status = _status_value(preview.status)
+            # The seller-wide preview has no chat node. Keep a pending null so
+            # the bounded detail queue verifies it against the order page. A
+            # non-null stale value can be repaired from the immutable Order.
+            if sale.funpay_chat_id is not None:
+                sale.funpay_chat_id = order.funpay_chat_id
             sale.buyer_username = preview.buyer_username or sale.buyer_username
             sale.buyer_avatar_url = preview.buyer_avatar_url
             sale.buyer_is_online = preview.buyer_is_online
@@ -855,6 +971,18 @@ class SaleRegistryService:
         session: AsyncSession,
         sale: FunPaySale,
     ) -> ChatConversation | None:
+        managed_order = await session.scalar(
+            select(FunPaySale.id).where(
+                FunPaySale.id == sale.id,
+                managed_sale_order_exists(),
+            )
+        )
+        if managed_order is None:
+            logger.warning(
+                "Refusing to verify unmanaged FunPay sale %s",
+                sale.funpay_order_id,
+            )
+            return None
         if sale.funpay_chat_id is None:
             return None
         conversation = await session.scalar(
@@ -1005,7 +1133,34 @@ class SaleRegistryService:
         sender_id: str | None,
         from_me: bool,
     ) -> bool:
-        return from_me or sender_id is None or sender_id == sale.buyer_funpay_id
+        # Incoming messages with no stable sender identity are not sufficient
+        # to authorize chat history or buyer commands.  Outgoing echoes are
+        # accepted only because the bot itself produced them.
+        return from_me or (
+            sender_id is not None and sender_id == sale.buyer_funpay_id
+        )
+
+    @staticmethod
+    def _message_role_matches(
+        sale: FunPaySale,
+        message: MessageInfo,
+        sender_id: str | None,
+    ) -> bool:
+        """Reject purchase-side metadata even for a previously known buyer."""
+
+        if (
+            message.buyer_id is not None
+            and str(message.buyer_id) != sale.buyer_funpay_id
+        ):
+            return False
+        if (
+            not message.from_me
+            and sender_id is not None
+            and message.seller_id is not None
+            and sender_id == str(message.seller_id)
+        ):
+            return False
+        return True
 
     @staticmethod
     async def _learn_chat(
@@ -1025,11 +1180,20 @@ class SaleRegistryService:
         buyer_id: str,
         chat_id: str,
     ) -> bool:
+        exact_sale = exists().where(
+            and_(
+                FunPaySale.funpay_chat_id == ChatConversation.funpay_chat_id,
+                FunPaySale.buyer_funpay_id == ChatConversation.buyer_funpay_id,
+                managed_sale_order_exists(),
+            )
+        )
         conversations = list(
             (
                 await session.execute(
                     select(ChatConversation)
                     .where(
+                        ChatConversation.verified_sale.is_(True),
+                        exact_sale,
                         or_(
                             ChatConversation.funpay_chat_id == chat_id,
                             ChatConversation.buyer_funpay_id == buyer_id,
@@ -1039,6 +1203,7 @@ class SaleRegistryService:
                         ChatConversation.last_message_at.desc().nulls_last(),
                         ChatConversation.id.desc(),
                     )
+                    .with_for_update()
                 )
             ).scalars()
         )
@@ -1046,19 +1211,40 @@ class SaleRegistryService:
             (item for item in conversations if item.funpay_chat_id == chat_id),
             None,
         )
-        if current is not None and current.buyer_funpay_id not in (None, buyer_id):
+        occupied = await session.scalar(
+            select(ChatConversation)
+            .where(ChatConversation.funpay_chat_id == chat_id)
+            .with_for_update()
+        )
+        if occupied is not None and occupied.buyer_funpay_id not in (None, buyer_id):
             logger.error(
                 "Refusing to rebind chat %s from buyer %s to %s",
                 chat_id,
-                current.buyer_funpay_id,
+                occupied.buyer_funpay_id,
                 buyer_id,
             )
             return False
+
+        if occupied is not None and current is None:
+            # Preserve quarantined history for audit under a non-routable key,
+            # but never merge or expose it as part of a later verified chat.
+            occupied.funpay_chat_id = f"quarantine:{occupied.id}"
+            occupied.verified_sale = False
+            await session.flush()
 
         target = current or next(
             (item for item in conversations if item.buyer_funpay_id == buyer_id),
             None,
         )
+        if target is None:
+            target = ChatConversation(
+                funpay_chat_id=chat_id,
+                buyer_funpay_id=buyer_id,
+                verified_sale=True,
+            )
+            session.add(target)
+            await session.flush()
+            conversations.append(target)
         if target is not None and target.funpay_chat_id != chat_id:
             target.funpay_chat_id = chat_id
             await session.flush()
@@ -1132,7 +1318,10 @@ class SaleRegistryService:
         sales = list(
             (
                 await session.execute(
-                    select(FunPaySale).where(FunPaySale.buyer_funpay_id == buyer_id)
+                    select(FunPaySale).where(
+                        FunPaySale.buyer_funpay_id == buyer_id,
+                        managed_sale_order_exists(),
+                    )
                 )
             ).scalars()
         )
@@ -1141,7 +1330,10 @@ class SaleRegistryService:
         local_orders = list(
             (
                 await session.execute(
-                    select(Order).where(Order.buyer_funpay_id == buyer_id)
+                    select(Order).where(
+                        Order.buyer_funpay_id == buyer_id,
+                        exact_lot_binding_exists(Order),
+                    )
                 )
             ).scalars()
         )
@@ -1152,7 +1344,10 @@ class SaleRegistryService:
                 await session.execute(
                     select(Rental)
                     .join(Order, Order.id == Rental.order_id)
-                    .where(Order.buyer_funpay_id == buyer_id)
+                    .where(
+                        Order.buyer_funpay_id == buyer_id,
+                        exact_lot_binding_exists(Order),
+                    )
                 )
             ).scalars()
         )
@@ -1167,5 +1362,8 @@ class SaleRegistryService:
         order_id: str,
     ) -> FunPaySale | None:
         return await session.scalar(
-            select(FunPaySale).where(FunPaySale.funpay_order_id == order_id)
+            select(FunPaySale).where(
+                FunPaySale.funpay_order_id == order_id,
+                managed_sale_order_exists(),
+            )
         )

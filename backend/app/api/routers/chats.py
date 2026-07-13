@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -23,6 +24,7 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 service = ChatService()
+_ADMIN_REPLY_TIMEOUT_SECONDS = 30.0
 
 
 def get_online_chat_gateway(request: Request) -> ChatGateway:
@@ -104,8 +106,29 @@ async def send_chat_message(
     pending = await service.create_outgoing_pending(session, conversation, req.text)
     await session.commit()
 
+    # The outbox commit releases the initial authorization snapshot. Re-check
+    # the exact sale/order/lot chain before external I/O so a concurrent
+    # quarantine or chat rebind cannot send to the stale node.
     try:
-        funpay_message_id = await gateway.send_message(chat_id=chat_id, text=req.text)
+        authorized = await service.get_conversation(
+            session,
+            conversation_id,
+            lock_route=True,
+        )
+    except ConversationNotFoundError:
+        await service.mark_outgoing_failed(session, pending)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="Chat authorization changed")
+    if authorized.funpay_chat_id != str(chat_id):
+        await service.mark_outgoing_failed(session, pending)
+        await session.commit()
+        raise HTTPException(status_code=409, detail="Chat identifier changed")
+
+    try:
+        funpay_message_id = await asyncio.wait_for(
+            gateway.send_message(chat_id=chat_id, text=req.text),
+            timeout=_ADMIN_REPLY_TIMEOUT_SECONDS,
+        )
     except Exception:
         logger.exception("Failed to deliver admin reply to FunPay chat %s", chat_id)
         await service.mark_outgoing_failed(session, pending)
