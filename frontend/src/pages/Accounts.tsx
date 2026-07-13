@@ -469,7 +469,7 @@ function ValidationStatus({ account }: { account: Account }) {
       )}
       {nonBlockingFailure && (
         <small className="validation-state__warning" title={job.error_detail ?? job.error_code ?? undefined}>
-          Последняя фоновая проверка не завершилась: {job.error_detail ?? humanizeValidationError(job.error_code ?? '')}. Аккаунт остаётся активным по свежим токенам и лимитам.
+          Последняя фоновая проверка не завершилась: {(job.error_detail ?? humanizeValidationError(job.error_code ?? '')).replace(/[.!?]+$/u, '')}. Аккаунт остаётся активным по свежим токенам и лимитам.
         </small>
       )}
     </div>
