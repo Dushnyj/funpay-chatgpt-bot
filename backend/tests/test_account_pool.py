@@ -45,6 +45,9 @@ async def _add_account(
             if expires_in_days is not None
             else None
         ),
+        subscription_expiry_source=(
+            "accounts_check" if tier.code != "free" else None
+        ),
         status="active",
         max_active_rentals=max_active_rentals,
     )
@@ -80,6 +83,26 @@ async def test_acquire_returns_account_matching_basic_criteria(session: AsyncSes
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
     assert result is not None
     assert result.id == acc.id
+
+
+async def test_paid_account_without_openai_expiry_provenance_fails_closed(
+    session: AsyncSession,
+):
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    account.subscription_expiry_source = None
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=duration.minutes,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    assert await AccountPool().acquire(session, criteria, 1) is None
+    account.subscription_expiry_source = "id_token"
+    assert await AccountPool().acquire(session, criteria, 1) is not None
 
 
 async def test_acquire_returns_none_when_no_active_accounts(session: AsyncSession):
@@ -141,7 +164,9 @@ async def test_acquire_fresh_recheck_skips_conflicted_candidate(
     second = await _add_account(session, tier, login="second")
     deadline = datetime.now(timezone.utc) + timedelta(days=30)
     first.subscription_expires_at = deadline
+    first.subscription_expiry_source = "accounts_check"
     second.subscription_expires_at = deadline + timedelta(days=1)
+    second.subscription_expiry_source = "accounts_check"
     await session.flush()
     checked: list[int] = []
 
@@ -418,6 +443,7 @@ async def test_short_rental_reserves_delivery_subscription_headroom(
     account.subscription_expires_at = datetime.now(timezone.utc) + timedelta(
         minutes=60
     )
+    account.subscription_expiry_source = "accounts_check"
     criteria = AccountCriteria(
         tier_id=tier.id,
         duration_minutes=30,
@@ -431,6 +457,7 @@ async def test_short_rental_reserves_delivery_subscription_headroom(
     account.subscription_expires_at = datetime.now(timezone.utc) + timedelta(
         minutes=72
     )
+    account.subscription_expiry_source = "accounts_check"
     assert await AccountPool().acquire(session, criteria, 1) is not None
 
 

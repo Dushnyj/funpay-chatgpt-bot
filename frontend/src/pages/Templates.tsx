@@ -56,6 +56,7 @@ const MESSAGE_META: Record<string, MessageMeta> = {
   email_code_unavailable: { title: 'Почта недоступна', description: 'Автоматическое чтение почты не настроено', category: 'access' },
   help: { title: 'Справка', description: 'Команды, доступные покупателю', category: 'support' },
   seller_called: { title: 'Продавец вызван', description: 'Подтверждение вызова продавца', category: 'support' },
+  seller_required: { title: 'Нужен продавец', description: 'Автоматическая замена не завершена', category: 'replacement' },
   replace_success: { title: 'Замена выполнена', description: 'Новые данные после замены', category: 'replacement' },
   replace_declined: { title: 'Замена не нужна', description: 'Аккаунт работает корректно', category: 'replacement' },
   replace_no_account: { title: 'Нет аккаунта для замены', description: 'Свободная замена не найдена', category: 'replacement' },

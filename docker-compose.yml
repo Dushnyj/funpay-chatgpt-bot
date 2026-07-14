@@ -13,6 +13,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   backend:
     build:
@@ -29,6 +34,15 @@ services:
       - "127.0.0.1:8000:8000"
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    shm_size: "256m"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     init: true
     stop_grace_period: 30s
 

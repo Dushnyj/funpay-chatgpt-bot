@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,13 +17,19 @@ from app.integrations.funpay.types import (
     SaleStatus,
 )
 from app.models.chat import ChatConversation, ChatMessage
-from app.models.funpay_sale import FunPaySale, FunPaySaleSyncState
+from app.models.funpay_sale import (
+    FunPaySale,
+    FunPaySaleCandidate,
+    FunPaySaleSyncState,
+)
 from app.models.rental import Order, Rental
 from app.services.order_provenance import (
     exact_lot_binding_exists,
     is_exactly_bound_order,
     managed_sale_order_exists,
 )
+from app.services.order_processor import LotNotFoundError, OrderProcessor
+from app.services.order_notifications import OrderNotificationService
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +39,8 @@ _DETAIL_RETRY_MAX = timedelta(hours=24)
 _PROFILE_RETRY_BASE = timedelta(minutes=5)
 _PROFILE_RETRY_MAX = timedelta(hours=24)
 _PROFILE_REFRESH_TTL = timedelta(minutes=15)
+_RECOVERY_CANDIDATE_RETENTION = timedelta(days=90)
+_RECOVERY_MAX_ATTEMPTS = 12
 
 
 def _utcnow() -> datetime:
@@ -50,6 +58,29 @@ def _status_from_local_order(value: str) -> str:
         "refunded": SaleStatus.REFUNDED.value,
         "refund_pending": SaleStatus.REFUNDED.value,
     }.get(value, SaleStatus.UNKNOWN.value)
+
+
+_SALE_STATUS_RANK = {
+    SaleStatus.UNKNOWN.value: 0,
+    SaleStatus.PAID.value: 1,
+    SaleStatus.COMPLETED.value: 2,
+    SaleStatus.REFUNDED.value: 3,
+}
+
+
+def _merge_sale_status(current: str, incoming: SaleStatus | str) -> str:
+    """Keep delayed/duplicated FunPay events from regressing terminal state."""
+
+    incoming_value = _status_value(incoming)
+    current_rank = _SALE_STATUS_RANK.get(current)
+    incoming_rank = _SALE_STATUS_RANK.get(incoming_value)
+    if (
+        current_rank is not None
+        and incoming_rank is not None
+        and incoming_rank < current_rank
+    ):
+        return current
+    return incoming_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +258,10 @@ class SaleRegistryService:
         pages = []
         sync_state: FunPaySaleSyncState | None = None
         if order_id is not None:
+            # Serialize exact operator-triggered sync with the periodic
+            # history worker as well. This prevents duplicate candidate/order
+            # insertion when both paths inspect the same missed sale.
+            sync_state = await self._get_sync_state(session)
             pages.append(
                 await gateway.list_sales(
                     limit=limit,
@@ -283,10 +318,29 @@ class SaleRegistryService:
         for page in pages:
             for preview in page.sales:
                 previews_by_order.setdefault(preview.order_id, preview)
+        await self._upsert_recovery_candidates(
+            session,
+            list(previews_by_order.values()),
+        )
+        recovery_budget = max(
+            0,
+            detail_limit if order_id is not None else detail_limit - 1,
+        )
+        recovered, recovery_attempts, recovery_errors = (
+            await self._recover_sale_candidates(
+                session,
+                gateway,
+                sync_state=sync_state,
+                limit=recovery_budget,
+                order_id=order_id,
+            )
+        )
         preview_sales, imported = await self._upsert_previews(
             session,
             list(previews_by_order.values()),
         )
+        imported += recovered
+        await self._reconcile_terminal_orders(session, preview_sales)
         await self._reconcile_preview_conversations(session, preview_sales)
 
         # Exact-order QA sync force-enriches only that order. The normal queue
@@ -303,7 +357,7 @@ class SaleRegistryService:
                 sale for sale in preview_sales if sale.funpay_chat_id is None
             ]
         else:
-            queue_limit = max(0, detail_limit)
+            queue_limit = max(0, detail_limit - recovery_attempts)
             oldest = list(
                 (
                     await session.execute(
@@ -352,8 +406,9 @@ class SaleRegistryService:
                     ][: queue_limit - 1]
 
         enriched = 0
-        errors = 0
-        for sale in detail_candidates[: max(0, detail_limit)]:
+        errors = recovery_errors
+        detail_budget = max(0, detail_limit - recovery_attempts)
+        for sale in detail_candidates[:detail_budget]:
             try:
                 info = await gateway.get_order(sale.funpay_order_id)
                 if (
@@ -401,6 +456,336 @@ class SaleRegistryService:
             enrichment_errors=errors,
             history_errors=history_errors,
         )
+
+    async def _upsert_recovery_candidates(
+        self,
+        session: AsyncSession,
+        previews: list[SalePreviewInfo],
+    ) -> None:
+        """Queue seller-wide rows without granting them any authority."""
+
+        now = _utcnow()
+        oldest_allowed = now - _RECOVERY_CANDIDATE_RETENTION
+        # ``observed_at`` is the immutable first-seen timestamp.  Expiring all
+        # states by it keeps a permanently malformed or unavailable order page
+        # from growing the recovery table forever.  A remote creation time,
+        # when supplied by FunPay, also prevents ancient backfill pages from
+        # being re-queued after their tombstone expires.
+        await session.execute(
+            delete(FunPaySaleCandidate)
+            .where(
+                or_(
+                    FunPaySaleCandidate.observed_at < oldest_allowed,
+                    and_(
+                        FunPaySaleCandidate.observed_created_at.is_not(None),
+                        FunPaySaleCandidate.observed_created_at < oldest_allowed,
+                    ),
+                )
+            )
+            .execution_options(synchronize_session=False)
+        )
+        valid = {
+            preview.order_id: preview
+            for preview in previews
+            if (
+                preview.order_id
+                and preview.buyer_id > 0
+                and self._within_recovery_horizon(
+                    preview.created_at,
+                    oldest_allowed,
+                )
+            )
+        }
+        if not valid:
+            return
+        managed_ids = set((await session.execute(
+            select(Order.funpay_order_id).where(
+                Order.funpay_order_id.in_(list(valid)),
+                exact_lot_binding_exists(Order),
+            )
+        )).scalars())
+        existing = {
+            candidate.funpay_order_id: candidate
+            for candidate in (await session.execute(
+                select(FunPaySaleCandidate).where(
+                    FunPaySaleCandidate.funpay_order_id.in_(list(valid))
+                )
+            )).scalars()
+        }
+        for remote_id in managed_ids:
+            candidate = existing.get(remote_id)
+            if candidate is not None:
+                await session.delete(candidate)
+        for remote_id, preview in valid.items():
+            if remote_id in managed_ids:
+                continue
+            buyer_id = str(preview.buyer_id)
+            candidate = existing.get(remote_id)
+            if candidate is None:
+                session.add(FunPaySaleCandidate(
+                    funpay_order_id=remote_id,
+                    buyer_funpay_id=buyer_id,
+                    status=_status_value(preview.status),
+                    observed_created_at=preview.created_at,
+                    recovery_state="pending",
+                    observed_at=now,
+                    updated_at=now,
+                ))
+                continue
+            if candidate.buyer_funpay_id != buyer_id:
+                candidate.recovery_state = "ignored"
+                candidate.last_error = "preview_buyer_identity_changed"
+                candidate.next_attempt_at = None
+                candidate.updated_at = now
+                continue
+            merged_status = _merge_sale_status(
+                candidate.status, preview.status,
+            )
+            if merged_status != candidate.status:
+                candidate.status = merged_status
+                candidate.updated_at = now
+            if (
+                preview.created_at is not None
+                and preview.created_at != candidate.observed_created_at
+            ):
+                candidate.observed_created_at = preview.created_at
+                candidate.updated_at = now
+        await session.flush()
+
+    async def _recover_sale_candidates(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        *,
+        sync_state: FunPaySaleSyncState | None,
+        limit: int,
+        order_id: str | None,
+    ) -> tuple[int, int, int]:
+        """Promote only candidates whose exact order page proves our lot."""
+
+        if limit <= 0:
+            return 0, 0, 0
+        now = _utcnow()
+        if (
+            sync_state is not None
+            and self._future(sync_state.page_backoff_until, now)
+        ):
+            return 0, 0, 0
+        filters = [
+            FunPaySaleCandidate.recovery_state == "pending",
+            or_(
+                FunPaySaleCandidate.next_attempt_at.is_(None),
+                FunPaySaleCandidate.next_attempt_at <= now,
+            ),
+        ]
+        if order_id is not None:
+            filters.append(FunPaySaleCandidate.funpay_order_id == order_id)
+        oldest = list((await session.execute(
+            select(FunPaySaleCandidate)
+            .where(*filters)
+            .order_by(
+                FunPaySaleCandidate.attempts.asc(),
+                FunPaySaleCandidate.next_attempt_at.asc().nulls_first(),
+                FunPaySaleCandidate.observed_created_at.asc().nulls_first(),
+                FunPaySaleCandidate.id.asc(),
+            )
+            .limit(limit)
+        )).scalars())
+        candidates = oldest
+        if order_id is None and limit > 1:
+            newest = await session.scalar(
+                select(FunPaySaleCandidate)
+                .where(*filters)
+                .order_by(
+                    FunPaySaleCandidate.attempts.asc(),
+                    FunPaySaleCandidate.next_attempt_at.asc().nulls_first(),
+                    FunPaySaleCandidate.observed_created_at.desc().nulls_last(),
+                    FunPaySaleCandidate.id.desc(),
+                )
+                .limit(1)
+            )
+            if newest is not None:
+                candidates = [newest] + [
+                    item for item in oldest if item.id != newest.id
+                ][: limit - 1]
+
+        recovered = 0
+        attempted = 0
+        errors = 0
+        processor = OrderProcessor()
+        notifications = OrderNotificationService()
+        for candidate in candidates[:limit]:
+            attempted += 1
+            try:
+                info = await gateway.get_order(candidate.funpay_order_id)
+                if (
+                    info.order_id != candidate.funpay_order_id
+                    or info.buyer_id <= 0
+                    or str(info.buyer_id) != candidate.buyer_funpay_id
+                    or info.chat_id <= 0
+                ):
+                    candidate.recovery_state = "ignored"
+                    candidate.next_attempt_at = None
+                    candidate.last_error = "order_detail_identity_mismatch"
+                    logger.warning(
+                        "Rejected FunPay recovery candidate %s: identity mismatch",
+                        candidate.funpay_order_id,
+                    )
+                    continue
+                order = await processor.process_new_sale(
+                    session,
+                    gateway,
+                    candidate.funpay_order_id,
+                    info=info,
+                )
+                await self.register_new_sale(
+                    session,
+                    gateway,
+                    candidate.funpay_order_id,
+                    order=order,
+                    info=info,
+                )
+                # ``process_new_sale`` may have raced with the event callback
+                # and returned its pre-existing pending Order.  Record the
+                # authoritative terminal state before deleting the candidate,
+                # but keep revoke/fulfillment I/O out of the registry worker.
+                # A refund is staged for the verified refund scheduler.
+                self._reconcile_local_order_status(order, info.status)
+                if order.status == "completed":
+                    await notifications.mark_confirmed_due(session, order)
+                await session.flush()
+            except LotNotFoundError:
+                # Seller-wide history legitimately contains manual/external
+                # offers. Remember the exact rejection so they neither gain
+                # authority nor consume the order-page budget every cycle.
+                candidate.recovery_state = "ignored"
+                candidate.next_attempt_at = None
+                candidate.last_error = "no_exact_bot_lot_provenance"
+                continue
+            except InvalidSaleProvenanceError:
+                candidate.recovery_state = "ignored"
+                candidate.next_attempt_at = None
+                candidate.last_error = "invalid_sale_identity"
+                continue
+            except Exception as exc:
+                if not session.is_active:
+                    raise
+                errors += 1
+                global_error = self._is_global_funpay_error(exc)
+                if global_error:
+                    # Authentication, rate-limit and transport outages are
+                    # shared infrastructure failures.  They use the global
+                    # page backoff and must not exhaust one sale's retry
+                    # budget merely because it happened to be first in line.
+                    if sync_state is not None:
+                        self._defer_global_page_retry(sync_state, now)
+                        retry_at = sync_state.page_backoff_until
+                    else:
+                        retry_at = now + _DETAIL_RETRY_BASE
+                    candidate.next_attempt_at = retry_at
+                    candidate.last_error = type(exc).__name__[:128]
+                    candidate.updated_at = now
+                else:
+                    self._defer_recovery_retry(candidate, now, exc)
+                logger.info(
+                    "FunPay sale recovery deferred order=%s error=%s",
+                    candidate.funpay_order_id,
+                    type(exc).__name__,
+                )
+                if global_error:
+                    break
+                continue
+            await session.delete(candidate)
+            if sync_state is not None:
+                sync_state.page_backoff_attempts = 0
+                sync_state.page_backoff_until = None
+                sync_state.updated_at = now
+            recovered += 1
+        await session.flush()
+        return recovered, attempted, errors
+
+    @staticmethod
+    def _defer_recovery_retry(
+        candidate: FunPaySaleCandidate,
+        now: datetime,
+        exc: Exception,
+    ) -> None:
+        attempts = max(0, candidate.attempts) + 1
+        candidate.attempts = attempts
+        candidate.updated_at = now
+        if attempts >= _RECOVERY_MAX_ATTEMPTS:
+            candidate.recovery_state = "failed"
+            candidate.next_attempt_at = None
+            candidate.last_error = (
+                f"retry_exhausted:{type(exc).__name__}"
+            )[:128]
+            return
+        exponent = min(12, attempts - 1)
+        delay_seconds = min(
+            _DETAIL_RETRY_BASE.total_seconds() * (2**exponent),
+            _DETAIL_RETRY_MAX.total_seconds(),
+        )
+        candidate.next_attempt_at = now + timedelta(seconds=delay_seconds)
+        candidate.last_error = type(exc).__name__[:128]
+
+    @staticmethod
+    def _within_recovery_horizon(
+        value: datetime | None,
+        oldest_allowed: datetime,
+    ) -> bool:
+        if value is None:
+            return True
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value >= oldest_allowed
+
+    @staticmethod
+    async def _reconcile_terminal_orders(
+        session: AsyncSession,
+        sales: list[FunPaySale],
+    ) -> None:
+        """Apply terminal seller-preview state to exact managed Orders."""
+
+        notifications = OrderNotificationService()
+        for sale in sales:
+            if sale.status not in {
+                SaleStatus.COMPLETED.value,
+                SaleStatus.REFUNDED.value,
+            }:
+                continue
+            order = await session.get(Order, sale.order_id)
+            if order is None:
+                continue
+            SaleRegistryService._reconcile_local_order_status(
+                order,
+                sale.status,
+            )
+            if order.status == "completed":
+                await notifications.mark_confirmed_due(session, order)
+        await session.flush()
+
+    @staticmethod
+    def _reconcile_local_order_status(
+        order: Order,
+        remote_status: SaleStatus | str,
+    ) -> None:
+        """Stage terminal state monotonically without external side effects."""
+
+        status = _status_value(remote_status)
+        if (
+            status == SaleStatus.REFUNDED.value
+            and order.status not in {"refunded", "refund_pending"}
+        ):
+            # ``refund_pending`` makes the existing provenance-filtered
+            # scheduler perform the account-wide revoke.  Marking the Order
+            # refunded here would make that safety-critical side effect look
+            # complete and permanently skip it.
+            order.status = "refund_pending"
+        elif (
+            status == SaleStatus.COMPLETED.value
+            and order.status == "pending"
+        ):
+            order.status = "completed"
 
     @staticmethod
     def _detail_retry_due(sale: FunPaySale, now: datetime) -> bool:
@@ -707,7 +1092,7 @@ class SaleRegistryService:
         sale = await self._get_by_remote_order(session, order_id)
         if sale is None:
             return None
-        sale.status = _status_value(status)
+        sale.status = _merge_sale_status(sale.status, status)
         sale.updated_at = _utcnow()
         await session.flush()
         return sale
@@ -878,7 +1263,7 @@ class SaleRegistryService:
                     order_id,
                 )
                 continue
-            sale.status = _status_value(preview.status)
+            sale.status = _merge_sale_status(sale.status, preview.status)
             # The seller-wide preview has no chat node. Keep a pending null so
             # the bounded detail queue verifies it against the order page. A
             # non-null stale value can be repaired from the immutable Order.
@@ -1109,7 +1494,7 @@ class SaleRegistryService:
         now = _utcnow()
         sale.funpay_chat_id = str(info.chat_id)
         sale.buyer_funpay_id = str(info.buyer_id)
-        sale.status = _status_value(info.status)
+        sale.status = _merge_sale_status(sale.status, info.status)
         sale.buyer_username = info.buyer_username or sale.buyer_username
         has_profile = any(
             value is not None

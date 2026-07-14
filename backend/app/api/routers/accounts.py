@@ -226,7 +226,6 @@ async def create_account(req: AccountCreate, session: AsyncSession = Depends(get
         email=req.email,
         email_password_encrypted=req.email_password,
         tier_id=None,
-        subscription_expires_at=req.subscription_expires_at,
         max_active_rentals=req.max_active_rentals,
         notes=req.notes,
     )

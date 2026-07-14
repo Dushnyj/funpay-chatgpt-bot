@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     admin_cookie_secure: bool = True
     admin_login_max_attempts: int = Field(default=5, ge=1, le=100)
     admin_login_window_seconds: int = Field(default=300, ge=1, le=86400)
+    # Chromium is the dominant memory consumer. Keep one scheduled refresh or
+    # revoke at a time on the documented 2 GiB host unless explicitly raised.
+    browser_concurrency_cap: int = Field(default=1, ge=1, le=20)
     funpay_session_key: str = ""
     telegram_bot_token: str = ""
     telegram_seller_chat_id: str = ""

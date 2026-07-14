@@ -131,9 +131,38 @@ async def test_seed_upgrades_only_exact_legacy_limit_defaults(session):
     await session.refresh(customized_subscription)
 
     assert legacy_welcome.content == DEFAULT_MESSAGE_TEMPLATES["welcome"]["ru"]
-    assert "{codex_primary_window}" in legacy_welcome.content
+    assert "{codex_usage_summary}" in legacy_welcome.content
+    assert "{chat_5h}" not in legacy_welcome.content
+    assert "{codex_primary_window}" not in legacy_welcome.content
     assert "{access_expires_at}" not in legacy_welcome.content
     assert customized_subscription.content == "Мой шаблон: {tier}"
+
+
+@pytest.mark.asyncio
+async def test_seed_upgrades_exact_pre_order_qualified_copy(session):
+    previous = MessageTemplate(
+        key="rental_ambiguous",
+        lang="ru",
+        content=(
+            "В этом чате найдено несколько активных заказов. Откройте страницу "
+            "нужного заказа и отправьте команду из его чата."
+        ),
+    )
+    custom = MessageTemplate(
+        key="rental_ambiguous",
+        lang="en",
+        content="My operator copy",
+    )
+    session.add_all([previous, custom])
+    await session.commit()
+
+    await seed_message_templates(session)
+    await session.refresh(previous)
+    await session.refresh(custom)
+
+    assert previous.content == DEFAULT_MESSAGE_TEMPLATES["rental_ambiguous"]["ru"]
+    assert "{active_orders}" in previous.content
+    assert custom.content == "My operator copy"
 
 
 @pytest.mark.asyncio

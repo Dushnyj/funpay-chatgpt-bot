@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,9 +26,11 @@ from app.services.durations import (
     format_legacy_days,
     format_remaining_seconds,
 )
+from app.telegram_notifier import TelegramNotifier
 
 
 EXPIRY_MESSAGE_TIMEOUT_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 class RentalExpiryService:
@@ -36,9 +40,20 @@ class RentalExpiryService:
         self,
         kick_service: KickService | None = None,
         job_queue: CheckJobQueue | None = None,
+        *,
+        capacity_changed: Callable[[], None] | None = None,
     ) -> None:
         self._kick = kick_service or KickService()
         self._jobs = job_queue or CheckJobQueue()
+        self._capacity_changed = capacity_changed
+
+    def _notify_capacity_changed(self) -> None:
+        if self._capacity_changed is None:
+            return
+        try:
+            self._capacity_changed()
+        except Exception:
+            logger.exception("Failed to queue capacity reconciliation")
 
     async def expire_overdue(
         self,
@@ -88,7 +103,10 @@ class RentalExpiryService:
         await self._release_stale_replacement_reservations(session, now=now)
         candidate_result = await session.execute(
             select(Rental.id, Rental.order_id)
+            .join(Order, Order.id == Rental.order_id)
             .where(
+                exact_lot_binding_exists(Order),
+                verified_sale_for_order_exists(Order),
                 Rental.status.in_(["active", "expiry_pending"]),
                 Rental.expires_at <= now,
                 # Initial rental time starts only after credentials are
@@ -147,6 +165,23 @@ class RentalExpiryService:
             claim_started_at=claim_started_at,
             success=revoked,
         )
+        if finalized is not None and finalized.status == "expired":
+            try:
+                account = await session.get(Account, account_id)
+                notifier = await TelegramNotifier.from_settings(session)
+                if notifier is not None and account is not None:
+                    await asyncio.wait_for(
+                        notifier.notify_rental_expired(account.login),
+                        timeout=10.0,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to notify Telegram about expired rental %s",
+                    rental_id,
+                )
+            finally:
+                if session.in_transaction():
+                    await session.rollback()
         return finalized or rental
 
     async def pending_notification_candidates(
@@ -322,6 +357,7 @@ class RentalExpiryService:
             # The old account deliberately remains in maintenance: after a
             # process crash we cannot know whether external logout completed.
             await session.commit()
+            self._notify_capacity_changed()
 
     async def _claim_expiry_notification(
         self,
@@ -461,6 +497,14 @@ class RentalExpiryService:
             )
         ).scalar_one_or_none()
         if order is None or order.status in {"refund_pending", "refunded"}:
+            await session.commit()
+            return None
+        # Expiry performs the same account-wide logout as a refund.  The
+        # candidate query is only a scheduling optimisation; direct calls and
+        # rows changed between selection and claim must independently prove
+        # that this is an exact bot-managed sale before any rental/account
+        # state is changed.
+        if not await is_verified_bot_sale_order(session, order):
             await session.commit()
             return None
         rental = (

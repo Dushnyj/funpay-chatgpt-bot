@@ -14,6 +14,22 @@ class SaleStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class OfferSubscriptionOption(str, Enum):
+    """Exact values accepted by FunPay's ChatGPT subscription selector."""
+
+    WITH_SUBSCRIPTION = "С подпиской"
+    WITHOUT_SUBSCRIPTION = "Без подписки"
+
+
+class OfferSubscriptionType(str, Enum):
+    """Exact conditional values accepted by FunPay's plan selector."""
+
+    GO = "Go"
+    PLUS = "Plus"
+    PRO = "Pro"
+    BUSINESS = "Business"
+
+
 @dataclass(frozen=True)
 class OrderInfo:
     """DTO заказа FunPay, результат gateway.get_order()."""
@@ -114,6 +130,11 @@ class OfferFieldsDTO:
     title_en: str
     desc_ru: str
     desc_en: str
+    payment_msg_ru: str
+    payment_msg_en: str
+    subscription: OfferSubscriptionOption
+    subscription_type: OfferSubscriptionType | None
     price: float
+    amount: int
     active: bool
     auto_delivery: bool

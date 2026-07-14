@@ -35,6 +35,7 @@ async def _seed_full(session: AsyncSession):
         totp_secret_encrypted="plain_totp",
         tier_id=tier.id,
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
         status="active",
     )
     session.add(acc)
@@ -111,6 +112,7 @@ async def _add_account_with_limits(
         totp_secret_encrypted="plain_totp",
         tier_id=tier.id,
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=60),
+        subscription_expiry_source="accounts_check",
         status="active",
     )
     session.add(account)
@@ -165,6 +167,39 @@ async def test_fulfill_order_creates_rental_and_sends_welcome(session: AsyncSess
     assert "%%" not in text
 
 
+async def test_capacity_hook_runs_after_commit_before_credential_delivery(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    _tier, _duration, _scope, _account, order = await _seed_full(session)
+    events: list[str] = []
+
+    def capacity_changed() -> None:
+        # The allocation is already crash-safe before catalog work is queued.
+        assert session.in_transaction() is False
+        events.append("capacity")
+
+    class OrderedGateway(FakeChatGateway):
+        async def send_message(self, chat_id: int, text: str) -> int:
+            assert events == ["capacity"]
+            events.append("delivery")
+            return await super().send_message(chat_id, text)
+
+    rental = await RentalService(
+        capacity_changed=capacity_changed,
+    ).fulfill_order(
+        session,
+        OrderedGateway(),
+        order.id,
+        default_max_active_rentals=1,
+    )
+
+    assert rental is not None
+    assert events == ["capacity", "delivery"]
+
+
 async def test_fulfill_order_sends_no_account_message_when_pool_empty(session: AsyncSession):
     from app.services.seed_data import seed_message_templates
     await seed_message_templates(session)
@@ -172,12 +207,14 @@ async def test_fulfill_order_sends_no_account_message_when_pool_empty(session: A
     acc.status = "maintenance"
     await session.flush()
     gateway = FakeChatGateway()
-    svc = RentalService()
+    capacity_events: list[str] = []
+    svc = RentalService(capacity_changed=lambda: capacity_events.append("reconcile"))
 
     rental = await svc.fulfill_order(session, gateway, order.id, default_max_active_rentals=1)
 
     assert rental is None
     assert len(gateway.sent_messages) == 1
+    assert capacity_events == ["reconcile"]
 
 
 async def test_no_account_message_timeout_releases_order_transaction(

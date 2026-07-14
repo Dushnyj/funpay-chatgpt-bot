@@ -74,6 +74,7 @@ export interface Account {
   tier_id: number | null
   email: string | null
   subscription_expires_at: string | null
+  subscription_expiry_source?: 'accounts_check' | 'id_token' | null
   max_active_rentals: number | null
   active_rentals_count: number
   replacement_reserved: boolean
@@ -114,13 +115,11 @@ export interface AccountCreate {
   totp_secret?: string
   email?: string
   email_password?: string
-  subscription_expires_at?: string
   max_active_rentals?: number
   notes?: string
 }
 
 export interface AccountUpdate {
-  subscription_expires_at?: string | null
   max_active_rentals?: number | null
   status?: 'maintenance' | 'disabled'
   notes?: string | null
@@ -278,6 +277,10 @@ export interface Order {
   fulfillment_attempts: number
   fulfillment_next_attempt_at: string | null
   fulfillment_last_error: string | null
+  confirmation_delivery_status: string
+  confirmation_delivery_attempts: number
+  confirmation_delivery_next_attempt_at: string | null
+  confirmation_delivery_last_error: string | null
   created_at: string
 }
 

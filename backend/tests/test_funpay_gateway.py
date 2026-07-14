@@ -10,7 +10,30 @@ from app.integrations.funpay.types import (
     OfferInfo,
     SaleStatus,
     OfferFieldsDTO,
+    OfferSubscriptionOption,
+    OfferSubscriptionType,
 )
+
+
+def _offer_fields(**overrides) -> OfferFieldsDTO:
+    values = {
+        "offer_id": 0,
+        "subcategory_id": 55,
+        "title_ru": "Target",
+        "title_en": "Target",
+        "desc_ru": "",
+        "desc_en": "",
+        "payment_msg_ru": "Заказ принят.",
+        "payment_msg_en": "Order accepted.",
+        "subscription": OfferSubscriptionOption.WITH_SUBSCRIPTION,
+        "subscription_type": OfferSubscriptionType.PLUS,
+        "price": 599,
+        "amount": 1,
+        "active": True,
+        "auto_delivery": False,
+    }
+    values.update(overrides)
+    return OfferFieldsDTO(**values)
 
 
 @pytest.fixture
@@ -67,17 +90,7 @@ async def test_profile_gateway_maps_exact_user_and_normalizes_text():
 
 
 async def test_save_offer_returns_new_id_and_records(gw: FakeChatGateway):
-    fields = OfferFieldsDTO(
-        offer_id=0,
-        subcategory_id=55,
-        title_ru="T",
-        title_en="T",
-        desc_ru="",
-        desc_en="",
-        price=100.0,
-        active=True,
-        auto_delivery=False,
-    )
+    fields = _offer_fields(title_ru="T", title_en="T", price=100.0)
     new_id = await gw.save_offer_fields(fields)
     assert new_id > 0
     assert new_id in gw.saved_offers
@@ -87,29 +100,15 @@ async def test_save_offer_returns_new_id_and_records(gw: FakeChatGateway):
 
 
 async def test_save_offer_updates_existing(gw: FakeChatGateway):
-    fields = OfferFieldsDTO(
-        offer_id=0,
-        subcategory_id=55,
-        title_ru="Old",
-        title_en="Old",
-        desc_ru="",
-        desc_en="",
-        price=100.0,
-        active=True,
-        auto_delivery=False,
-    )
+    fields = _offer_fields(title_ru="Old", title_en="Old", price=100.0)
     new_id = await gw.save_offer_fields(fields)
 
-    updated = OfferFieldsDTO(
+    updated = _offer_fields(
         offer_id=new_id,
-        subcategory_id=55,
         title_ru="New",
         title_en="New",
-        desc_ru="",
-        desc_en="",
         price=200.0,
         active=False,
-        auto_delivery=False,
     )
     same_id = await gw.save_offer_fields(updated)
     assert same_id == new_id
@@ -152,7 +151,39 @@ def _preview(offer_id: int, title: str, price: float):
     )
 
 
+def _engine_offer_fields():
+    """Engine 0.7 field object shaped like the live node 1355 form."""
+    from funpaybotengine.types import OfferFields
+
+    return OfferFields(
+        raw_source="",
+        fields_dict={
+            "form_created_at": "1783991480",
+            "offer_id": "0",
+            "node_id": "55",
+            "location": "",
+            "deleted": "",
+            "fields[subscription]": "",
+            "fields[type]": "",
+            "fields[summary][ru]": "",
+            "fields[summary][en]": "",
+            "fields[desc][ru]": "",
+            "fields[desc][en]": "",
+            "fields[payment_msg][ru]": "",
+            "fields[payment_msg][en]": "",
+            "fields[images]": "",
+            "auto_delivery": "",
+            "secrets": "",
+            "price": "",
+            "amount": "",
+            "active": "on",
+        },
+    )
+
+
 async def test_engine_07_create_resolves_new_offer_id_from_snapshots():
+    from funpaybotengine.types.enums import SubcategoryType
+
     bot = SimpleNamespace(
         get_my_offers_page=AsyncMock(side_effect=[
             SimpleNamespace(offers={10: _preview(10, "Old", 10)}),
@@ -161,16 +192,53 @@ async def test_engine_07_create_resolves_new_offer_id_from_snapshots():
                 42: _preview(42, "Target", 599),
             }),
         ]),
-        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        get_offer_fields=AsyncMock(return_value=_engine_offer_fields()),
         save_offer_fields=AsyncMock(return_value=True),
     )
-    fields = OfferFieldsDTO(
-        offer_id=0, subcategory_id=55, title_ru="Target", title_en="Target",
-        desc_ru="", desc_en="", price=599, active=True, auto_delivery=False,
-    )
+    fields = _offer_fields()
 
     assert await FunPayChatGateway(bot).save_offer_fields(fields) == 42
     bot.save_offer_fields.assert_awaited_once()
+    bot.get_offer_fields.assert_awaited_once_with(
+        subcategory_type=SubcategoryType.OFFERS,
+        subcategory_id=55,
+    )
+    submitted = bot.save_offer_fields.await_args.args[0].fields_dict
+    assert submitted["fields[subscription]"] == "С подпиской"
+    assert submitted["fields[type]"] == "Plus"
+    assert submitted["fields[summary][ru]"] == "Target"
+    assert submitted["fields[summary][en]"] == "Target"
+    assert submitted["fields[desc][ru]"] == ""
+    assert submitted["fields[desc][en]"] == ""
+    assert submitted["fields[payment_msg][ru]"] == "Заказ принят."
+    assert submitted["fields[payment_msg][en]"] == "Order accepted."
+    assert submitted["price"] == "599"
+    assert submitted["amount"] == "1"
+    assert submitted["auto_delivery"] == ""
+    assert submitted["active"] == "on"
+
+
+async def test_engine_07_free_offer_clears_conditional_subscription_type():
+    fp_fields = _engine_offer_fields()
+    fp_fields.set_field("fields[type]", "Pro")
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(side_effect=[
+            SimpleNamespace(offers={}),
+            SimpleNamespace(offers={42: _preview(42, "Target", 599)}),
+        ]),
+        get_offer_fields=AsyncMock(return_value=fp_fields),
+        save_offer_fields=AsyncMock(return_value=True),
+    )
+    fields = _offer_fields(
+        subscription=OfferSubscriptionOption.WITHOUT_SUBSCRIPTION,
+        subscription_type=None,
+    )
+
+    assert await FunPayChatGateway(bot).save_offer_fields(fields) == 42
+
+    submitted = bot.save_offer_fields.await_args.args[0].fields_dict
+    assert submitted["fields[subscription]"] == "Без подписки"
+    assert submitted["fields[type]"] == ""
 
 
 async def test_engine_07_create_rejects_ambiguous_offer_id():
@@ -182,29 +250,20 @@ async def test_engine_07_create_rejects_ambiguous_offer_id():
                 42: _preview(42, "Target", 599),
             }),
         ]),
-        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        get_offer_fields=AsyncMock(return_value=_engine_offer_fields()),
         save_offer_fields=AsyncMock(return_value=True),
     )
-    fields = OfferFieldsDTO(
-        offer_id=0, subcategory_id=55, title_ru="Target", title_en="Target",
-        desc_ru="", desc_en="", price=599, active=True, auto_delivery=False,
-    )
+    fields = _offer_fields()
 
     with pytest.raises(FunPayOfferResolutionError):
         await FunPayChatGateway(bot).save_offer_fields(fields)
 
 
 async def test_engine_07_create_rejects_unrelated_sole_delta():
-    fields = OfferFieldsDTO(
-        offer_id=0,
-        subcategory_id=55,
+    fields = _offer_fields(
         title_ru="Нужный лот",
         title_en="Expected lot",
-        desc_ru="",
-        desc_en="",
         price=199,
-        active=True,
-        auto_delivery=False,
     )
     bot = SimpleNamespace(
         get_my_offers_page=AsyncMock(side_effect=[
@@ -213,7 +272,7 @@ async def test_engine_07_create_rejects_unrelated_sole_delta():
                 77: _preview(77, "Unrelated concurrent offer", 1),
             }),
         ]),
-        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        get_offer_fields=AsyncMock(return_value=_engine_offer_fields()),
         save_offer_fields=AsyncMock(return_value=True),
     )
 
@@ -224,15 +283,34 @@ async def test_engine_07_create_rejects_unrelated_sole_delta():
 async def test_engine_07_false_save_result_is_an_api_error():
     bot = SimpleNamespace(
         get_my_offers_page=AsyncMock(return_value=SimpleNamespace(offers={})),
-        get_offer_fields=AsyncMock(return_value=SimpleNamespace()),
+        get_offer_fields=AsyncMock(return_value=_engine_offer_fields()),
         save_offer_fields=AsyncMock(return_value=False),
     )
-    fields = OfferFieldsDTO(
-        offer_id=0, subcategory_id=55, title_ru="Target", title_en="Target",
-        desc_ru="", desc_en="", price=599, active=True, auto_delivery=False,
-    )
+    fields = _offer_fields()
     with pytest.raises(FunPayApiError):
         await FunPayChatGateway(bot).save_offer_fields(fields)
+
+
+async def test_real_gateway_rejects_missing_message_acknowledgement():
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=None))
+
+    with pytest.raises(FunPayApiError):
+        await FunPayChatGateway(bot).send_message(123, "hello")
+
+
+async def test_real_gateway_reads_full_offer_descriptions_for_provenance():
+    bot = SimpleNamespace(get_offer_fields=AsyncMock(return_value=SimpleNamespace(
+        desc_ru="Описание\n\n[FPBOT:0123456789abcdef0123456789abcdef]",
+        desc_en="   ",
+    )))
+
+    descriptions = await FunPayChatGateway(bot).get_offer_descriptions(77)
+
+    assert descriptions == (
+        "Описание\n\n[FPBOT:0123456789abcdef0123456789abcdef]",
+        None,
+    )
+    bot.get_offer_fields.assert_awaited_once_with(offer_id=77)
 
 
 from app.integrations.funpay.gateway import (

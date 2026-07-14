@@ -1,4 +1,5 @@
 import os
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,6 +23,12 @@ from app.api.routers.templates import router as templates_router
 from app.api.routers.metrics import router as metrics_router
 from app.api.deps import get_db_session
 from app.db.session import engine
+
+
+_APP_LOG_LEVEL = os.getenv("APP_LOG_LEVEL", "INFO").upper()
+logging.getLogger("app").setLevel(
+    getattr(logging, _APP_LOG_LEVEL, logging.INFO)
+)
 
 
 @asynccontextmanager
@@ -56,6 +63,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="FunPay ChatGPT Rental Bot", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def browser_security_headers(request: Request, call_next):
+    """Harden browser responses and make hash-chunk deploys recoverable."""
+
+    response = await call_next(request)
+    path = request.url.path
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), payment=()"
+    )
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; base-uri 'self'; object-src 'none'; "
+        "frame-ancestors 'none'; form-action 'self'; "
+        "img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; connect-src 'self'"
+    )
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    if path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
 app.include_router(auth_router)
 app.include_router(catalog_router)
 app.include_router(accounts_router)

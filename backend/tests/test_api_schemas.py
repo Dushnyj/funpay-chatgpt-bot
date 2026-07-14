@@ -1,5 +1,8 @@
+import pytest
+from pydantic import ValidationError
+
 from app.api.schemas import (
-    AccountOut, AccountCreate, TierOut, DurationOut,
+    AccountOut, AccountCreate, AccountUpdate, TierOut, DurationOut,
     LotOut, OrderOut, RentalOut, SettingsOut, SettingsUpdate,
     MetricsOut, PriceMatrixItem, TemplateOut,
 )
@@ -10,6 +13,21 @@ def test_account_out_excludes_secrets():
     fields = AccountOut.model_fields
     assert "password_encrypted" not in fields
     assert "totp_secret_encrypted" not in fields
+
+
+def test_account_write_schemas_reject_manual_subscription_expiry():
+    assert "subscription_expires_at" not in AccountCreate.model_fields
+    assert "subscription_expires_at" not in AccountUpdate.model_fields
+    with pytest.raises(ValidationError):
+        AccountCreate.model_validate({
+            "login": "account@example.com",
+            "password": "password",
+            "subscription_expires_at": "2026-08-01T00:00:00Z",
+        })
+    with pytest.raises(ValidationError):
+        AccountUpdate.model_validate({
+            "subscription_expires_at": "2026-08-01T00:00:00Z",
+        })
 
 
 def test_tier_out():

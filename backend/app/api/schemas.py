@@ -159,6 +159,7 @@ class AccountOut(_Base):
     tier_id: int | None = None
     email: str | None = None
     subscription_expires_at: datetime | None = None
+    subscription_expiry_source: str | None = None
     max_active_rentals: int | None = None
     active_rentals_count: int = 0
     replacement_reserved: bool = False
@@ -181,18 +182,34 @@ class AccountCreate(BaseModel):
     totp_secret: str = Field(default="", max_length=256)
     email: str | None = Field(default=None, max_length=320)
     email_password: str | None = Field(default=None, max_length=4096)
-    subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = Field(default=None, ge=1, le=1)
     notes: str | None = Field(default=None, max_length=4000)
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_manual_subscription_expiry(cls, value):
+        if isinstance(value, dict) and "subscription_expires_at" in value:
+            raise ValueError(
+                "subscription expiry is measured automatically by OpenAI"
+            )
+        return value
+
 
 class AccountUpdate(BaseModel):
-    subscription_expires_at: datetime | None = None
     max_active_rentals: int | None = Field(default=None, ge=1, le=1)
     # A human operator may suspend an account, but cannot certify credentials.
     # Returning to active always goes through the recheck endpoint.
     status: Literal["maintenance", "disabled"] | None = None
     notes: str | None = Field(default=None, max_length=4000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_manual_subscription_expiry(cls, value):
+        if isinstance(value, dict) and "subscription_expires_at" in value:
+            raise ValueError(
+                "subscription expiry is measured automatically by OpenAI"
+            )
+        return value
 
     @field_validator("status", mode="before")
     @classmethod
@@ -417,6 +434,10 @@ class OrderOut(_Base):
     fulfillment_attempts: int
     fulfillment_next_attempt_at: datetime | None = None
     fulfillment_last_error: str | None = None
+    confirmation_delivery_status: str
+    confirmation_delivery_attempts: int
+    confirmation_delivery_next_attempt_at: datetime | None = None
+    confirmation_delivery_last_error: str | None = None
     created_at: datetime
 
 

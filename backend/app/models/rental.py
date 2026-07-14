@@ -39,6 +39,12 @@ class Order(Base):
             "ix_orders_fulfillment_next_attempt_at",
             "fulfillment_next_attempt_at",
         ),
+        Index(
+            "ix_orders_confirmation_delivery_retry",
+            "confirmation_delivery_status",
+            "confirmation_delivery_next_attempt_at",
+            "created_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -72,6 +78,18 @@ class Order(Base):
         DateTime(timezone=True), default=None
     )
     fulfillment_last_error: Mapped[str | None] = mapped_column(
+        String(128), default=None
+    )
+    confirmation_delivery_status: Mapped[str] = mapped_column(
+        String(16), default="idle"
+    )
+    confirmation_delivery_attempts: Mapped[int] = mapped_column(
+        Integer, default=0
+    )
+    confirmation_delivery_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    confirmation_delivery_last_error: Mapped[str | None] = mapped_column(
         String(128), default=None
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

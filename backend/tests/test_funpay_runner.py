@@ -109,6 +109,9 @@ async def test_runner_tracks_listener_and_gateway_uses_same_bot():
         update=AsyncMock(),
         listen_events=AsyncMock(side_effect=_listen),
         stop_listening=AsyncMock(),
+        userid=123,
+        username="seller",
+        session=SimpleNamespace(close=AsyncMock()),
     )
     runner = FunPayRunner(
         "key", RunnerCallbacks(), 1,
@@ -133,6 +136,27 @@ async def test_runner_tracks_listener_and_gateway_uses_same_bot():
     await runner.stop()
     assert runner.listener_task is None
     bot.stop_listening.assert_awaited_once()
+    bot.session.close.assert_awaited_once()
+
+
+async def test_runner_prepare_rejects_anonymous_or_invalid_session():
+    from app.integrations.funpay.exceptions import GoldenKeyError
+
+    bot = SimpleNamespace(
+        update=AsyncMock(),
+        userid=-1,
+        username="",
+    )
+    runner = FunPayRunner(
+        "invalid-key", RunnerCallbacks(), 1,
+        bot=bot, dispatcher=object(),
+    )
+
+    with pytest.raises(GoldenKeyError):
+        await runner.prepare()
+
+    assert runner.started is False
+    assert runner._prepared is False
 
 
 async def test_runner_sale_handlers_keep_distinct_callbacks():

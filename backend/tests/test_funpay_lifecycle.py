@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 import pytest
 from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
@@ -6,11 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.integrations.funpay.gateway import FakeChatGateway
 from app.integrations.funpay.runner import RunnerCallbacks
 from app.integrations.funpay.types import MessageInfo, OrderInfo, SaleStatus
+from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.funpay_sale import FunPaySale
 from app.models.lot import Lot
-from app.models.rental import Order
+from app.models.rental import Order, Rental
 from app.services.funpay_lifecycle import build_callbacks
 from app.services.sale_registry import SaleRegistryService
 
@@ -48,6 +50,66 @@ async def _seed_verified_sale(
         status="paid",
     ))
     await session.flush()
+
+
+async def _seed_active_rental(
+    session: AsyncSession,
+    *,
+    order_id: str,
+    chat_id: int,
+    buyer_id: int,
+    login: str,
+    totp_secret: str,
+) -> Rental:
+    await _seed_verified_sale(
+        session,
+        order_id=order_id,
+        chat_id=chat_id,
+        buyer_id=buyer_id,
+    )
+    order = await session.scalar(
+        select(Order).where(Order.funpay_order_id == order_id)
+    )
+    lot = await session.get(Lot, order.lot_id)
+    account = Account(
+        login=login,
+        password_encrypted="enc",
+        totp_secret_encrypted=totp_secret,
+        tier_id=lot.tier_id,
+        status="active",
+        subscription_expires_at=(
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ),
+    )
+    session.add(account)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="enc",
+        measured_at=datetime.now(timezone.utc),
+        refresh_status="ok",
+        plan_window_status="ok",
+    ))
+    rental = Rental(
+        order_id=order.id,
+        account_id=account.id,
+        buyer_funpay_id=str(buyer_id),
+        buyer_funpay_chat_id=str(chat_id),
+        tier_id=lot.tier_id,
+        duration_id=lot.duration_id,
+        limit_scope_id=lot.limit_scope_id,
+        lang="ru",
+        started_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+        status="active",
+        credentials_delivery_status="sent",
+        credentials_delivery_template="welcome",
+        credentials_delivery_attempts=1,
+        credentials_delivered_at=datetime.now(timezone.utc),
+    )
+    session.add(rental)
+    await session.flush()
+    return rental
 
 
 async def _seed_lot(session: AsyncSession) -> int:
@@ -112,6 +174,155 @@ async def test_on_new_sale_callback_processes_order(session: AsyncSession):
     await callbacks.on_new_sale("ord-1")  # type: ignore
     result = await session.execute(select(Order).where(Order.funpay_order_id == "ord-1"))
     assert result.scalar_one_or_none() is not None
+
+
+async def test_telegram_failure_does_not_block_new_sale_fulfillment(
+    session: AsyncSession,
+):
+    await _seed_lot(session)
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="telegram-down",
+        status=SaleStatus.PAID,
+        chat_id=101,
+        buyer_id=201,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+    notifier = AsyncMock()
+    call_order: list[str] = []
+
+    async def fail_telegram(*_args):
+        call_order.append("telegram")
+        raise RuntimeError("telegram unavailable")
+
+    async def fulfill_first(*_args, **_kwargs):
+        call_order.append("fulfill")
+        return None
+
+    notifier.notify_new_order.side_effect = fail_telegram
+
+    with (
+        patch(
+            "app.services.funpay_lifecycle.TelegramNotifier.from_settings",
+            new=AsyncMock(return_value=notifier),
+        ),
+        patch(
+            "app.services.funpay_lifecycle.RentalService.fulfill_order",
+            new=AsyncMock(side_effect=fulfill_first),
+        ) as fulfill,
+    ):
+        callbacks = build_callbacks(
+            session_factory=lambda: session,
+            gateway=gateway,
+        )
+        await callbacks.on_new_sale("telegram-down")  # type: ignore[misc]
+
+    fulfill.assert_awaited_once()
+    assert call_order == ["fulfill", "telegram"]
+
+
+@pytest.mark.parametrize(
+    ("remote_status", "expected_local_status"),
+    [
+        (SaleStatus.REFUNDED, "refunded"),
+        (SaleStatus.UNKNOWN, "pending"),
+    ],
+)
+async def test_non_fulfillable_new_sale_never_discloses_credentials(
+    session: AsyncSession,
+    remote_status: SaleStatus,
+    expected_local_status: str,
+):
+    await _seed_lot(session)
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id=f"intake-{remote_status.value}",
+        status=remote_status,
+        chat_id=102,
+        buyer_id=202,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    with patch(
+        "app.services.funpay_lifecycle.RentalService.fulfill_order",
+        new=AsyncMock(return_value=None),
+    ) as fulfill:
+        callbacks = build_callbacks(
+            session_factory=lambda: session,
+            gateway=gateway,
+        )
+        await callbacks.on_new_sale(  # type: ignore[misc]
+            f"intake-{remote_status.value}",
+        )
+
+    order = await session.scalar(
+        select(Order).where(
+            Order.funpay_order_id == f"intake-{remote_status.value}"
+        )
+    )
+    assert order is not None
+    assert order.status == expected_local_status
+    fulfill.assert_not_awaited()
+
+
+async def test_delayed_paid_new_sale_does_not_resurrect_refunded_order(
+    session: AsyncSession,
+):
+    await _seed_verified_sale(
+        session,
+        order_id="delayed-paid-after-refund",
+        chat_id=103,
+        buyer_id=203,
+    )
+    order = await session.scalar(select(Order).where(
+        Order.funpay_order_id == "delayed-paid-after-refund",
+    ))
+    sale = await session.scalar(select(FunPaySale).where(
+        FunPaySale.funpay_order_id == "delayed-paid-after-refund",
+    ))
+    assert order is not None and sale is not None
+    order.status = "refunded"
+    sale.status = SaleStatus.REFUNDED.value
+    await session.commit()
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id=order.funpay_order_id,
+        status=SaleStatus.PAID,
+        chat_id=103,
+        buyer_id=203,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    with patch(
+        "app.services.funpay_lifecycle.RentalService.fulfill_order",
+        new=AsyncMock(return_value=None),
+    ) as fulfill:
+        callbacks = build_callbacks(
+            session_factory=lambda: session,
+            gateway=gateway,
+        )
+        await callbacks.on_new_sale(order.funpay_order_id)  # type: ignore[misc]
+
+    persisted_order = await session.scalar(select(Order).where(
+        Order.funpay_order_id == "delayed-paid-after-refund",
+    ))
+    persisted_sale = await session.scalar(select(FunPaySale).where(
+        FunPaySale.funpay_order_id == "delayed-paid-after-refund",
+    ))
+    assert persisted_order is not None and persisted_order.status == "refunded"
+    assert persisted_sale is not None
+    assert persisted_sale.status == SaleStatus.REFUNDED.value
+    fulfill.assert_not_awaited()
+    assert gateway.sent_messages == []
 
 
 async def test_new_sale_continues_after_concurrent_registry_insert(
@@ -192,6 +403,152 @@ async def test_on_sale_closed_callback_updates_status(session: AsyncSession):
     assert order.status == "completed"
 
 
+async def test_sale_close_notifies_exact_buyer_once(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    await _seed_lot(session)
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="close-once",
+        status=SaleStatus.PAID,
+        chat_id=321,
+        buyer_id=654,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    with patch(
+        "app.services.funpay_lifecycle.RentalService.fulfill_order",
+        new=AsyncMock(return_value=None),
+    ):
+        callbacks = build_callbacks(
+            session_factory=lambda: session,
+            gateway=gateway,
+        )
+        await callbacks.on_new_sale("close-once")  # type: ignore[misc]
+        gateway.sent_messages.clear()
+        await callbacks.on_sale_closed("close-once")  # type: ignore[misc]
+        await callbacks.on_sale_closed("close-once")  # type: ignore[misc]
+
+    assert len(gateway.sent_messages) == 1
+    assert gateway.sent_messages[0][0] == 321
+
+
+async def test_completed_sale_at_intake_notifies_exact_buyer(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    await _seed_lot(session)
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="completed-at-intake",
+        status=SaleStatus.COMPLETED,
+        chat_id=322,
+        buyer_id=655,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    with patch(
+        "app.services.funpay_lifecycle.RentalService.fulfill_order",
+        new=AsyncMock(return_value=None),
+    ):
+        callbacks = build_callbacks(
+            session_factory=lambda: session,
+            gateway=gateway,
+        )
+        await callbacks.on_new_sale("completed-at-intake")  # type: ignore[misc]
+
+    assert len(gateway.sent_messages) == 1
+    assert gateway.sent_messages[0][0] == 322
+
+
+async def test_failed_buyer_confirmation_retries_on_duplicate_close(
+    session: AsyncSession,
+):
+    from app.models.audit import AuditLog
+    from app.services.order_notifications import BUYER_ORDER_CONFIRMED_EVENT
+    from app.services.seed_data import seed_message_templates
+
+    class FailFirstConfirmationGateway(FakeChatGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.confirmation_attempts = 0
+
+        async def send_message(self, chat_id: int, text: str) -> int:
+            self.confirmation_attempts += 1
+            if self.confirmation_attempts == 1:
+                raise RuntimeError("temporary FunPay send failure")
+            return await super().send_message(chat_id, text)
+
+    await seed_message_templates(session)
+    await _seed_lot(session)
+    gateway = FailFirstConfirmationGateway()
+    gateway.set_order(OrderInfo(
+        order_id="close-retry",
+        status=SaleStatus.PAID,
+        chat_id=323,
+        buyer_id=656,
+        subcategory_id=55,
+        title="T",
+        price=599.0,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    with patch(
+        "app.services.funpay_lifecycle.RentalService.fulfill_order",
+        new=AsyncMock(return_value=None),
+    ):
+        callbacks = build_callbacks(
+            session_factory=lambda: session,
+            gateway=gateway,
+        )
+        await callbacks.on_new_sale("close-retry")  # type: ignore[misc]
+        await callbacks.on_sale_closed("close-retry")  # type: ignore[misc]
+        assert await session.scalar(select(AuditLog.id).where(
+            AuditLog.event_type == BUYER_ORDER_CONFIRMED_EVENT,
+        )) is None
+
+        order = await session.scalar(
+            select(Order).where(Order.funpay_order_id == "close-retry")
+        )
+        assert order is not None
+        assert order.confirmation_delivery_status == "failed"
+        assert order.confirmation_delivery_attempts == 1
+        assert order.confirmation_delivery_next_attempt_at is not None
+
+        # A duplicate callback must respect the per-order retry backoff instead
+        # of hammering the same broken FunPay chat immediately.
+        await callbacks.on_sale_closed("close-retry")  # type: ignore[misc]
+        assert gateway.confirmation_attempts == 1
+
+        order = await session.scalar(
+            select(Order).where(Order.funpay_order_id == "close-retry")
+        )
+        assert order is not None
+        order.confirmation_delivery_next_attempt_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        )
+        await session.commit()
+        await callbacks.on_sale_closed("close-retry")  # type: ignore[misc]
+
+    assert gateway.confirmation_attempts == 2
+    assert len(gateway.sent_messages) == 1
+    assert gateway.sent_messages[0][0] == 323
+    assert await session.scalar(select(AuditLog.id).where(
+        AuditLog.event_type == BUYER_ORDER_CONFIRMED_EVENT,
+    )) is not None
+
+
 async def test_unmatched_sale_never_creates_provenance_or_chat(
     session: AsyncSession,
 ):
@@ -238,6 +595,116 @@ async def test_on_message_callback_dispatches_command(session: AsyncSession):
     # Распознанная команда без зарегистрированного хэндлера → UnhandledMessage,
     # но lifecycle ловит и логирует (не падает)
     await callbacks.on_message(msg)  # type: ignore
+
+
+async def test_generic_chat_order_reference_routes_to_exact_active_rental(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    first = await _seed_active_rental(
+        session,
+        order_id="HHHGNZ4N",
+        chat_id=909,
+        buyer_id=200,
+        login="first@example.test",
+        totp_secret="FIRSTSECRETTOTP",
+    )
+    second = await _seed_active_rental(
+        session,
+        order_id="XQGVAQ85",
+        chat_id=909,
+        buyer_id=200,
+        login="second@example.test",
+        totp_secret="SECONDSECRETTOTP",
+    )
+    first_rental_id = first.id
+    second_rental_id = second.id
+    first_order_id = first.order_id
+    second_order_id = second.order_id
+    gateway = FakeChatGateway()
+    gateway.set_order(OrderInfo(
+        order_id="XQGVAQ85",
+        status=SaleStatus.PAID,
+        chat_id=909,
+        buyer_id=200,
+        subcategory_id=55,
+        title="ChatGPT",
+        price=100,
+        offer_id=5001,
+    ))
+    callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
+    message = MessageInfo(
+        message_id=503,
+        chat_id=909,
+        sender_id=200,
+        text="!code #xqgvaq85",
+        order_id=None,
+    )
+
+    with patch(
+        "app.services.command_handlers.generate_totp",
+        return_value="654321",
+    ) as generate:
+        await callbacks.on_message(message)  # type: ignore[misc]
+
+    generate.assert_called_once_with("SECONDSECRETTOTP")
+    assert len(gateway.sent_messages) == 1
+    assert "654321" in gateway.sent_messages[0][1]
+    first = await session.get(Rental, first_rental_id)
+    second = await session.get(Rental, second_rental_id)
+    first_order = await session.get(Order, first_order_id)
+    second_order = await session.get(Order, second_order_id)
+    assert first.lang == "ru"
+    assert first_order.buyer_locale == "ru"
+    assert second.lang == "en"
+    assert second_order.buyer_locale == "en"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["!code #FOREIGN1", "!code XQGVAQ85", "!code #TOO-SHRT"],
+)
+async def test_generic_chat_foreign_or_malformed_reference_discloses_nothing(
+    session: AsyncSession,
+    text: str,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_active_rental(
+        session,
+        order_id="XQGVAQ85",
+        chat_id=910,
+        buyer_id=200,
+        login="owned@example.test",
+        totp_secret="OWNEDSECRETTOTP",
+    )
+    rental_id = rental.id
+    order_id = rental.order_id
+    gateway = FakeChatGateway()
+    callbacks = build_callbacks(session_factory=lambda: session, gateway=gateway)
+    message = MessageInfo(
+        message_id=504,
+        chat_id=910,
+        sender_id=200,
+        text=text,
+        order_id=None,
+    )
+
+    with patch("app.services.command_handlers.generate_totp") as generate:
+        await callbacks.on_message(message)  # type: ignore[misc]
+
+    generate.assert_not_called()
+    assert len(gateway.sent_messages) == 1
+    assert "OWNEDSECRETTOTP" not in gateway.sent_messages[0][1]
+    assert "XQGVAQ85" not in gateway.sent_messages[0][1]
+    assert "No active access" in gateway.sent_messages[0][1]
+    rental = await session.get(Rental, rental_id)
+    order = await session.get(Order, order_id)
+    assert rental.lang == "ru"
+    assert order.buyer_locale == "ru"
 
 
 async def test_on_message_callback_persists_incoming_and_is_idempotent(session: AsyncSession):
@@ -345,6 +812,7 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
         tier_id=tier.id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(acc)
     await session.flush()

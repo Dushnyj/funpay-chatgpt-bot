@@ -12,6 +12,7 @@ from app.integrations.funpay.types import (
     OrderInfo,
     OfferInfo,
     OfferFieldsDTO,
+    OfferSubscriptionOption,
     SalePreviewInfo,
     SalePreviewPage,
 )
@@ -39,6 +40,13 @@ class ChatGateway(Protocol):
 
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
         """Получить список своих лотов в подкатегории."""
+        ...
+
+    async def get_offer_descriptions(
+        self,
+        offer_id: int,
+    ) -> tuple[str | None, str | None]:
+        """Return the full localized descriptions for provenance checks."""
         ...
 
     async def list_sales(
@@ -104,6 +112,49 @@ class FakeChatGateway:
     def set_my_offers(self, subcategory_id: int, offers: list[OfferInfo]) -> None:
         self._my_offers[subcategory_id] = offers
 
+    def set_offer_descriptions(
+        self,
+        offer_id: int,
+        *,
+        desc_ru: str | None,
+        desc_en: str | None,
+    ) -> None:
+        existing = self.saved_offers.get(offer_id)
+        if existing is None:
+            self.saved_offers[offer_id] = OfferFieldsDTO(
+                offer_id=offer_id,
+                subcategory_id=0,
+                title_ru="",
+                title_en="",
+                desc_ru=desc_ru or "",
+                desc_en=desc_en or "",
+                payment_msg_ru="",
+                payment_msg_en="",
+                subscription=OfferSubscriptionOption.WITHOUT_SUBSCRIPTION,
+                subscription_type=None,
+                price=0,
+                amount=1,
+                active=False,
+                auto_delivery=False,
+            )
+            return
+        self.saved_offers[offer_id] = OfferFieldsDTO(
+            offer_id=existing.offer_id,
+            subcategory_id=existing.subcategory_id,
+            title_ru=existing.title_ru,
+            title_en=existing.title_en,
+            desc_ru=desc_ru or "",
+            desc_en=desc_en or "",
+            payment_msg_ru=existing.payment_msg_ru,
+            payment_msg_en=existing.payment_msg_en,
+            subscription=existing.subscription,
+            subscription_type=existing.subscription_type,
+            price=existing.price,
+            amount=existing.amount,
+            active=existing.active,
+            auto_delivery=existing.auto_delivery,
+        )
+
     def set_category_id(self, subcategory_id: int, category_id: int) -> None:
         self._category_ids[subcategory_id] = category_id
 
@@ -164,7 +215,12 @@ class FakeChatGateway:
                 title_en=fields.title_en,
                 desc_ru=fields.desc_ru,
                 desc_en=fields.desc_en,
+                payment_msg_ru=fields.payment_msg_ru,
+                payment_msg_en=fields.payment_msg_en,
+                subscription=fields.subscription,
+                subscription_type=fields.subscription_type,
                 price=fields.price,
+                amount=fields.amount,
                 active=fields.active,
                 auto_delivery=fields.auto_delivery,
             )
@@ -179,6 +235,15 @@ class FakeChatGateway:
 
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
         return self._my_offers.get(subcategory_id, [])
+
+    async def get_offer_descriptions(
+        self,
+        offer_id: int,
+    ) -> tuple[str | None, str | None]:
+        fields = self.saved_offers.get(offer_id)
+        if fields is None:
+            return None, None
+        return fields.desc_ru, fields.desc_en
 
     async def get_category_id(self, subcategory_id: int) -> int | None:
         return self._category_ids.get(subcategory_id)
@@ -323,7 +388,12 @@ class FunPayChatGateway:
 
     async def send_message(self, chat_id: int, text: str) -> int:
         msg = await self._bot.send_message(chat_id=chat_id, text=text)
-        return msg.id if msg else 0
+        if msg is None:
+            # Callers persist buyer-visible delivery markers immediately after
+            # this method returns. A missing message object is not a confirmed
+            # send and must therefore enter the normal retry/manual path.
+            raise FunPayApiError(0, "send_message returned no message")
+        return int(msg.id)
 
     async def get_order(self, order_id: str) -> OrderInfo:
         page = await self._bot.get_order_page(order_id=order_id)
@@ -371,6 +441,12 @@ class FunPayChatGateway:
         if self._bot is None:
             raise RuntimeError("FunPayChatGateway requires a bound Bot")
 
+        # FunPayBotEngine 0.7 requires the subcategory namespace together
+        # with its numeric ID when fields for a new offer are requested.
+        # Passing only ``subcategory_id`` leaves the bot connected but makes
+        # every automatic lot creation fail before the first save request.
+        from funpaybotengine.types.enums import SubcategoryType
+
         before: list[OfferInfo] = []
         if fields.offer_id <= 0:
             before = await self.get_my_offers(fields.subcategory_id)
@@ -378,12 +454,23 @@ class FunPayChatGateway:
         if fields.offer_id > 0:
             fp_fields = await self._bot.get_offer_fields(offer_id=fields.offer_id)
         else:
-            fp_fields = await self._bot.get_offer_fields(subcategory_id=fields.subcategory_id)
+            fp_fields = await self._bot.get_offer_fields(
+                subcategory_type=SubcategoryType.OFFERS,
+                subcategory_id=fields.subcategory_id,
+            )
         fp_fields.title_ru = fields.title_ru
         fp_fields.title_en = fields.title_en
         fp_fields.desc_ru = fields.desc_ru
         fp_fields.desc_en = fields.desc_en
+        fp_fields.payment_msg_ru = fields.payment_msg_ru
+        fp_fields.payment_msg_en = fields.payment_msg_en
+        fp_fields.set_field("fields[subscription]", fields.subscription.value)
+        fp_fields.set_field(
+            "fields[type]",
+            fields.subscription_type.value if fields.subscription_type else "",
+        )
         fp_fields.price = fields.price
+        fp_fields.amount = fields.amount
         fp_fields.active = fields.active
         fp_fields.auto_delivery = fields.auto_delivery
         if fields.offer_id > 0:
@@ -417,6 +504,16 @@ class FunPayChatGateway:
                 auto_delivery=info.auto_delivery,
             ))
         return result
+
+    async def get_offer_descriptions(
+        self,
+        offer_id: int,
+    ) -> tuple[str | None, str | None]:
+        fields = await self._bot.get_offer_fields(offer_id=offer_id)
+        return (
+            _clean_optional_text(getattr(fields, "desc_ru", None)),
+            _clean_optional_text(getattr(fields, "desc_en", None)),
+        )
 
     async def get_category_id(self, subcategory_id: int) -> int | None:
         page = await self._bot.get_my_offers_page(subcategory_id=subcategory_id)

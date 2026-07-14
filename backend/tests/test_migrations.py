@@ -516,6 +516,303 @@ def test_0018_generates_transactional_postgresql_upgrade_and_downgrade_sql():
     assert "COMMIT;" in downgrade_sql
 
 
+async def test_0019_adds_isolated_sale_recovery_queue_and_resets_backfill(
+    tmp_path,
+    monkeypatch,
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'sale-recovery-0019.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260714_0018")
+
+    await asyncio.to_thread(command.upgrade, config, "20260714_0019")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        version = (
+            await connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            )
+        ).scalar_one()
+        sync_state = (
+            await connection.execute(text(
+                "SELECT backfill_cursor, backfill_complete "
+                "FROM funpay_sale_sync_state WHERE id=1"
+            ))
+        ).one()
+        schema = await connection.run_sync(
+            lambda sync_connection: {
+                "tables": set(inspect(sync_connection).get_table_names()),
+                "columns": {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns(
+                        "funpay_sale_candidates"
+                    )
+                },
+                "indexes": {
+                    index["name"]
+                    for index in inspect(sync_connection).get_indexes(
+                        "funpay_sale_candidates"
+                    )
+                },
+                "audit_indexes": {
+                    index["name"]
+                    for index in inspect(sync_connection).get_indexes(
+                        "audit_logs"
+                    )
+                },
+                "order_columns": {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns(
+                        "orders"
+                    )
+                },
+                "order_indexes": {
+                    index["name"]
+                    for index in inspect(sync_connection).get_indexes(
+                        "orders"
+                    )
+                },
+            }
+        )
+    await engine.dispose()
+
+    assert version == "20260714_0019"
+    assert tuple(sync_state) == (None, 0)
+    assert "funpay_sale_candidates" in schema["tables"]
+    assert {
+        "funpay_order_id",
+        "buyer_funpay_id",
+        "recovery_state",
+        "attempts",
+        "next_attempt_at",
+        "last_error",
+    } <= schema["columns"]
+    assert "ix_funpay_sale_candidates_recovery_due" in schema["indexes"]
+    assert "ix_audit_logs_event_order" in schema["audit_indexes"]
+    assert {
+        "confirmation_delivery_status",
+        "confirmation_delivery_attempts",
+        "confirmation_delivery_next_attempt_at",
+        "confirmation_delivery_last_error",
+    } <= schema["order_columns"]
+    assert (
+        "ix_orders_confirmation_delivery_retry" in schema["order_indexes"]
+    )
+
+    await asyncio.to_thread(command.downgrade, config, "20260714_0018")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        tables, audit_indexes, order_columns, order_indexes = (
+            await connection.run_sync(
+                lambda sync_connection: (
+                    set(inspect(sync_connection).get_table_names()),
+                    {
+                        index["name"]
+                        for index in inspect(sync_connection).get_indexes(
+                            "audit_logs"
+                        )
+                    },
+                    {
+                        column["name"]
+                        for column in inspect(sync_connection).get_columns(
+                            "orders"
+                        )
+                    },
+                    {
+                        index["name"]
+                        for index in inspect(sync_connection).get_indexes(
+                            "orders"
+                        )
+                    },
+                )
+            )
+        )
+        complete = (
+            await connection.execute(text(
+                "SELECT backfill_complete FROM funpay_sale_sync_state WHERE id=1"
+            ))
+        ).scalar_one()
+    await engine.dispose()
+
+    assert "funpay_sale_candidates" not in tables
+    assert "ix_audit_logs_event_order" not in audit_indexes
+    assert "confirmation_delivery_status" not in order_columns
+    assert "ix_orders_confirmation_delivery_retry" not in order_indexes
+    assert bool(complete) is True
+
+
+async def test_0020_clears_unsourced_expiry_and_revalidates_paid_accounts(
+    tmp_path,
+    monkeypatch,
+):
+    database_url = (
+        f"sqlite+aiosqlite:///{tmp_path / 'expiry-provenance-0020.db'}"
+    )
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, config, "20260714_0019")
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        tiers = {
+            row.code: row.id
+            for row in (
+                await connection.execute(
+                    text(
+                        "SELECT id, code FROM subscription_tiers "
+                        "WHERE code IN ('plus', 'free')"
+                    )
+                )
+            )
+        }
+        await connection.execute(
+            text(
+                "INSERT INTO accounts "
+                "(id, login, password_encrypted, totp_secret_encrypted, "
+                "tier_id, subscription_expires_at, status, "
+                "operator_status_override, validation_rerun_requested) VALUES "
+                "(1, 'paid-pending', :password, :totp, :plus, "
+                "CURRENT_TIMESTAMP, 'active', NULL, 0), "
+                "(2, 'free-active', :password, :totp, :free, "
+                "CURRENT_TIMESTAMP, 'active', NULL, 0), "
+                "(3, 'paid-disabled', :password, :totp, :plus, "
+                "CURRENT_TIMESTAMP, 'disabled', 'disabled', 0), "
+                "(4, 'paid-running', :password, :totp, :plus, "
+                "CURRENT_TIMESTAMP, 'active', NULL, 0), "
+                "(5, 'paid-device-auth', :password, :totp, :plus, "
+                "CURRENT_TIMESTAMP, 'active', NULL, 0)"
+            ),
+            {
+                "password": encrypt("password"),
+                "totp": encrypt("TOTP"),
+                "plus": tiers["plus"],
+                "free": tiers["free"],
+            },
+        )
+        for account_id in range(1, 6):
+            await connection.execute(
+                text(
+                    "INSERT INTO account_limits "
+                    "(account_id, refresh_token_encrypted, "
+                    "subscription_expires_at, refresh_status, "
+                    "refresh_recover_attempts) VALUES "
+                    "(:account_id, :refresh, CURRENT_TIMESTAMP, 'ok', 0)"
+                ),
+                {
+                    "account_id": account_id,
+                    "refresh": encrypt(f"refresh-{account_id}"),
+                },
+            )
+        await connection.execute(
+            text(
+                "INSERT INTO account_check_jobs "
+                "(id, account_id, priority, job_type, status, created_at) "
+                "VALUES "
+                "(1, 1, 'limit_check', 'limit_check', 'pending', "
+                "CURRENT_TIMESTAMP), "
+                "(2, 4, 'limit_check', 'limit_check', 'running', "
+                "CURRENT_TIMESTAMP), "
+                "(3, 5, 'manual', 'device_auth', 'pending', "
+                "CURRENT_TIMESTAMP)"
+            )
+        )
+    await engine.dispose()
+
+    await asyncio.to_thread(command.upgrade, config, "20260714_0020")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        account_rows = {
+            row.login: (
+                row.status,
+                row.subscription_expires_at,
+                row.subscription_expiry_source,
+                bool(row.validation_rerun_requested),
+            )
+            for row in (
+                await connection.execute(
+                    text(
+                        "SELECT login, status, subscription_expires_at, "
+                        "subscription_expiry_source, "
+                        "validation_rerun_requested FROM accounts"
+                    )
+                )
+            )
+        }
+        limit_rows = list(
+            await connection.execute(
+                text(
+                    "SELECT subscription_expires_at, "
+                    "subscription_expiry_source FROM account_limits"
+                )
+            )
+        )
+        jobs = list(
+            await connection.execute(
+                text(
+                    "SELECT account_id, job_type, status, result "
+                    "FROM account_check_jobs ORDER BY id"
+                )
+            )
+        )
+        version = (
+            await connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            )
+        ).scalar_one()
+        check_constraints = await connection.run_sync(
+            lambda sync_connection: {
+                constraint["name"]
+                for table_name in ("accounts", "account_limits")
+                for constraint in inspect(sync_connection).get_check_constraints(
+                    table_name
+                )
+            }
+        )
+    await engine.dispose()
+
+    assert version == "20260714_0020"
+    assert {
+        "ck_accounts_subscription_expiry_source_trusted",
+        "ck_account_limits_subscription_expiry_source_trusted",
+    } <= check_constraints
+    assert account_rows == {
+        "paid-pending": ("pending_validation", None, None, False),
+        "free-active": ("active", None, None, False),
+        "paid-disabled": ("disabled", None, None, False),
+        "paid-running": ("pending_validation", None, None, True),
+        "paid-device-auth": ("pending_validation", None, None, True),
+    }
+    assert all(tuple(row) == (None, None) for row in limit_rows)
+    assert [tuple(row) for row in jobs] == [
+        (1, "limit_check", "done", "superseded:expiry_provenance_migration"),
+        (4, "limit_check", "running", None),
+        (5, "device_auth", "pending", None),
+        (1, "full_validation", "pending", None),
+    ]
+
+    await asyncio.to_thread(command.downgrade, config, "20260714_0019")
+    engine = create_async_engine(database_url)
+    async with engine.connect() as connection:
+        account_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns("accounts")
+            }
+        )
+        limit_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in inspect(sync_connection).get_columns(
+                    "account_limits"
+                )
+            }
+        )
+    await engine.dispose()
+    assert "subscription_expiry_source" not in account_columns
+    assert "subscription_expiry_source" not in limit_columns
+
+
 async def _schema(engine):
     async with engine.connect() as connection:
         return await connection.run_sync(
@@ -587,9 +884,10 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 )
             }
         )
-    assert version == "20260714_0018"
+    assert version == "20260714_0020"
     assert "funpay_sales" in tables
     assert "funpay_sale_sync_state" in tables
+    assert "funpay_sale_candidates" in tables
     assert {
         "backfill_cursor",
         "backfill_complete",
@@ -1266,7 +1564,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260714_0018"
+    assert version == "20260714_0020"
     await engine.dispose()
 
 
@@ -1350,12 +1648,14 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
 
     assert accounts == {
         "legacy-active": (None, "pending_validation", None),
-        "verified-active": (plus_id, "active", None),
+        # The plan evidence remains valid, but pre-0020 subscription dates had
+        # no durable provenance and paid accounts therefore revalidate once.
+        "verified-active": (plus_id, "pending_validation", None),
         "legacy-disabled": (None, "disabled", "disabled"),
         "legacy-pending": (None, "pending_validation", None),
     }
-    assert jobs == {1: 1, 4: 1}
-    assert version == "20260714_0018"
+    assert jobs == {1: 1, 2: 1, 4: 1}
+    assert version == "20260714_0020"
     await engine.dispose()
 
 

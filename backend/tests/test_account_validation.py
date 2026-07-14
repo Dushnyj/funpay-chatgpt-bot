@@ -66,6 +66,9 @@ async def test_validate_account_success(session, monkeypatch):
                 "email": "new@e.com",
                 "https://api.openai.com/auth": {"plan_type": "plus"},
                 "https://api.openai.com/account": {"account_id": "openai-acc-1"},
+                "https://api.openai.com/profile": {
+                    "subscription_expires_at": 1786752000,
+                },
             }),
         )
 
@@ -92,12 +95,21 @@ async def test_validate_account_success(session, monkeypatch):
     reloaded_acc = await session.get(Account, acc.id)
     assert reloaded_acc.status == "active"
     assert reloaded_acc.chatgpt_last_check_at is not None
+    assert reloaded_acc.subscription_expiry_source == "id_token"
+    assert reloaded_acc.subscription_expires_at is not None
 
     limits = await session.get(AccountLimits, acc.id)
     assert limits is not None
     assert limits.refresh_token_encrypted == "initial-refresh"
     assert limits.account_id_openai == "openai-acc-1"
     assert limits.refresh_status == "ok"
+    assert limits.subscription_expiry_source == "id_token"
+    limits_expiry = limits.subscription_expires_at
+    if limits_expiry is not None and limits_expiry.tzinfo is None:
+        from datetime import timezone
+
+        limits_expiry = limits_expiry.replace(tzinfo=timezone.utc)
+    assert limits_expiry == reloaded_acc.subscription_expires_at
 
 
 @pytest.mark.asyncio

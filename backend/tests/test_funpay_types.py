@@ -4,6 +4,8 @@ from app.integrations.funpay.types import (
     MessageInfo,
     SaleStatus,
     OfferFieldsDTO,
+    OfferSubscriptionOption,
+    OfferSubscriptionType,
 )
 
 
@@ -55,7 +57,12 @@ def test_offer_fields_dto_build():
         title_en="Test",
         desc_ru="Описание",
         desc_en="Desc",
+        payment_msg_ru="Заказ принят.",
+        payment_msg_en="Order accepted.",
+        subscription=OfferSubscriptionOption.WITH_SUBSCRIPTION,
+        subscription_type=OfferSubscriptionType.PLUS,
         price=500.0,
+        amount=1,
         active=True,
         auto_delivery=False,
     )

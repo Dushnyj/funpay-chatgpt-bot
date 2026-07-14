@@ -21,6 +21,7 @@ class CommandContext:
     lang: str
     gateway: ChatGateway
     parsed: ParsedCommand | None
+    order_reference_invalid: bool = False
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[None]]
@@ -55,14 +56,20 @@ class CommandRouter:
         gateway: ChatGateway,
     ) -> CommandContext:
         parsed = self._parser.parse(text)
+        effective_order_id = order_id
+        invalid_order_reference = False
+        if order_id is None and parsed is not None:
+            effective_order_id = parsed.order_reference
+            invalid_order_reference = parsed.order_reference_invalid
         return CommandContext(
             chat_id=chat_id,
             sender_id=sender_id,
             text=text,
-            order_id=order_id,
+            order_id=effective_order_id,
             lang=parsed.lang if parsed is not None else lang,
             gateway=gateway,
             parsed=parsed,
+            order_reference_invalid=invalid_order_reference,
         )
 
     async def dispatch(self, ctx: CommandContext) -> None:

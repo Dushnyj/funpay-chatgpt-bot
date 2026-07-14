@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db_session
@@ -12,6 +12,9 @@ from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.models.rental import OCCUPYING_RENTAL_STATUSES, Order, Rental
 from app.models.settings import SellerSettings
+from app.services.subscription_eligibility import (
+    trusted_paid_subscription_expiry,
+)
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"], dependencies=[Depends(get_current_user)])
 
@@ -84,10 +87,13 @@ async def get_metrics(request: Request, session: AsyncSession = Depends(get_db_s
                 ~reserved_for_replacement,
                 Account.id.not_in(active_checks),
                 or_(
-                    Account.subscription_expires_at > now,
-                    (
-                        (SubscriptionTier.code == "free")
-                        & Account.subscription_expires_at.is_(None)
+                    and_(
+                        SubscriptionTier.code != "free",
+                        trusted_paid_subscription_expiry(now),
+                    ),
+                    and_(
+                        SubscriptionTier.code == "free",
+                        Account.subscription_expires_at.is_(None),
                     ),
                 ),
             )

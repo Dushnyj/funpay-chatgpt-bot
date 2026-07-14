@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,9 +33,15 @@ from app.services.durations import (
     format_plan_expiry,
     format_remaining_seconds,
 )
+from app.services.subscription_eligibility import (
+    trusted_paid_subscription_expiry,
+)
 from app.services.limit_eligibility import apply_limit_scope_filters
 from app.services.messages import issued_usage_template_variables, render_message
 from app.services.order_provenance import is_verified_bot_sale_order
+
+
+logger = logging.getLogger(__name__)
 
 
 CREDENTIAL_DELIVERY_LEASE = timedelta(minutes=5)
@@ -59,8 +67,26 @@ class RentalService:
     Если аккаунт не найден — отправляет no_account_available, возвращает None.
     """
 
-    def __init__(self, account_pool: AccountPool | None = None) -> None:
+    def __init__(
+        self,
+        account_pool: AccountPool | None = None,
+        *,
+        capacity_changed: Callable[[], None] | None = None,
+    ) -> None:
         self._pool = account_pool or AccountPool()
+        self._capacity_changed = capacity_changed
+
+    def _notify_capacity_changed(self) -> None:
+        """Queue catalog reconciliation without coupling it to this transaction."""
+
+        if self._capacity_changed is None:
+            return
+        try:
+            self._capacity_changed()
+        except Exception:
+            # Allocation is already durable. A catalog hook must never turn a
+            # successful reservation into a buyer-visible fulfillment error.
+            logger.exception("Failed to queue capacity reconciliation")
 
     async def fulfill_order(
         self,
@@ -120,6 +146,10 @@ class RentalService:
         )
         account = await self._pool.acquire(session, criteria, default_max_active_rentals)
         if account is None:
+            # A sale reached fulfillment while the pool has no eligible
+            # capacity. Reconcile immediately so another buyer cannot enter
+            # through a lot that was still active from an older snapshot.
+            self._notify_capacity_changed()
             if notify_unavailable:
                 await self._send_no_account(session, gateway, order)
             return None
@@ -180,6 +210,7 @@ class RentalService:
         # after FunPay accepts the message, retries can only reuse this Rental
         # and therefore never allocate a second account for the same order.
         await session.commit()
+        self._notify_capacity_changed()
         return await self._deliver_claimed(session, gateway, order.id, rental.id)
 
     async def deliver_claimed_rental(
@@ -615,7 +646,7 @@ class RentalService:
             )
 
         freshness = limits_freshness_for_duration(freshness_minutes)
-        expiry_condition = Account.subscription_expires_at >= required_until
+        expiry_condition = trusted_paid_subscription_expiry(required_until)
         if tier.code == "free":
             expiry_condition = or_(
                 expiry_condition,
@@ -692,6 +723,7 @@ class RentalService:
         )
         # Persist the exact new target before any external message is sent.
         await session.commit()
+        self._notify_capacity_changed()
         return account
 
     @staticmethod

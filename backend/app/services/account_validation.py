@@ -22,7 +22,11 @@ from app.integrations.playwright.enable_2fa import Enable2FAError, enable_2fa
 from app.integrations.playwright.oauth_login import OAuthLoginError, login_and_get_auth_code
 from app.config import get_settings
 from app.models.account import Account, AccountLimits, EmailOAuthCredential
-from app.services.account_limits import MeasureResult, measure_account_limits
+from app.services.account_limits import (
+    MeasureResult,
+    _store_subscription_expiry,
+    measure_account_limits,
+)
 from app.services.totp import is_valid_base32
 
 logger = logging.getLogger(__name__)
@@ -351,7 +355,12 @@ async def _save_tokens_and_measure(
     limits.refresh_last_recover_at = None
 
     if claims.subscription_expires_at:
-        account.subscription_expires_at = claims.subscription_expires_at
+        _store_subscription_expiry(
+            account,
+            limits,
+            claims.subscription_expires_at,
+            source="id_token",
+        )
 
     await session.flush()
 

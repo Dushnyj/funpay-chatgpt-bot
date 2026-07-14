@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.account import Account
 from app.models.catalog import SubscriptionTier
@@ -49,3 +50,17 @@ async def test_account_max_active_rentals_defaults_to_none(session):
 
     fetched = await session.get(Account, acc.id)
     assert fetched.max_active_rentals is None
+
+
+@pytest.mark.asyncio
+async def test_subscription_expiry_source_rejects_operator_provenance(session):
+    account = Account(
+        login="manual-expiry-source@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        status="pending_validation",
+        subscription_expiry_source="operator",
+    )
+    session.add(account)
+    with pytest.raises(IntegrityError):
+        await session.flush()

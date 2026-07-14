@@ -8,7 +8,11 @@ from app.integrations.openai.client import OpenAIClient
 from app.integrations.openai.exceptions import BackendApiError, RefreshFailedError, TokenExpiredError
 from app.integrations.openai.oauth import parse_id_token, refresh_access_token
 from app.integrations.openai.types import AccountMetadata, UsageInfo
-from app.models.account import Account, AccountLimits
+from app.models.account import (
+    Account,
+    AccountLimits,
+    TRUSTED_SUBSCRIPTION_EXPIRY_SOURCES,
+)
 from app.models.catalog import SubscriptionTier
 from app.services.subscription_plans import (
     PLANS_BY_CODE,
@@ -135,20 +139,26 @@ async def measure_account_limits(
         )
         limits.expected_long_window_seconds = expected_window
         limits.plan_window_status = "ok" if window_contract_ok else "mismatch"
-    if (
+    if resolved_plan.code == "free" or metadata.has_active_subscription is False:
+        # Free has no subscription term. An explicitly inactive paid
+        # entitlement may carry a historical ``expires_at`` and must fail
+        # closed as well.
+        _clear_subscription_expiry(account, limits)
+    elif (
         metadata.has_active_subscription is True
         and metadata.subscription_expires_at is not None
     ):
-        limits.subscription_expires_at = metadata.subscription_expires_at
-        account.subscription_expires_at = metadata.subscription_expires_at
-    elif metadata.has_active_subscription is False:
-        # Inactive entitlements often contain a stale historical expires_at.
-        limits.subscription_expires_at = None
-        account.subscription_expires_at = None
-    elif limits.subscription_expires_at is None and account.subscription_expires_at is not None:
-        # /accounts/check legitimately omits expiry for some responses. Keep
-        # stronger evidence already stored from an ID token or prior measure.
-        limits.subscription_expires_at = account.subscription_expires_at
+        _store_subscription_expiry(
+            account,
+            limits,
+            metadata.subscription_expires_at,
+            source="accounts_check",
+        )
+    else:
+        # ``accounts/check`` legitimately omits expiry for some responses.
+        # Preserve a prior OpenAI attestation, but never promote the legacy
+        # operator-editable date that existed before provenance was stored.
+        _synchronize_trusted_subscription_expiry(account, limits)
     limits.measured_at = datetime.now(timezone.utc)
     limits.refresh_status = "ok"
     limits.refresh_failed_at = None
@@ -244,6 +254,74 @@ async def _get_canonical_tier(
     return tier
 
 
+def _store_subscription_expiry(
+    account: Account,
+    limits: AccountLimits,
+    expires_at: datetime,
+    *,
+    source: str,
+) -> None:
+    if source not in TRUSTED_SUBSCRIPTION_EXPIRY_SOURCES:
+        raise ValueError(f"Untrusted subscription expiry source: {source}")
+    account.subscription_expires_at = expires_at
+    account.subscription_expiry_source = source
+    limits.subscription_expires_at = expires_at
+    limits.subscription_expiry_source = source
+
+
+def _clear_subscription_expiry(
+    account: Account,
+    limits: AccountLimits,
+) -> None:
+    account.subscription_expires_at = None
+    account.subscription_expiry_source = None
+    limits.subscription_expires_at = None
+    limits.subscription_expiry_source = None
+
+
+def _synchronize_trusted_subscription_expiry(
+    account: Account,
+    limits: AccountLimits,
+) -> None:
+    candidates = (
+        (
+            account.subscription_expiry_source,
+            account.subscription_expires_at,
+        ),
+        (
+            limits.subscription_expiry_source,
+            limits.subscription_expires_at,
+        ),
+    )
+    trusted = [
+        (source, expires_at)
+        for source, expires_at in candidates
+        if source in TRUSTED_SUBSCRIPTION_EXPIRY_SOURCES
+        and expires_at is not None
+    ]
+    if not trusted:
+        _clear_subscription_expiry(account, limits)
+        return
+
+    # accounts/check is the authoritative entitlement endpoint. Prefer it if
+    # the two durable copies were interrupted between commits; otherwise the
+    # current ID-token claim remains a valid conservative fallback.
+    source, expires_at = next(
+        (
+            candidate
+            for candidate in trusted
+            if candidate[0] == "accounts_check"
+        ),
+        trusted[0],
+    )
+    _store_subscription_expiry(
+        account,
+        limits,
+        expires_at,
+        source=source,
+    )
+
+
 def _is_token_expired(expires_at: datetime | None) -> bool:
     if expires_at is None:
         return True
@@ -309,5 +387,16 @@ async def _do_refresh(session: AsyncSession, limits: AccountLimits) -> str | Non
     limits.access_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     limits.refresh_recover_attempts = 0
     limits.refresh_status = "ok"
+    if refreshed.id_token:
+        claims = parse_id_token(refreshed.id_token)
+        if claims.subscription_expires_at is not None:
+            account = await session.get(Account, limits.account_id)
+            if account is not None:
+                _store_subscription_expiry(
+                    account,
+                    limits,
+                    claims.subscription_expires_at,
+                    source="id_token",
+                )
     await session.commit()
     return refreshed.access_token

@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import jwt
-from passlib.hash import bcrypt
 
 from app.config import get_settings
 
@@ -22,11 +22,18 @@ class AccessTokenClaims:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.verify(plain, hashed)
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("ascii"))
+    except (TypeError, ValueError):
+        # Corrupt or unsupported stored hashes are authentication failures,
+        # not reasons for the login endpoint to return an internal error.
+        return False
 
 
 def hash_password(plain: str) -> str:
-    return bcrypt.hash(plain)
+    return bcrypt.hashpw(
+        plain.encode("utf-8"), bcrypt.gensalt(),
+    ).decode("ascii")
 
 
 def create_access_token(subject: str = "admin", *, session_version: int = 0) -> str:

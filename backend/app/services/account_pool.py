@@ -16,6 +16,9 @@ from app.services.limit_eligibility import (
     observed_codex_primary,
     observed_codex_secondary,
 )
+from app.services.subscription_eligibility import (
+    trusted_paid_subscription_expiry,
+)
 
 
 _LIMITS_FRESH_THRESHOLD = timedelta(hours=1)
@@ -116,7 +119,12 @@ class AccountPool:
                 SubscriptionTier.is_active.is_(True),
                 SubscriptionTier.is_sellable.is_(True),
                 or_(
-                    Account.subscription_expires_at >= required_expires_at,
+                    and_(
+                        SubscriptionTier.code != "free",
+                        trusted_paid_subscription_expiry(
+                            required_expires_at
+                        ),
+                    ),
                     and_(
                         SubscriptionTier.code == "free",
                         Account.subscription_expires_at.is_(None),

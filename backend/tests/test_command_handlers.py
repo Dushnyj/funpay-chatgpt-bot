@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from app.integrations.email.provider import (
     FreshVerificationCode,
 )
 from app.integrations.funpay.gateway import FakeChatGateway
+from app.integrations.funpay.types import OrderInfo, SaleStatus
 from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
@@ -25,7 +26,7 @@ from app.services.command_handlers import (
     SubscriptionHandler,
     _wait_for_safe_totp_window,
 )
-from app.services.command_router import CommandContext
+from app.services.command_router import CommandContext, CommandRouter
 from app.services.account_limits import MeasureResult
 from app.services.command_parser import CommandType, ParsedCommand
 
@@ -47,6 +48,7 @@ async def _seed_rental(session: AsyncSession, chat_id: int = 100) -> Rental:
         tier_id=tier.id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(acc)
     await session.flush()
@@ -112,6 +114,17 @@ async def _seed_rental(session: AsyncSession, chat_id: int = 100) -> Rental:
 def _ctx(gateway: FakeChatGateway, session: AsyncSession, chat_id: int = 100,
          lang: str = "ru", command: CommandType = CommandType.CODE,
          order_id: str | None = None) -> CommandContext:
+    remote_order_id = order_id or "o1"
+    gateway.set_order(OrderInfo(
+        order_id=remote_order_id,
+        status=SaleStatus.PAID,
+        chat_id=chat_id,
+        buyer_id=200,
+        subcategory_id=55,
+        title="ChatGPT",
+        price=100,
+        offer_id=5001,
+    ))
     ctx = CommandContext(
         chat_id=chat_id,
         sender_id=200,
@@ -121,6 +134,35 @@ def _ctx(gateway: FakeChatGateway, session: AsyncSession, chat_id: int = 100,
         gateway=gateway,
         parsed=ParsedCommand(command=command, argument=None),
     )
+    object.__setattr__(ctx, "_session", session)
+    return ctx
+
+
+def _parsed_ctx(
+    gateway: FakeChatGateway,
+    session: AsyncSession,
+    *,
+    text: str,
+    chat_id: int,
+) -> CommandContext:
+    ctx = CommandRouter().build_context(
+        chat_id=chat_id,
+        sender_id=200,
+        text=text,
+        order_id=None,
+        lang="ru",
+        gateway=gateway,
+    )
+    gateway.set_order(OrderInfo(
+        order_id=ctx.order_id or "o1",
+        status=SaleStatus.PAID,
+        chat_id=chat_id,
+        buyer_id=200,
+        subcategory_id=55,
+        title="ChatGPT",
+        price=100,
+        offer_id=5001,
+    ))
     object.__setattr__(ctx, "_session", session)
     return ctx
 
@@ -136,6 +178,7 @@ async def _add_second_rental_in_same_chat(
         tier_id=first.tier_id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(account)
     first_order = await session.get(Order, first.order_id)
@@ -208,6 +251,120 @@ async def test_code_handler_sends_totp(session: AsyncSession):
     assert "123456" in text
 
 
+async def test_code_handler_live_refund_revokes_before_disclosure(
+    session: AsyncSession,
+):
+    from app.services.kick_service import KickResult
+    from app.services.order_processor import OrderProcessor
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session)
+    order = await session.get(Order, rental.order_id)
+    gateway = FakeChatGateway()
+    ctx = _ctx(gateway, session, order_id=order.funpay_order_id)
+    gateway.set_order(OrderInfo(
+        order_id=order.funpay_order_id,
+        status=SaleStatus.REFUNDED,
+        chat_id=int(order.funpay_chat_id),
+        buyer_id=int(order.buyer_funpay_id),
+        subcategory_id=55,
+        title="ChatGPT",
+        price=100,
+        offer_id=5001,
+    ))
+    kick_service = AsyncMock()
+    kick_service.kick = AsyncMock(return_value=KickResult(success=True))
+    capacity_changed = Mock()
+    handler = CodeHandler(
+        totp_min_validity_s=0,
+        refund_processor=OrderProcessor(kick_service=kick_service),
+        capacity_changed=capacity_changed,
+    )
+
+    with patch("app.services.command_handlers.generate_totp") as generate:
+        await handler(ctx)
+
+    generate.assert_not_called()
+    kick_service.kick.assert_awaited_once_with(session, rental.account_id)
+    capacity_changed.assert_called_once_with()
+    await session.refresh(order)
+    await session.refresh(rental)
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    assert order.status == "refunded"
+    assert rental.status == "refunded"
+    assert sale.status == "refunded"
+    assert len(gateway.sent_messages) == 1
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
+
+
+async def test_code_handler_live_identity_mismatch_fails_closed(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session)
+    order = await session.get(Order, rental.order_id)
+    gateway = FakeChatGateway()
+    ctx = _ctx(gateway, session, order_id=order.funpay_order_id)
+    gateway.set_order(OrderInfo(
+        order_id=order.funpay_order_id,
+        status=SaleStatus.PAID,
+        chat_id=int(order.funpay_chat_id),
+        buyer_id=999999,
+        subcategory_id=55,
+        title="ChatGPT",
+        price=100,
+        offer_id=5001,
+    ))
+
+    with patch("app.services.command_handlers.generate_totp") as generate:
+        await CodeHandler(totp_min_validity_s=0)(ctx)
+
+    generate.assert_not_called()
+    assert len(gateway.sent_messages) == 1
+    assert "продавец" in gateway.sent_messages[0][1].casefold()
+
+
+async def test_code_handler_live_lookup_is_bounded_and_outside_transaction(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session)
+    order = await session.get(Order, rental.order_id)
+
+    class BlockingGateway(FakeChatGateway):
+        in_transaction_during_lookup: bool | None = None
+
+        async def get_order(self, order_id: str) -> OrderInfo:
+            assert order_id == order.funpay_order_id
+            self.in_transaction_during_lookup = session.in_transaction()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    gateway = BlockingGateway()
+    ctx = _ctx(gateway, session, order_id=order.funpay_order_id)
+
+    with (
+        patch(
+            "app.services.command_handlers._LIVE_ORDER_CHECK_TIMEOUT_SECONDS",
+            0.01,
+        ),
+        patch("app.services.command_handlers.generate_totp") as generate,
+    ):
+        await CodeHandler(totp_min_validity_s=0)(ctx)
+
+    generate.assert_not_called()
+    assert gateway.in_transaction_during_lookup is False
+    assert len(gateway.sent_messages) == 1
+    assert "продавец" in gateway.sent_messages[0][1].casefold()
+
+
 async def test_code_handler_denies_commands_until_initial_delivery(
     session: AsyncSession,
 ):
@@ -221,7 +378,7 @@ async def test_code_handler_denies_commands_until_initial_delivery(
         await CodeHandler(totp_min_validity_s=0)(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "ещё доставляются" in gateway.sent_messages[0][1]
+    assert "Выдача аккаунта ещё не завершена" in gateway.sent_messages[0][1]
     assert rental.status == "active"
 
 
@@ -238,7 +395,7 @@ async def test_code_handler_denies_new_code_in_final_minute(
         await CodeHandler(totp_min_validity_s=0)(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "меньше минуты" in gateway.sent_messages[0][1]
+    assert "не более минуты" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_denies_refund_pending_rental(session: AsyncSession):
@@ -257,7 +414,7 @@ async def test_code_handler_denies_refund_pending_rental(session: AsyncSession):
         )
 
     generate.assert_not_called()
-    assert "Доступ закончился" in gateway.sent_messages[0][1]
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_uses_exact_order_when_chat_has_two_active_rentals(
@@ -345,6 +502,119 @@ async def test_orderless_direct_chat_keeps_multiple_rentals_ambiguous(
     assert "несколько активных заказов" in gateway.sent_messages[0][1]
 
 
+async def test_order_qualified_code_selects_exact_rental_in_generic_chat(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    first = await _seed_rental(session)
+    second, second_account = await _add_second_rental_in_same_chat(
+        session, first,
+    )
+    first_order = await session.get(Order, first.order_id)
+    second_order = await session.get(Order, second.order_id)
+    first_order.funpay_order_id = "HHHGNZ4N"
+    second_order.funpay_order_id = "XQGVAQ85"
+    for order in (first_order, second_order):
+        order.funpay_chat_id = "999"
+    for rental in (first, second):
+        rental.buyer_funpay_chat_id = "999"
+    sales = list((await session.execute(
+        select(FunPaySale).where(
+            FunPaySale.order_id.in_([first_order.id, second_order.id])
+        )
+    )).scalars())
+    for sale in sales:
+        bound_order = first_order if sale.order_id == first_order.id else second_order
+        sale.funpay_order_id = bound_order.funpay_order_id
+        sale.funpay_chat_id = "999"
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    with patch(
+        "app.services.command_handlers.generate_totp",
+        return_value="654321",
+    ) as generate:
+        await CodeHandler(totp_min_validity_s=0)(
+            _parsed_ctx(
+                gateway,
+                session,
+                text="!код #xqgvaq85",
+                chat_id=999,
+            )
+        )
+
+    generate.assert_called_once_with(second_account.totp_secret_encrypted)
+    assert "654321" in gateway.sent_messages[0][1]
+
+
+async def test_ambiguous_reply_lists_only_verified_buyer_active_orders(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    first = await _seed_rental(session, chat_id=999)
+    second, _ = await _add_second_rental_in_same_chat(session, first)
+    first_order = await session.get(Order, first.order_id)
+    second_order = await session.get(Order, second.order_id)
+    first_order.funpay_order_id = "HHHGNZ4N"
+    second_order.funpay_order_id = "XQGVAQ85"
+    sales = list((await session.execute(
+        select(FunPaySale).where(
+            FunPaySale.order_id.in_([first_order.id, second_order.id])
+        )
+    )).scalars())
+    for sale in sales:
+        bound_order = first_order if sale.order_id == first_order.id else second_order
+        sale.funpay_order_id = bound_order.funpay_order_id
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    with patch("app.services.command_handlers.generate_totp") as generate:
+        await CodeHandler(totp_min_validity_s=0)(
+            _parsed_ctx(gateway, session, text="!код", chat_id=999)
+        )
+
+    generate.assert_not_called()
+    reply = gateway.sent_messages[0][1]
+    assert "!код #HHHGNZ4N" in reply
+    assert "Активные заказы: #XQGVAQ85, #HHHGNZ4N" in reply
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["!код #FOREIGN1", "!код HHHGNZ4N", "!код #TOO-SHRT"],
+)
+async def test_order_reference_cannot_fall_back_or_disclose_foreign_rental(
+    session: AsyncSession,
+    text: str,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session, chat_id=999)
+    order = await session.get(Order, rental.order_id)
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    order.funpay_order_id = "HHHGNZ4N"
+    sale.funpay_order_id = order.funpay_order_id
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    with patch("app.services.command_handlers.generate_totp") as generate:
+        await CodeHandler(totp_min_validity_s=0)(
+            _parsed_ctx(gateway, session, text=text, chat_id=999)
+        )
+
+    generate.assert_not_called()
+    assert len(gateway.sent_messages) == 1
+    assert "HHHGNZ4N" not in gateway.sent_messages[0][1]
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
+
+
 async def test_code_handler_rechecks_account_status_after_mailbox_work(
     session: AsyncSession,
 ):
@@ -383,9 +653,11 @@ async def test_code_secret_send_has_bounded_timeout(
     await seed_message_templates(session)
     await _seed_rental(session)
     monkeypatch.setattr(handlers, "_CODE_SEND_TIMEOUT_SECONDS", 0.01)
+    transaction_states: list[bool] = []
 
     class SlowGateway(FakeChatGateway):
         async def send_message(self, chat_id: int, text: str) -> int:
+            transaction_states.append(session.in_transaction())
             await asyncio.sleep(0.05)
             return await super().send_message(chat_id, text)
 
@@ -397,6 +669,164 @@ async def test_code_secret_send_has_bounded_timeout(
             await CodeHandler(totp_min_validity_s=0)(
                 _ctx(SlowGateway(), session)
             )
+
+    # The first claim is already durable, while the short second authorization
+    # transaction remains locked until the bounded secret send finishes.
+    assert transaction_states == [True]
+
+
+async def test_code_timeout_claim_blocks_same_otp_and_points_to_safe_retry(
+    session: AsyncSession,
+    monkeypatch,
+):
+    import app.services.command_handlers as handlers
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session)
+    monkeypatch.setattr(handlers, "_CODE_SEND_TIMEOUT_SECONDS", 0.01)
+
+    class SlowGateway(FakeChatGateway):
+        async def send_message(self, chat_id: int, text: str) -> int:
+            await asyncio.sleep(0.05)
+            return await super().send_message(chat_id, text)
+
+    handler = CodeHandler(totp_min_validity_s=0)
+    with (
+        patch("app.services.command_handlers.time.time", return_value=3000.0),
+        patch(
+            "app.services.command_handlers.generate_totp",
+            side_effect=["123456", "654321"],
+        ) as generate,
+    ):
+        with pytest.raises(TimeoutError):
+            await handler(_ctx(SlowGateway(), session))
+
+        retry_gateway = FakeChatGateway()
+        await handler(_ctx(retry_gateway, session))
+
+    generate.assert_called_once_with(
+        (await session.get(Account, rental.account_id)).totp_secret_encrypted
+    )
+    retry_text = retry_gateway.sent_messages[0][1]
+    assert "123456" not in retry_text
+    assert "654321" not in retry_text
+    assert "Доставка предыдущего кода не подтвердилась" in retry_text
+    assert "!код" in retry_text
+
+    logs = list((await session.execute(
+        select(AuditLog).where(
+            AuditLog.event_type.in_([
+                "buyer_otp_delivery_claimed",
+                "buyer_otp_delivery_uncertain",
+            ])
+        )
+        .order_by(AuditLog.id)
+    )).scalars())
+    assert [log.event_type for log in logs] == [
+        "buyer_otp_delivery_claimed",
+        "buyer_otp_delivery_uncertain",
+    ]
+    assert logs[0].metadata_["claim_id"] == logs[1].metadata_["claim_id"]
+    assert "123456" not in repr([log.metadata_ for log in logs])
+    assert "654321" not in repr([log.metadata_ for log in logs])
+
+
+async def test_code_claim_survives_process_crash_boundary_and_fails_closed(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    await _seed_rental(session)
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    class CrashGateway(FakeChatGateway):
+        async def send_message(self, chat_id: int, text: str) -> int:
+            raise SimulatedProcessCrash
+
+    handler = CodeHandler(totp_min_validity_s=0)
+    with (
+        patch("app.services.command_handlers.time.time", return_value=6000.0),
+        patch(
+            "app.services.command_handlers.generate_totp",
+            return_value="123456",
+        ) as generate,
+    ):
+        with pytest.raises(SimulatedProcessCrash):
+            await handler(_ctx(CrashGateway(), session))
+
+        # A real process exit drops the in-flight authorization transaction;
+        # the earlier delivery claim remains committed independently.
+        await session.rollback()
+        retry_gateway = FakeChatGateway()
+        await handler(_ctx(retry_gateway, session))
+
+    generate.assert_called_once()
+    retry_text = retry_gateway.sent_messages[0][1]
+    assert "123456" not in retry_text
+    assert "Доставка предыдущего кода не подтвердилась" in retry_text
+
+    claim = await session.scalar(
+        select(AuditLog).where(
+            AuditLog.event_type == "buyer_otp_delivery_claimed"
+        )
+    )
+    assert claim is not None
+    outcome_count = len(list((await session.execute(
+        select(AuditLog.id).where(
+            AuditLog.event_type.in_([
+                "buyer_otp_delivery_sent",
+                "buyer_otp_delivery_uncertain",
+            ])
+        )
+    )).scalars()))
+    assert outcome_count == 0
+    assert "123456" not in repr(claim.metadata_)
+
+
+async def test_uncertain_code_retry_preserves_explicit_order_reference(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session, chat_id=999)
+    order = await session.get(Order, rental.order_id)
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    order.funpay_order_id = "HHHGNZ4N"
+    sale.funpay_order_id = order.funpay_order_id
+    rental.last_code_request_at = datetime.now(timezone.utc)
+    session.add(AuditLog(
+        event_type="buyer_otp_delivery_claimed",
+        account_id=rental.account_id,
+        order_id=order.id,
+        rental_id=rental.id,
+        chat_id="999",
+        metadata_={"claim_id": "claim-safe-retry", "totp_window": 100},
+    ))
+    await session.commit()
+    gateway = FakeChatGateway()
+
+    with (
+        patch("app.services.command_handlers.time.time", return_value=3000.0),
+        patch("app.services.command_handlers.generate_totp") as generate,
+    ):
+        await CodeHandler(totp_min_validity_s=0)(
+            _parsed_ctx(
+                gateway,
+                session,
+                text="!код #hhhgnz4n",
+                chat_id=999,
+            )
+        )
+
+    generate.assert_not_called()
+    assert "!код #HHHGNZ4N" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_refuses_to_guess_between_two_active_rentals(
@@ -441,7 +871,7 @@ async def test_code_handler_rechecks_expiry_after_totp_boundary_wait(
     generate.assert_not_called()
     await session.refresh(rental)
     assert rental.status == "expiry_pending"
-    assert "Доступ закончился" in gateway.sent_messages[0][1]
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_refund_during_totp_wait_wins(
@@ -469,7 +899,7 @@ async def test_code_handler_refund_during_totp_wait_wins(
         await CodeHandler(totp_min_validity_s=12)(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "Доступ закончился" in gateway.sent_messages[0][1]
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_releases_locks_before_slow_denial(
@@ -575,7 +1005,7 @@ async def test_code_handler_sends_labelled_totp_and_fresh_email_otp(
         await handler(_ctx(gateway, session))
 
     text = gateway.sent_messages[0][1]
-    assert "TOTP (приложение): 123456" in text
+    assert "Код подтверждения: 123456" in text
     assert "Почтовый код из панели: 654321" in text
     provider.preflight.assert_not_awaited()
     cutoff = provider.fetch_fresh_verification_code.await_args.kwargs["not_before"]
@@ -586,13 +1016,22 @@ async def test_code_handler_sends_labelled_totp_and_fresh_email_otp(
     log = (
         await session.execute(
             select(AuditLog).where(
-                AuditLog.event_type == "buyer_email_code_delivered"
+                AuditLog.event_type == "buyer_otp_delivery_claimed"
             )
         )
     ).scalar_one()
     assert log.metadata_["fingerprint"] == "f" * 64
+    assert isinstance(log.metadata_["claim_id"], str)
+    assert isinstance(log.metadata_["totp_window"], int)
     assert "654321" not in repr(log.metadata_)
     assert "123456" not in repr(log.metadata_)
+    sent = await session.scalar(
+        select(AuditLog).where(
+            AuditLog.event_type == "buyer_otp_delivery_sent"
+        )
+    )
+    assert sent is not None
+    assert sent.metadata_["claim_id"] == log.metadata_["claim_id"]
 
 
 async def test_code_handler_rejects_stale_or_duplicate_email_code(
@@ -622,7 +1061,10 @@ async def test_code_handler_rejects_stale_or_duplicate_email_code(
         totp_min_validity_s=0,
     )
 
-    with patch("app.services.command_handlers.generate_totp", return_value="111111"):
+    with (
+        patch("app.services.command_handlers.time.time", return_value=3000.0),
+        patch("app.services.command_handlers.generate_totp", return_value="111111"),
+    ):
         await handler(_ctx(gateway, session))
     assert "111111" in gateway.sent_messages[-1][1]
     assert "333333" not in gateway.sent_messages[-1][1]
@@ -634,17 +1076,23 @@ async def test_code_handler_rejects_stale_or_duplicate_email_code(
     )
     rental.last_code_request_at = datetime.now(timezone.utc) - timedelta(seconds=31)
     await session.flush()
-    with patch("app.services.command_handlers.generate_totp", return_value="222222"):
+    with (
+        patch("app.services.command_handlers.time.time", return_value=3031.0),
+        patch("app.services.command_handlers.generate_totp", return_value="222222"),
+    ):
         await handler(_ctx(gateway, session))
-    assert "Email OTP OpenAI: 444444" in gateway.sent_messages[-1][1]
+    assert "Код из письма OpenAI: 444444" in gateway.sent_messages[-1][1]
 
     rental.last_code_request_at = datetime.now(timezone.utc) - timedelta(seconds=31)
     await session.flush()
-    with patch("app.services.command_handlers.generate_totp", return_value="555555"):
+    with (
+        patch("app.services.command_handlers.time.time", return_value=3062.0),
+        patch("app.services.command_handlers.generate_totp", return_value="555555"),
+    ):
         await handler(_ctx(gateway, session))
     assert "555555" in gateway.sent_messages[-1][1]
     assert "444444" not in gateway.sent_messages[-1][1]
-    assert "уже выдавался" in gateway.sent_messages[-1][1]
+    assert "Нового кода из письма пока нет" in gateway.sent_messages[-1][1]
     provider.preflight.assert_not_awaited()
 
 
@@ -677,8 +1125,8 @@ async def test_code_handler_mail_failure_still_returns_totp(
         await handler(_ctx(gateway, session))
 
     text = gateway.sent_messages[0][1]
-    assert "TOTP (приложение): 777777" in text
-    assert "нужен продавец" in text
+    assert "Код подтверждения: 777777" in text
+    assert "получить код из почты не удалось" in text
     assert "safe mailbox error" not in text
 
 
@@ -774,7 +1222,7 @@ async def test_subscription_handler_hides_stale_limits_when_refresh_fails(
     )(_ctx(gateway, session, command=CommandType.SUBSCRIPTION))
 
     text = gateway.sent_messages[0][1]
-    assert "не удалось обновить" in text
+    assert "получить не удалось" in text
     assert "73%" not in text
 
 
@@ -826,7 +1274,7 @@ async def test_subscription_handler_trusts_persisted_limit_status(
     )
 
     assert rental.account_id is not None
-    assert "не удалось обновить" in gateway.sent_messages[0][1]
+    assert "получить не удалось" in gateway.sent_messages[0][1]
     assert "42%" not in gateway.sent_messages[0][1]
 
 
@@ -845,6 +1293,7 @@ async def test_seller_handler_responds(session: AsyncSession):
     ):
         await handler(ctx)
     assert len(gateway.sent_messages) == 1
+    assert "Запрос зарегистрирован" in gateway.sent_messages[0][1]
     notifier.notify_seller_called.assert_awaited_once_with(
         str(ctx.sender_id),
         funpay_chat_id=str(ctx.chat_id),
@@ -888,6 +1337,7 @@ async def _add_replacement_candidate(
         tier_id=rental.tier_id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(account)
     await session.flush()
@@ -906,6 +1356,55 @@ async def _add_replacement_candidate(
     return account
 
 
+async def test_replace_handler_live_refund_revokes_before_replacement(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    rental = await _seed_rental(session)
+    order = await session.get(Order, rental.order_id)
+    old_account_id = rental.account_id
+    gateway = FakeChatGateway()
+    ctx = _ctx(
+        gateway,
+        session,
+        command=CommandType.REPLACE,
+        order_id=order.funpay_order_id,
+    )
+    gateway.set_order(OrderInfo(
+        order_id=order.funpay_order_id,
+        status=SaleStatus.REFUNDED,
+        chat_id=int(order.funpay_chat_id),
+        buyer_id=int(order.buyer_funpay_id),
+        subcategory_id=55,
+        title="ChatGPT",
+        price=100,
+        offer_id=5001,
+    ))
+    validator = AsyncMock(return_value=ValidationOutcome.LOGIN_FAILED)
+    kick = FakeKickService()
+
+    await ReplaceHandler(
+        validator=validator,
+        kick_service=kick,
+    )(ctx)
+
+    validator.assert_awaited_once_with(session, old_account_id)
+    assert kick.calls == [old_account_id]
+    await session.refresh(order)
+    await session.refresh(rental)
+    sale = await session.scalar(
+        select(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    assert order.status == "refunded"
+    assert rental.status == "refunded"
+    assert rental.replacement_count == 0
+    assert sale.status == "refunded"
+    assert len(gateway.sent_messages) == 1
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
+
+
 async def test_replace_kick_starts_after_durable_claim_without_transaction(
     session: AsyncSession,
 ):
@@ -915,6 +1414,7 @@ async def test_replace_kick_starts_after_durable_claim_without_transaction(
     old_account_id = rental.account_id
     target = await _add_replacement_candidate(session, rental)
     await seed_message_templates(session)
+    capacity_events: list[str] = []
 
     class InspectingKickService:
         in_transaction_at_entry: bool | None = None
@@ -923,6 +1423,7 @@ async def test_replace_kick_starts_after_durable_claim_without_transaction(
         persisted_account_status: str | None = None
 
         async def kick(self, kick_session: AsyncSession, account_id: int):
+            assert capacity_events == ["changed"]
             self.in_transaction_at_entry = kick_session.in_transaction()
             persisted_rental = await kick_session.scalar(
                 select(Rental)
@@ -945,6 +1446,7 @@ async def test_replace_kick_starts_after_durable_claim_without_transaction(
     await ReplaceHandler(
         validator=_invalid_validator,
         kick_service=kick,
+        capacity_changed=lambda: capacity_events.append("changed"),
     )(_ctx(FakeChatGateway(), session, command=CommandType.REPLACE))
 
     assert kick.in_transaction_at_entry is False
@@ -953,6 +1455,7 @@ async def test_replace_kick_starts_after_durable_claim_without_transaction(
     assert kick.persisted_account_status == "maintenance"
     old_account = await session.get(Account, old_account_id)
     assert old_account.status == "maintenance"
+    assert len(capacity_events) >= 2
 
 
 async def test_replace_live_revoke_lease_does_not_kick_twice(
@@ -1103,6 +1606,7 @@ async def test_replace_handler_switches_account(session: AsyncSession):
         login="acc2", password_encrypted="pass2", totp_secret_encrypted="enc_totp",
         tier_id=tier.id, status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(acc2)
     await session.flush()
@@ -1125,7 +1629,15 @@ async def test_replace_handler_switches_account(session: AsyncSession):
     kick = FakeKickService()
     handler = ReplaceHandler(validator=_invalid_validator, kick_service=kick)
     ctx = _ctx(gateway, session, command=CommandType.REPLACE)
-    await handler(ctx)
+    notifier = AsyncMock()
+    with patch(
+        "app.services.command_handlers.TelegramNotifier.from_settings",
+        new=AsyncMock(return_value=notifier),
+    ):
+        await handler(ctx)
+    notifier.notify_replace_requested.assert_awaited_once_with(
+        str(ctx.sender_id), "acc1",
+    )
     assert len(gateway.sent_messages) == 1
     _, text = gateway.sent_messages[0]
     assert "acc2" in text or "pass2" in text
@@ -1244,7 +1756,7 @@ async def test_replace_handler_refuses_final_two_minutes_before_validation(
 
     validator.assert_not_awaited()
     assert kick.calls == []
-    assert "меньше 2 минут" in gateway.sent_messages[0][1]
+    assert "не более 2 минут" in gateway.sent_messages[0][1]
 
 
 async def test_replace_handler_rechecks_expiry_before_durable_switch(
@@ -1263,6 +1775,7 @@ async def test_replace_handler_rechecks_expiry_before_durable_switch(
         tier_id=tier.id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(replacement)
     await session.flush()
@@ -1306,7 +1819,7 @@ async def test_subscription_handler_expires_due_rental_synchronously(
 
     await session.refresh(rental)
     assert rental.status == "expiry_pending"
-    assert "Доступ закончился" in gateway.sent_messages[0][1]
+    assert "Действующий доступ" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_expires_due_rental_before_generating_secret(
@@ -1349,6 +1862,32 @@ async def test_replace_handler_declines_healthy_account(session: AsyncSession):
     await session.refresh(rental)
     assert rental.replacement_count == 0
     assert kick.calls == []
+    assert "Проверка завершена: аккаунт доступен" in gateway.sent_messages[0][1]
+
+
+async def test_replace_handler_without_active_order_reports_missing_access(
+    session: AsyncSession,
+):
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    validator = AsyncMock()
+    gateway = FakeChatGateway()
+    handler = ReplaceHandler(validator=validator, kick_service=FakeKickService())
+
+    await handler(
+        _ctx(
+            gateway,
+            session,
+            chat_id=999,
+            command=CommandType.REPLACE,
+        )
+    )
+
+    validator.assert_not_awaited()
+    assert "Действующий доступ по этому заказу не найден" in (
+        gateway.sent_messages[0][1]
+    )
 
 
 async def test_replace_handler_does_not_issue_second_account(session: AsyncSession):
@@ -1364,6 +1903,9 @@ async def test_replace_handler_does_not_issue_second_account(session: AsyncSessi
 
     assert kick.calls == []
     assert len(gateway.sent_messages) == 1
+    assert "Автоматически завершить замену не удалось" in (
+        gateway.sent_messages[0][1]
+    )
 
 
 async def test_replace_handler_stops_when_old_credentials_cannot_be_revoked(
@@ -1403,6 +1945,7 @@ async def test_failed_replacement_delivery_retries_same_account_without_extensio
         tier_id=tier.id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(replacement)
     await session.flush()

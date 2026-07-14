@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -101,6 +102,9 @@ async def _add_account_with_limits(
             if expires_in_days is not None
             else None
         ),
+        subscription_expiry_source=(
+            "accounts_check" if tier.code != "free" else None
+        ),
     )
     session.add(acc)
     await session.flush()
@@ -133,6 +137,29 @@ async def test_creates_lot_when_capacity_available(session: AsyncSession):
     mgr = LotAutoManager(funpay_node_id=55)
     actions = await mgr.run(session, gateway)
     assert any(a.action == "create" for a in actions)
+
+
+async def test_does_not_publish_paid_lot_for_unsourced_expiry(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    account = await _add_account_with_limits(session, tier.id)
+    account.subscription_expiry_source = None
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.flush()
+
+    actions = await LotAutoManager(funpay_node_id=55).run(
+        session,
+        FakeChatGateway(),
+    )
+
+    assert actions == []
+    assert (await session.execute(select(Lot))).scalars().all() == []
 
 
 async def test_disabled_limit_scope_is_excluded_from_automatic_lots(
@@ -285,7 +312,7 @@ async def test_template_render_error_does_not_block_other_lot_and_is_audited(
 ):
     valid_tier, duration, scope = await _seed_catalog(session)
     invalid_tier = SubscriptionTier(
-        code="pro",
+        code="pro_20x",
         name="X" * 120,
         is_active=True,
         is_sellable=True,
@@ -443,6 +470,46 @@ async def test_activates_lot_when_capacity_returns(session: AsyncSession):
     await session.refresh(lot)
     assert lot.status == "active"
     assert gateway.saved_offers[200].active is True
+
+
+async def test_capacity_refresh_republishes_single_unit_but_periodic_run_is_idle(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.flush()
+    gateway = FakeChatGateway()
+    manager = LotAutoManager(funpay_node_id=55)
+
+    created = await manager.run(session, gateway)
+    assert [action.action for action in created] == ["create"]
+    lot = (await session.execute(select(Lot))).scalar_one()
+    offer_id = int(lot.funpay_id or 0)
+    gateway.saved_offers[offer_id] = replace(
+        gateway.saved_offers[offer_id],
+        amount=0,
+    )
+
+    periodic = await manager.run(session, gateway)
+
+    assert [action.action for action in periodic] == ["none"]
+    assert gateway.saved_offers[offer_id].amount == 0
+
+    capacity_change = await manager.run(
+        session,
+        gateway,
+        refresh_stock=True,
+    )
+
+    assert [action.action for action in capacity_change] == ["update"]
+    assert gateway.saved_offers[offer_id].amount == 1
+    assert gateway.saved_offers[offer_id].active is True
 
 
 @pytest.mark.parametrize("rental_status", ["active", "expiry_pending"])
@@ -766,6 +833,7 @@ async def test_disabled_limit_scope_pauses_existing_auto_lot(
     [
         "tier_inactive",
         "tier_unsellable",
+        "funpay_form",
         "duration",
         "scope",
         "chat",
@@ -781,6 +849,8 @@ async def test_unavailable_catalog_pauses_existing_manual_lot(
         tier.is_active = False
     elif unavailable_catalog == "tier_unsellable":
         tier.is_sellable = False
+    elif unavailable_catalog == "funpay_form":
+        tier.code = "enterprise"
     elif unavailable_catalog == "duration":
         duration.is_enabled = False
     elif unavailable_catalog == "scope":
@@ -811,6 +881,29 @@ async def test_unavailable_catalog_pauses_existing_manual_lot(
     assert any(action.action == "pause" for action in actions)
     assert lot.status == "paused"
     assert lot.paused_reason == "catalog_unavailable"
+
+
+async def test_unsupported_sellable_tier_is_not_auto_published(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    tier.code = "enterprise"
+    await _add_account_with_limits(session, tier.id)
+    matrix = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    gateway = FakeChatGateway()
+
+    actions = await LotAutoManager(55).run(session, gateway)
+
+    assert actions == []
+    assert list((await session.execute(select(Lot))).scalars()) == []
+    assert gateway.saved_offers == {}
 
 
 @pytest.mark.parametrize(
@@ -859,7 +952,9 @@ async def test_codex_capacity_uses_exact_plan_window(
     lot = (await session.execute(select(Lot))).scalar_one()
     assert f"Codex ≥ {matrix.min_limit_pct}%" in lot.title_ru
     assert "30 дней только на Free, 7 дней на платных" in lot.description_ru
-    assert "фактический остаток OpenAI" in lot.description_ru
+    assert "последнюю успешную проверку остатка лимита Codex" in (
+        lot.description_ru
+    )
 
 
 @pytest.mark.parametrize(

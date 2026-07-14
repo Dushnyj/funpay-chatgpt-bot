@@ -91,6 +91,7 @@ DATABASE_URL=postgresql+asyncpg://funpay:PASSWORD@postgres:5432/funpay_bot
 ENCRYPTION_KEY=<Fernet ключ>
 SECRET_KEY=<случайная строка>
 ADMIN_PASSWORD_HASH=<bcrypt хеш>
+BROWSER_CONCURRENCY_CAP=1  # предел фоновых Chromium-задач для сервера с 2 ГБ RAM
 FUNPAY_SESSION_KEY=<опциональный env fallback для golden_key>
 TELEGRAM_BOT_TOKEN=<опционально>
 TELEGRAM_SELLER_CHAT_ID=<опционально>
@@ -116,6 +117,6 @@ POSTGRES_PASSWORD=<пароль БД>
 ```bash
 cd backend
 pip install -e ".[dev]"
-pytest                    # 415+ тестов
-cd ../frontend && npm run lint && npm run build
+pytest                    # 800+ backend-тестов
+cd ../frontend && npm run lint && npm run test && npm run build
 ```

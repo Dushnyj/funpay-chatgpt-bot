@@ -75,3 +75,43 @@ def test_build_context_parses_command(router: CommandRouter, gateway: FakeChatGa
 def test_build_context_none_parsed_for_non_command(router: CommandRouter, gateway: FakeChatGateway):
     ctx = _ctx(router, gateway, "обычное сообщение")
     assert ctx.parsed is None
+
+
+def test_build_context_derives_normalized_order_only_without_event_order(
+    router: CommandRouter,
+    gateway: FakeChatGateway,
+):
+    ctx = _ctx(
+        router,
+        gateway,
+        "!code #hhhgnz4n",
+        order_id=None,
+    )
+
+    assert ctx.order_id == "HHHGNZ4N"
+    assert ctx.order_reference_invalid is False
+
+
+def test_build_context_preserves_authoritative_event_order(
+    router: CommandRouter,
+    gateway: FakeChatGateway,
+):
+    ctx = _ctx(
+        router,
+        gateway,
+        "!code #FOREIGN1",
+        order_id="HHHGNZ4N",
+    )
+
+    assert ctx.order_id == "HHHGNZ4N"
+    assert ctx.order_reference_invalid is False
+
+
+def test_build_context_marks_malformed_order_reference_without_fallback(
+    router: CommandRouter,
+    gateway: FakeChatGateway,
+):
+    ctx = _ctx(router, gateway, "!code HHHGNZ4N", order_id=None)
+
+    assert ctx.order_id is None
+    assert ctx.order_reference_invalid is True

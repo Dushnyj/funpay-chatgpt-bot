@@ -1,6 +1,6 @@
 import pytest
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import FakeChatGateway
@@ -8,10 +8,15 @@ from app.integrations.funpay.types import OrderInfo, SaleStatus
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.account import Account, AccountCheckJob
 from app.models.audit import AuditLog
+from app.models.funpay_sale import FunPaySale
 from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.services.kick_service import KickResult
-from app.services.order_processor import OrderProcessor, LotNotFoundError
+from app.services.order_processor import (
+    LotNotFoundError,
+    OrderProcessor,
+    UnverifiedOrderProvenanceError,
+)
 
 
 class FakeKickService:
@@ -75,6 +80,13 @@ async def _add_active_rental(
     *,
     login: str = "refund@example.com",
 ) -> tuple[Rental, Account]:
+    session.add(FunPaySale(
+        funpay_order_id=order.funpay_order_id,
+        order_id=order.id,
+        funpay_chat_id=order.funpay_chat_id,
+        buyer_funpay_id=order.buyer_funpay_id,
+        status="paid",
+    ))
     account = Account(
         login=login,
         password_encrypted="pass",
@@ -82,6 +94,7 @@ async def _add_active_rental(
         tier_id=order.tier_id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(account)
     await session.flush()
@@ -115,6 +128,40 @@ async def test_process_new_sale_creates_order(session: AsyncSession, gateway: Fa
     assert order.funpay_offer_id == "9001"
     assert order.lot_provenance_token is None
     assert order.status == "pending"
+
+
+@pytest.mark.parametrize(
+    ("remote_status", "local_status"),
+    [
+        (SaleStatus.PAID, "pending"),
+        (SaleStatus.COMPLETED, "completed"),
+        (SaleStatus.REFUNDED, "refunded"),
+        (SaleStatus.UNKNOWN, "pending"),
+    ],
+)
+async def test_process_new_sale_preserves_remote_terminal_status(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+    remote_status: SaleStatus,
+    local_status: str,
+):
+    await _seed_catalog_and_lot(session)
+    gateway.set_order(OrderInfo(
+        order_id="terminal-at-intake",
+        status=remote_status,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title="Plus 7d",
+        price=599.0,
+        offer_id=9001,
+    ))
+
+    order = await OrderProcessor().process_new_sale(
+        session, gateway, "terminal-at-intake",
+    )
+
+    assert order.status == local_status
 
 
 async def test_process_new_sale_idempotent(session: AsyncSession, gateway: FakeChatGateway):
@@ -208,9 +255,44 @@ async def test_process_sale_closed_marks_completed(session: AsyncSession, gatewa
 async def test_process_sale_refunded_marks_refunded(session: AsyncSession, gateway: FakeChatGateway):
     await _seed_catalog_and_lot(session)
     proc = OrderProcessor()
-    await proc.process_new_sale(session, gateway, order_id="ord-1")
+    created = await proc.process_new_sale(session, gateway, order_id="ord-1")
+    session.add(FunPaySale(
+        funpay_order_id=created.funpay_order_id,
+        order_id=created.id,
+        funpay_chat_id=created.funpay_chat_id,
+        buyer_funpay_id=created.buyer_funpay_id,
+        status="paid",
+    ))
+    await session.flush()
     order = await proc.process_sale_refunded(session, order_id="ord-1")
     assert order.status == "refunded"
+
+
+async def test_refund_never_kicks_account_for_unverified_order(
+    session: AsyncSession,
+    gateway: FakeChatGateway,
+):
+    await _seed_catalog_and_lot(session)
+    order = await OrderProcessor().process_new_sale(session, gateway, "ord-1")
+    rental, account = await _add_active_rental(session, order)
+    await session.execute(
+        delete(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    await session.commit()
+    kick = FakeKickService(success=True)
+
+    with pytest.raises(UnverifiedOrderProvenanceError):
+        await OrderProcessor(kick_service=kick).process_sale_refunded(
+            session, "ord-1",
+        )
+
+    await session.refresh(order)
+    await session.refresh(rental)
+    await session.refresh(account)
+    assert kick.calls == []
+    assert order.status == "pending"
+    assert rental.status == "active"
+    assert account.status == "active"
 
 
 async def test_late_refund_after_expiry_keeps_history_consistent(
@@ -256,6 +338,7 @@ async def test_refund_releases_stale_replacement_target(
         tier_id=order.tier_id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(target)
     await session.flush()
@@ -280,7 +363,15 @@ async def test_late_close_cannot_resurrect_refunded_order(
 ):
     await _seed_catalog_and_lot(session)
     proc = OrderProcessor()
-    await proc.process_new_sale(session, gateway, order_id="ord-1")
+    created = await proc.process_new_sale(session, gateway, order_id="ord-1")
+    session.add(FunPaySale(
+        funpay_order_id=created.funpay_order_id,
+        order_id=created.id,
+        funpay_chat_id=created.funpay_chat_id,
+        buyer_funpay_id=created.buyer_funpay_id,
+        status="paid",
+    ))
+    await session.flush()
     await proc.process_sale_refunded(session, order_id="ord-1")
 
     order = await proc.process_sale_closed(session, order_id="ord-1")

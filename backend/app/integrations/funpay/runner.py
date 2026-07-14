@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from app.integrations.funpay.gateway import FunPayChatGateway
+from app.integrations.funpay.exceptions import GoldenKeyError
+from app.integrations.funpay.secure_session import SecureFunPaySession
 from app.integrations.funpay.types import MessageInfo
 
 
@@ -102,6 +104,17 @@ class FunPayRunner:
             return
         self._ensure_components()
         await self._bot.update()
+        try:
+            user_id = int(self._bot.userid)
+            username = str(self._bot.username or "").strip()
+        except Exception as exc:
+            raise GoldenKeyError(
+                "FunPay did not authenticate the configured golden_key"
+            ) from exc
+        if user_id <= 0 or not username:
+            raise GoldenKeyError(
+                "FunPay did not authenticate the configured golden_key"
+            )
         self._prepared = True
 
     async def start(self) -> None:
@@ -128,13 +141,21 @@ class FunPayRunner:
             with suppress(asyncio.CancelledError):
                 await self._listener_task
             self._listener_task = None
+        session = getattr(self._bot, "session", None)
+        close_session = getattr(session, "close", None)
+        if close_session is not None:
+            with suppress(Exception):
+                await close_session()
         self._started = False
 
     def _ensure_components(self) -> None:
         from funpaybotengine import Bot, Dispatcher
 
         if self._bot is None:
-            self._bot = Bot(golden_key=self._golden_key)
+            self._bot = Bot(
+                golden_key=self._golden_key,
+                session=SecureFunPaySession(),
+            )
         if self._dp is None:
             self._dp = Dispatcher()
 

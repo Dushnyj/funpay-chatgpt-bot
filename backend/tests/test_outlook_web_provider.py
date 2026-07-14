@@ -9,6 +9,7 @@ from app.integrations.email.outlook_web_provider import (
     _MessageSnapshot,
     _looks_like_openai_code_message,
     _message_fingerprint,
+    _is_trusted_microsoft_login_url,
     is_outlook_address,
 )
 from app.integrations.email.provider import EmailErrorCode, EmailProviderError
@@ -30,6 +31,19 @@ def test_recognises_microsoft_consumer_domains(address):
 
 def test_does_not_treat_custom_exchange_domain_as_outlook_web():
     assert not is_outlook_address("user@example.org")
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://login.live.com/oauth20_authorize.srf", True),
+        ("https://login.microsoftonline.com/common/oauth2/v2.0/authorize", True),
+        ("http://login.live.com/", False),
+        ("https://login.live.com.attacker.example/", False),
+    ],
+)
+def test_password_entry_host_allowlist(url, expected):
+    assert _is_trusted_microsoft_login_url(url) is expected
 
 
 @pytest.mark.parametrize(
@@ -96,6 +110,37 @@ async def test_preflight_baselines_existing_messages_and_reuses_session(monkeypa
     assert provider._baseline_keys == {"old-key"}
     assert provider.baseline_at is not None
     assert provider._storage_state == {"cookies": [{"name": "session"}]}
+
+
+async def test_password_switch_supports_microsoft_role_button_markup():
+    provider = OutlookWebProvider("user@hotmail.com", "password")
+    clicked: list[str] = []
+
+    class Locator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+            self.first = self
+
+        async def is_visible(self) -> bool:
+            return self.selector == (
+                "[role='button']:has-text('Используйте свой пароль')"
+            )
+
+        async def click(self) -> None:
+            clicked.append(self.selector)
+
+        async def wait_for(self, **_kwargs) -> None:
+            return None
+
+    class Page:
+        def locator(self, selector: str) -> Locator:
+            return Locator(selector)
+
+    await provider._switch_to_password_if_offered(Page())
+
+    assert clicked == [
+        "[role='button']:has-text('Используйте свой пароль')"
+    ]
 
 
 async def test_fetch_reads_only_message_newer_than_baseline(monkeypatch):
@@ -354,6 +399,26 @@ async def test_send_code_action_is_treated_as_manual_security_challenge():
     with pytest.raises(EmailProviderError) as error:
         await provider._raise_for_login_failure_or_challenge(page)
     assert error.value.code is EmailErrorCode.SECURITY_CHALLENGE
+
+
+async def test_password_form_is_not_misclassified_by_hidden_send_code_copy():
+    provider = OutlookWebProvider("user@hotmail.com", "password")
+    page = MagicMock()
+
+    def locator_for(selector):
+        locator = _locator_for(selector)
+        if "input[name='passwd']" in selector:
+            locator.is_visible = AsyncMock(return_value=True)
+        if "Send code" in selector:
+            locator.is_visible = AsyncMock(return_value=True)
+        return locator
+
+    page.locator.side_effect = locator_for
+    provider._safe_body_text = AsyncMock(
+        return_value="verify your identity or send a code"
+    )
+
+    await provider._raise_for_login_failure_or_challenge(page)
 
 
 def _locator_for(_selector):

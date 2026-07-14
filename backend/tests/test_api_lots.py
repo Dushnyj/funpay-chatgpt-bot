@@ -43,7 +43,7 @@ async def auth_client():
 
 
 async def _seed_catalog(session: AsyncSession):
-    tier = SubscriptionTier(name="Plus", is_active=True)
+    tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
     session.add(tier)
     duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
@@ -132,6 +132,7 @@ async def test_create_manual_lot_rejects_disabled_limit_scope(
     [
         ("tier_inactive", "tariff is unavailable"),
         ("tier_unsellable", "tariff is unavailable"),
+        ("funpay_form", "not supported by the FunPay"),
         ("duration", "duration is disabled"),
         ("scope", "limit scope is disabled"),
         ("chat", "limit scope is disabled or invalid"),
@@ -150,6 +151,8 @@ async def test_reactivate_manual_lot_rejects_unavailable_catalog(
         tier.is_active = False
     elif unavailable_catalog == "tier_unsellable":
         tier.is_sellable = False
+    elif unavailable_catalog == "funpay_form":
+        tier.code = "enterprise"
     elif unavailable_catalog == "duration":
         duration.is_enabled = False
     elif unavailable_catalog == "scope":

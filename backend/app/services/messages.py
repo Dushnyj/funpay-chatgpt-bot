@@ -28,6 +28,9 @@ _USAGE_FIELDS = frozenset(
         "codex_secondary_limit",
         "codex_secondary_window",
         "codex_secondary_reset",
+        # Compact localized block. Unlike the individual compatibility fields,
+        # this omits an unobserved secondary window instead of printing dashes.
+        "codex_usage_summary",
     }
 )
 
@@ -56,8 +59,11 @@ TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
     "account_unavailable": frozenset(),
     "delivery_pending": frozenset(),
     "code_expired": frozenset(),
-    "rental_ambiguous": frozenset(),
+    "rental_ambiguous": frozenset({"active_orders"}),
     "code_rate_limited": frozenset({"retry_in_sec"}),
+    "code_delivery_uncertain": frozenset(
+        {"retry_in_sec", "retry_command"}
+    ),
     "email_code_success": frozenset({"email_code"}),
     "email_code_duplicate": frozenset(),
     "email_code_not_found": frozenset(),
@@ -85,6 +91,7 @@ TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
     "replace_declined": frozenset(),
     "replace_expiring": frozenset(),
     "replace_no_account": frozenset(),
+    "seller_required": frozenset(),
     "seller_called": frozenset(),
     "help": frozenset(),
     "order_confirmed": frozenset(),
@@ -256,6 +263,25 @@ def usage_template_variables(
         "codex_secondary_reset": _format_reset(
             limits.codex_secondary_resets_at if limits else None, lang
         ),
+        "codex_usage_summary": _format_usage_summary(
+            primary_remaining=(
+                limits.codex_primary_remaining_pct if limits else None
+            ),
+            primary_window=(
+                limits.codex_primary_window_seconds if limits else None
+            ),
+            primary_reset=(limits.codex_primary_resets_at if limits else None),
+            secondary_remaining=(
+                limits.codex_secondary_remaining_pct if limits else None
+            ),
+            secondary_window=(
+                limits.codex_secondary_window_seconds if limits else None
+            ),
+            secondary_reset=(
+                limits.codex_secondary_resets_at if limits else None
+            ),
+            lang=lang,
+        ),
     }
 
 
@@ -292,6 +318,15 @@ def issued_usage_template_variables(
         ),
         "codex_secondary_reset": _format_reset(
             rental.issued_codex_secondary_resets_at, lang
+        ),
+        "codex_usage_summary": _format_usage_summary(
+            primary_remaining=rental.issued_codex_primary_pct,
+            primary_window=rental.issued_codex_primary_window_seconds,
+            primary_reset=rental.issued_codex_primary_resets_at,
+            secondary_remaining=rental.issued_codex_secondary_pct,
+            secondary_window=rental.issued_codex_secondary_window_seconds,
+            secondary_reset=rental.issued_codex_secondary_resets_at,
+            lang=lang,
         ),
     }
 
@@ -339,6 +374,52 @@ def _format_reset(value: datetime | None, lang: str) -> str:
     if lang == "en":
         return value.strftime("%Y-%m-%d %H:%M UTC")
     return value.strftime("%d.%m.%Y %H:%M UTC")
+
+
+def _format_usage_summary(
+    *,
+    primary_remaining: int | None,
+    primary_window: int | None,
+    primary_reset: datetime | None,
+    secondary_remaining: int | None,
+    secondary_window: int | None,
+    secondary_reset: datetime | None,
+    lang: str,
+) -> str:
+    """Render only the OpenAI usage windows that were actually observed."""
+
+    windows = (
+        (
+            "Основное окно" if lang != "en" else "Primary window",
+            primary_remaining,
+            primary_window,
+            primary_reset,
+        ),
+        (
+            "Дополнительное окно" if lang != "en" else "Secondary window",
+            secondary_remaining,
+            secondary_window,
+            secondary_reset,
+        ),
+    )
+    lines: list[str] = []
+    for label, remaining, window, reset in windows:
+        if remaining is None and not window and reset is None:
+            continue
+        limit_text = _exact_percentage(remaining)
+        window_text = _format_window(window, lang)
+        reset_text = _format_reset(reset, lang)
+        reset_label = "resets" if lang == "en" else "сброс"
+        lines.append(
+            f"{label}: {limit_text} · {window_text}; {reset_label} {reset_text}"
+        )
+    if lines:
+        return "\n".join(lines)
+    return (
+        "Data is currently unavailable."
+        if lang == "en"
+        else "Данные пока недоступны."
+    )
 
 
 async def _find_template(session: AsyncSession, key: str, lang: str) -> MessageTemplate:

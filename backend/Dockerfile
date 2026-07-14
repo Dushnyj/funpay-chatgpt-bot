@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY backend/ .
-RUN pip install --no-cache-dir . \
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1.2" \
+    && pip install --no-cache-dir . \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 app \

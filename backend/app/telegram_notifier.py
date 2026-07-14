@@ -57,7 +57,10 @@ class TelegramNotifier:
             raise RuntimeError("Telegram is not configured")
         await self._bot.send_message(
             chat_id=self._seller_chat_id,
-            text="✅ FunPay Bot: Telegram notifications are configured.",
+            text=(
+                "Связь с Telegram настроена\n"
+                "FunPay Bot готов отправлять уведомления."
+            ),
         )
 
     async def notify(self, text: str) -> bool:
@@ -71,22 +74,40 @@ class TelegramNotifier:
             return False
 
     async def notify_new_order(self, order_id: str, desc: str, price: int) -> None:
-        await self.notify(f"🆕 Новый заказ #{order_id}: {desc}, {price}₽")
+        await self.notify(
+            "Новый заказ\n"
+            f"Заказ: #{order_id}\n"
+            f"Позиция: {desc}\n"
+            f"Сумма: {price} ₽"
+        )
 
     async def notify_order_confirmed(self, order_id: str) -> None:
-        await self.notify(f"✅ Заказ #{order_id} подтверждён")
+        await self.notify(f"Заказ подтверждён\nЗаказ: #{order_id}")
 
     async def notify_dispute(self, order_id: str) -> None:
-        await self.notify(f"⚠️ СПОР по заказу #{order_id}!")
+        await self.notify(
+            f"Требуется внимание\nОткрыт спор по заказу #{order_id}."
+        )
 
     async def notify_replace_requested(self, buyer_id: str, account_login: str) -> None:
-        await self.notify(f"🔄 Замена: покупатель {buyer_id} запросил замену аккаунта {account_login}")
+        await self.notify(
+            "Запрос на замену\n"
+            f"Покупатель: {buyer_id}\n"
+            f"Аккаунт: {account_login}"
+        )
 
     async def notify_rental_expired(self, account_login: str) -> None:
-        await self.notify(f"⏰ Аренда истекла: аккаунт {account_login}, освободился слот")
+        await self.notify(
+            "Аренда завершена\n"
+            f"Аккаунт: {account_login}"
+        )
 
     async def notify_account_unavailable(self, account_login: str, reason: str) -> None:
-        await self.notify(f"🔴 Аккаунт {account_login} недоступен ({reason})")
+        await self.notify(
+            "Аккаунт недоступен\n"
+            f"Аккаунт: {account_login}\n"
+            f"Причина: {reason}"
+        )
 
     async def notify_low_limits(
         self,
@@ -96,8 +117,10 @@ class TelegramNotifier:
         window_label: str,
     ) -> bool:
         return await self.notify(
-            f"📊 Длинный лимит Codex аккаунта {account_login} "
-            f"({window_label}) снизился до {remaining_pct}%"
+            "Низкий лимит Codex\n"
+            f"Аккаунт: {account_login}\n"
+            f"Окно: {window_label}\n"
+            f"Остаток: {remaining_pct}%"
         )
 
     async def notify_seller_called(
@@ -107,23 +130,39 @@ class TelegramNotifier:
         funpay_chat_id: str | None = None,
         order_id: str | None = None,
     ) -> None:
-        context = []
+        context = [
+            "Покупатель вызвал продавца",
+            f"Покупатель: {buyer_id}",
+        ]
         if funpay_chat_id:
-            context.append(f"чат FunPay #{funpay_chat_id}")
+            context.append(f"Чат FunPay: #{funpay_chat_id}")
         if order_id:
-            context.append(f"заказ #{order_id}")
-        suffix = f" ({', '.join(context)})" if context else ""
-        await self.notify(
-            f"📢 Покупатель {buyer_id} вызывает продавца{suffix}. "
-            "Ответьте ему в разделе «Чаты» админ-панели."
+            context.append(f"Заказ: #{order_id}")
+        context.extend(
+            (
+                "",
+                "Ответьте покупателю в разделе «Чаты» админ-панели.",
+            )
         )
+        await self.notify("\n".join(context))
 
     async def notify_order_refunded(self, order_id: str, *, pending: bool) -> None:
-        state = "ожидает подтверждённого выхода из аккаунта" if pending else "возвращён"
-        await self.notify(f"↩️ Заказ #{order_id}: {state}")
+        state = (
+            "выход из аккаунта ещё не подтверждён"
+            if pending
+            else "возврат завершён"
+        )
+        await self.notify(
+            "Возврат заказа\n"
+            f"Заказ: #{order_id}\n"
+            f"Статус: {state}"
+        )
 
     async def notify_bump_failed(self, lot_id: int) -> None:
-        await self.notify(f"❌ Bump лота #{lot_id} не удался")
+        await self.notify(f"Не удалось поднять лот\nЛот: #{lot_id}")
 
     async def notify_funpay_disconnect(self) -> None:
-        await self.notify("🔴 FunPay дисконнект / golden_key протух")
+        await self.notify(
+            "Потеряно соединение с FunPay\n"
+            "Проверьте подключение и golden_key в настройках."
+        )

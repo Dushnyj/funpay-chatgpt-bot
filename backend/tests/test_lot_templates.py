@@ -3,6 +3,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.lot import LotTemplate
 from app.services.lot_templates import (
+    DEFAULT_LOT_TEMPLATES,
     LotTemplateRenderError,
     LotTemplateValidationError,
     render_lot_template,
@@ -71,6 +72,42 @@ def test_lot_template_source_rejects_possible_post_substitution_overflow():
             description_ru="",
             description_en="",
         )
+
+
+def test_default_lot_copy_is_localized_compact_and_contract_safe():
+    template = DEFAULT_LOT_TEMPLATES["default"]
+    title_ru_fields = validate_lot_template_content(
+        template.title_ru, field="title_ru"
+    )
+    title_en_fields = validate_lot_template_content(
+        template.title_en, field="title_en"
+    )
+    description_ru_fields = validate_lot_template_content(
+        template.description_ru, field="description_ru"
+    )
+    description_en_fields = validate_lot_template_content(
+        template.description_en, field="description_en"
+    )
+
+    assert title_ru_fields == title_en_fields
+    assert description_ru_fields == description_en_fields
+    assert "30 дней только на Free, 7 дней на платных тарифах" in (
+        template.description_ru
+    )
+    assert "последнюю успешную проверку остатка лимита Codex" in (
+        template.description_ru
+    )
+    assert "Данные для входа придут в чат FunPay" in template.description_ru
+    assert not set("✅❌⚠⏳🔑📧📊📱🔄📢📖🙏⏰┌┐└┘─│╔╗╚╝║═").intersection(
+        template.title_ru + template.title_en
+        + template.description_ru + template.description_en
+    )
+    validate_lot_template_values(
+        title_ru=template.title_ru,
+        title_en=template.title_en,
+        description_ru=template.description_ru,
+        description_en=template.description_en,
+    )
 
 
 async def test_enabled_custom_lot_template_target_is_database_unique(session):

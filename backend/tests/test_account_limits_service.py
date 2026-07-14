@@ -199,6 +199,8 @@ async def test_measure_and_update_success(session, httpx_mock):
     assert reloaded_account.plan_source == "accounts_check+wham_usage"
     assert reloaded_account.plan_confidence == pytest.approx(0.92)
     assert reloaded_account.plan_detected_at is not None
+    assert reloaded_account.subscription_expiry_source == "accounts_check"
+    assert reloaded.subscription_expiry_source == "accounts_check"
 
 
 @pytest.mark.asyncio
@@ -289,6 +291,8 @@ async def test_measure_current_free_claims_preserves_sellable_override_and_exact
     assert free_tier.is_sellable is False
     assert account.subscription_expires_at is None
     assert limits.subscription_expires_at is None
+    assert account.subscription_expiry_source is None
+    assert limits.subscription_expiry_source is None
     assert limits.codex_primary_remaining_pct == 93
     assert limits.codex_primary_window_seconds == 2592000
     observed_reset = limits.codex_primary_resets_at
@@ -481,8 +485,12 @@ async def test_measure_skips_refresh_if_token_fresh(session, httpx_mock):
     reloaded = await session.get(AccountLimits, acc.id)
     # access_token не изменился
     assert reloaded.access_token_encrypted == "valid-access"
-    assert acc.subscription_expires_at == known_expiry
-    assert reloaded.subscription_expires_at == known_expiry
+    # A pre-provenance/manual value is not promoted when accounts/check omits
+    # the deadline.
+    assert acc.subscription_expires_at is None
+    assert acc.subscription_expiry_source is None
+    assert reloaded.subscription_expires_at is None
+    assert reloaded.subscription_expiry_source is None
 
 
 @pytest.mark.asyncio

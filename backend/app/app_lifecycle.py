@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, func, or_, select
 
 from app.check_job_queue import CheckJobQueue
+from app.config import get_settings
 from app.db.session import async_session_factory
 from app.integrations.funpay.runner import FunPayRunner, RunnerCallbacks
 from app.integrations.funpay.types import SaleStatus
@@ -23,6 +24,12 @@ from app.services.lot_auto_manager import LotAutoManager, ProvenanceMarkerSyncEr
 from app.services.lot_sync import LotSyncService
 from app.services.offer_configuration import validate_offer_configurations
 from app.services.order_processor import OrderProcessor
+from app.services.order_notifications import (
+    GlobalOrderNotificationDeliveryError,
+    OrderNotificationService,
+    buyer_confirmation_due,
+    buyer_confirmation_missing,
+)
 from app.services.order_provenance import (
     exact_lot_binding_exists,
     is_verified_bot_sale_order,
@@ -78,6 +85,7 @@ class AppLifecycle:
     """Own the FunPay transport and all periodic application tasks."""
 
     def __init__(self, golden_key: str, category_id: int) -> None:
+        self._browser_concurrency_cap = get_settings().browser_concurrency_cap
         self._golden_key = golden_key
         self._category_id = category_id
         self.scheduler = Scheduler()
@@ -85,6 +93,10 @@ class AppLifecycle:
         self._gateway = None
         self.last_funpay_error: str | None = None
         self._funpay_lock = asyncio.Lock()
+        self._capacity_reconcile_dirty = False
+        self._capacity_reconcile_task: asyncio.Task[None] | None = None
+        self._capacity_reconcile_stopping = False
+        self._capacity_reconcile_retry_seconds = 5.0
         self._limits_interval_seconds = 5 * 60
         self._validation_interval_seconds = 24 * 60 * 60
         self._lot_interval_seconds = 10 * 60
@@ -92,14 +104,19 @@ class AppLifecycle:
         self._refresh_interval_seconds = 60
         self._pending_order_interval_seconds = CREDENTIAL_DELIVERY_POLL_SECONDS
         self._sale_sync_interval_seconds = 120
-        self._refresh_concurrency = 3
-        self._revoke_concurrency = 4
+        self._refresh_concurrency = self._browser_concurrency_cap
+        self._revoke_concurrency = self._browser_concurrency_cap
         self._revoke_semaphore = asyncio.Semaphore(self._revoke_concurrency)
         self._refresh_max_attempts = 3
         self._refresh_retry_delay_seconds = 5 * 60
-        self._expiry = RentalExpiryService()
+        self._expiry = RentalExpiryService(
+            capacity_changed=self.request_capacity_reconcile,
+        )
         self._refunds = OrderProcessor()
-        self._rentals = RentalService()
+        self._order_notifications = OrderNotificationService()
+        self._rentals = RentalService(
+            capacity_changed=self.request_capacity_reconcile,
+        )
         self._bump = BumpService()
         self._jobs = CheckJobQueue()
         self._lot_sync = LotSyncService()
@@ -108,6 +125,7 @@ class AppLifecycle:
 
     async def start(self) -> None:
         """Start the live FunPay listener when a session key is configured."""
+        self._capacity_reconcile_stopping = False
         await self.reconfigure_funpay()
         await self._recover_interrupted_validation_jobs()
         self._register_tasks()
@@ -154,7 +172,11 @@ class AppLifecycle:
                     effective_key, RunnerCallbacks(), self._category_id,
                 )
                 gateway = candidate.gateway
-                candidate.set_callbacks(build_callbacks(async_session_factory, gateway))
+                candidate.set_callbacks(build_callbacks(
+                    async_session_factory,
+                    gateway,
+                    capacity_changed=self.request_capacity_reconcile,
+                ))
                 # Authenticate without enabling callbacks, then make the
                 # ownership marker a startup barrier. Otherwise a sale of a
                 # pre-migration lot can arrive before its immutable marker is
@@ -185,6 +207,8 @@ class AppLifecycle:
                 self._golden_key = effective_key
                 self.last_funpay_error = None
                 await self._set_session_valid(True)
+                if self._capacity_reconcile_dirty:
+                    self.request_capacity_reconcile()
                 return True
             except Exception as exc:
                 logger.exception("FunPay runtime failed to start")
@@ -234,6 +258,12 @@ class AppLifecycle:
     async def stop(self) -> None:
         """Остановка Scheduler (и Runner если есть)."""
         await self.scheduler.stop()
+        self._capacity_reconcile_stopping = True
+        capacity_task = self._capacity_reconcile_task
+        if capacity_task is not None and not capacity_task.done():
+            capacity_task.cancel()
+            await asyncio.gather(capacity_task, return_exceptions=True)
+        self._capacity_reconcile_task = None
         async with self._funpay_lock:
             if self.runner is not None:
                 try:
@@ -243,6 +273,75 @@ class AppLifecycle:
                 finally:
                     self.runner = None
                     self._gateway = None
+
+    def request_capacity_reconcile(self) -> None:
+        """Coalesce capacity changes into a non-blocking remote lot refresh.
+
+        Callers invoke this only after committing their durable allocation or
+        release.  The actual FunPay operation runs in its own task, so code
+        that is already inside ``_funpay_lock`` can never self-deadlock.
+        """
+
+        if self._capacity_reconcile_stopping:
+            return
+        self._capacity_reconcile_dirty = True
+        # Preserve the dirty state while disconnected. Reconfiguration starts
+        # the worker as soon as a live transport is installed.
+        if self._gateway is None:
+            return
+        task = self._capacity_reconcile_task
+        if task is None or task.done():
+            self._capacity_reconcile_task = asyncio.create_task(
+                self._capacity_reconcile_loop(),
+                name="capacity-lot-reconcile",
+            )
+
+    async def _capacity_reconcile_loop(self) -> None:
+        """Drain the dirty flag; retain it across transient remote failures."""
+
+        current_task = asyncio.current_task()
+        retry_delay = self._capacity_reconcile_retry_seconds
+        try:
+            while (
+                self._capacity_reconcile_dirty
+                and not self._capacity_reconcile_stopping
+            ):
+                if self._gateway is None:
+                    return
+                self._capacity_reconcile_dirty = False
+                try:
+                    await self.reconcile_lots(refresh_stock=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The DB state is authoritative and already committed.
+                    # Keep the dirty bit so this loop retries; the regular
+                    # lot-auto task is an additional eventual-recovery path.
+                    self._capacity_reconcile_dirty = True
+                    logger.exception(
+                        "Capacity lot reconciliation failed; retry scheduled"
+                    )
+                    if self._gateway is None:
+                        return
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(
+                        max(self._capacity_reconcile_retry_seconds, retry_delay * 2),
+                        5 * 60,
+                    )
+                else:
+                    retry_delay = self._capacity_reconcile_retry_seconds
+                    # Let same-tick requests merge into at most one follow-up.
+                    await asyncio.sleep(0)
+        finally:
+            if self._capacity_reconcile_task is current_task:
+                self._capacity_reconcile_task = None
+            # Close the narrow race where a caller marks dirty after the loop
+            # condition but before task cleanup.
+            if (
+                self._capacity_reconcile_dirty
+                and not self._capacity_reconcile_stopping
+            ):
+                self.request_capacity_reconcile()
 
     async def _load_runtime_settings(self) -> tuple[str, int | None]:
         """Prefer persisted settings while retaining environment fallbacks."""
@@ -267,8 +366,9 @@ class AppLifecycle:
                     self._refresh_interval_seconds = max(
                         30, settings.check_delay_seconds,
                     )
-                    self._refresh_concurrency = max(
-                        1, settings.refresh_recover_concurrency,
+                    self._refresh_concurrency = min(
+                        self._browser_concurrency_cap,
+                        max(1, settings.refresh_recover_concurrency),
                     )
                     self._refresh_max_attempts = max(
                         1, settings.refresh_max_attempts,
@@ -333,6 +433,10 @@ class AppLifecycle:
             callback=self._task_funpay_sale_sync,
             interval=self._sale_sync_interval_seconds,
         ))
+        self.scheduler.register("order_confirmed_notify", ScheduledTask(
+            callback=self._task_order_confirmed_notify,
+            interval=60,
+        ))
 
     async def sync_funpay_sales(
         self,
@@ -390,6 +494,66 @@ class AppLifecycle:
             return
         await self.sync_funpay_sales()
 
+    async def _task_order_confirmed_notify(self) -> None:
+        """Retry due confirmations without poison-row head-of-line blocking."""
+
+        gateway = self._gateway
+        if gateway is None:
+            return
+        now = datetime.now(timezone.utc)
+        async with async_session_factory() as session:
+            filters = (
+                exact_lot_binding_exists(Order),
+                verified_sale_for_order_exists(Order),
+                buyer_confirmation_due(Order),
+                buyer_confirmation_missing(Order),
+                Order.status == "completed",
+                Order.confirmation_delivery_status.in_(("pending", "failed")),
+                or_(
+                    Order.confirmation_delivery_next_attempt_at.is_(None),
+                    Order.confirmation_delivery_next_attempt_at <= now,
+                ),
+            )
+            oldest = list((await session.execute(
+                select(Order.id)
+                .where(*filters)
+                .order_by(
+                    Order.created_at.asc(),
+                    Order.id.asc(),
+                )
+                .limit(25)
+            )).scalars())
+            newest = list((await session.execute(
+                select(Order.id)
+                .where(*filters)
+                .order_by(Order.created_at.desc(), Order.id.desc())
+                .limit(25)
+            )).scalars())
+            oldest_ids = set(oldest)
+            order_ids = oldest + [
+                order_id for order_id in newest if order_id not in oldest_ids
+            ]
+            await session.commit()
+        for order_id in order_ids:
+            try:
+                async with async_session_factory() as session:
+                    await self._order_notifications.notify_confirmed(
+                        session, gateway, order_id,
+                    )
+            except GlobalOrderNotificationDeliveryError:
+                logger.warning(
+                    "Stopped confirmed-order notification batch after shared "
+                    "FunPay delivery failure on %s",
+                    order_id,
+                    exc_info=True,
+                )
+                break
+            except Exception:
+                logger.exception(
+                    "Confirmed-order notification retry failed for %s",
+                    order_id,
+                )
+
     async def _task_expire_overdue(self) -> None:
         """Помечать истёкшие аренды как expired."""
         gateway = self._gateway
@@ -416,6 +580,8 @@ class AppLifecycle:
                     )
 
         await asyncio.gather(*(expire_one(item) for item in candidates))
+        if candidates:
+            self.request_capacity_reconcile()
 
         if gateway is None:
             return
@@ -527,7 +693,7 @@ class AppLifecycle:
             # guard above and lock acquisition.
             return
 
-    async def reconcile_lots(self) -> list:
+    async def reconcile_lots(self, *, refresh_stock: bool = False) -> list:
         """Immediately reconcile local price/capacity state with FunPay."""
         async with self._funpay_lock:
             gateway = self._require_gateway()
@@ -538,7 +704,11 @@ class AppLifecycle:
                 # node is not configured: a manual lot can carry its own node.
                 # LotAutoManager treats node 0 as "do not create new lots".
                 mgr = LotAutoManager(funpay_node_id=node_id or 0)
-                actions = await mgr.run(session, gateway)
+                actions = await mgr.run(
+                    session,
+                    gateway,
+                    refresh_stock=refresh_stock,
+                )
                 await session.commit()
                 return actions
 
@@ -622,9 +792,13 @@ class AppLifecycle:
                 )
                 return await worker.process_next(session)
 
-        await asyncio.gather(
+        processed = await asyncio.gather(
             *(process_one() for _ in range(self._refresh_concurrency))
         )
+        # Validation/limit jobs can add or remove sellable accounts. Signal
+        # once after the whole worker batch instead of reconciling per row.
+        if any(processed):
+            self.request_capacity_reconcile()
 
     async def _recover_interrupted_validation_jobs(self) -> None:
         """At startup, every worker lease belongs to the previous process."""
@@ -781,6 +955,7 @@ class AppLifecycle:
                                 session, order.funpay_order_id,
                             )
                             await session.commit()
+                            self.request_capacity_reconcile()
                             continue
                         if remote.status not in {
                             SaleStatus.PAID,
@@ -811,6 +986,10 @@ class AppLifecycle:
                             _clear_order_retry(order)
                             if remote.status is SaleStatus.COMPLETED:
                                 order.status = "completed"
+                                await self._order_notifications.mark_confirmed_due(
+                                    session,
+                                    order,
+                                )
                         elif rental is None:
                             _defer_order_retry(order, "no_account_available")
                         elif rental.credentials_delivery_status == "manual":
@@ -838,7 +1017,11 @@ class AppLifecycle:
         """Retry refunds whose external account revoke previously failed."""
         async with async_session_factory() as session:
             result = await session.execute(
-                select(Order.funpay_order_id).where(Order.status == "refund_pending")
+                select(Order.funpay_order_id).where(
+                    exact_lot_binding_exists(Order),
+                    verified_sale_for_order_exists(Order),
+                    Order.status == "refund_pending",
+                )
             )
             order_ids = list(result.scalars().all())
             await session.commit()
@@ -860,6 +1043,8 @@ class AppLifecycle:
                     )
 
         await asyncio.gather(*(revoke_one(order_id) for order_id in order_ids))
+        if order_ids:
+            self.request_capacity_reconcile()
 
     async def retry_rental_delivery(self, rental_id: int) -> None:
         """Explicit operator retry after resolving a manual delivery failure."""

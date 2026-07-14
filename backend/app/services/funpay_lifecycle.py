@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Callable
 
@@ -9,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
 from app.integrations.funpay.runner import RunnerCallbacks
-from app.integrations.funpay.types import MessageInfo
+from app.integrations.funpay.types import MessageInfo, SaleStatus
 from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.services.order_provenance import (
@@ -29,9 +30,12 @@ from app.services.chat_service import ChatService, UnverifiedConversationError
 from app.services.order_processor import OrderProcessor, LotNotFoundError
 from app.services.sale_registry import SaleRegistryService
 from app.services.rental_service import RentalService
+from app.services.order_notifications import OrderNotificationService
 from app.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+SELLER_NOTIFICATION_TIMEOUT_SECONDS = 10.0
 
 
 SessionFactory = Callable[[], AsyncSession]
@@ -42,6 +46,8 @@ def build_callbacks(
     gateway: ChatGateway,
     command_router: CommandRouter | None = None,
     sale_registry: SaleRegistryService | None = None,
+    *,
+    capacity_changed: Callable[[], None] | None = None,
 ) -> RunnerCallbacks:
     """Сборка RunnerCallbacks из сервисов Фазы 3.
 
@@ -52,17 +58,24 @@ def build_callbacks(
     Фаза 4 расширит это: добавит AccountPool, RentalService, KickService callback'и.
     """
     order_processor = OrderProcessor()
-    rental_service = RentalService()
+    rental_service = RentalService(capacity_changed=capacity_changed)
     chat_service = ChatService()
     sale_registry = sale_registry or SaleRegistryService()
+    order_notifications = OrderNotificationService()
     router = command_router or CommandRouter()
 
     # Регистрируем хэндлеры команд для on_message.
-    router.register(CommandType.CODE, CodeHandler())
+    router.register(
+        CommandType.CODE,
+        CodeHandler(capacity_changed=capacity_changed),
+    )
     router.register(CommandType.HELP, HelpHandler())
     router.register(CommandType.SUBSCRIPTION, SubscriptionHandler())
     router.register(CommandType.SELLER, SellerHandler())
-    router.register(CommandType.REPLACE, ReplaceHandler())
+    router.register(CommandType.REPLACE, ReplaceHandler(
+        rental_service=rental_service,
+        capacity_changed=capacity_changed,
+    ))
 
     async def on_new_sale(order_id: str) -> None:
         async with session_factory() as session:
@@ -79,10 +92,33 @@ def build_callbacks(
                     order=order,
                     info=info,
                 )
+                if info.status is SaleStatus.REFUNDED:
+                    # A delayed/replayed NewSale may arrive after the buyer
+                    # has already been refunded. Route it through the same
+                    # monotonic revoke path and never disclose credentials.
+                    order = await order_processor.process_sale_refunded(
+                        session, order_id,
+                    )
+                elif info.status is SaleStatus.COMPLETED:
+                    order = await order_processor.process_sale_closed(
+                        session, order_id,
+                    )
+                    await order_notifications.mark_confirmed_due(
+                        session, order,
+                    )
                 # Order создаётся и коммитится отдельно от fulfill_order,
                 # чтобы сбой выдачи аккаунта не откатил сам заказ
                 # (Order нужен для последующих on_sale_closed/refunded).
                 await session.commit()
+                if info.status is SaleStatus.REFUNDED and capacity_changed is not None:
+                    try:
+                        capacity_changed()
+                    except Exception:
+                        logger.exception("Failed to queue capacity reconciliation")
+                local_order_id = order.id
+                local_lot_id = order.lot_id
+                local_price = order.price
+                local_order_status = order.status
             except LotNotFoundError:
                 await session.rollback()
                 logger.info(
@@ -95,11 +131,17 @@ def build_callbacks(
                 logger.exception("Failed to process new sale %s", order_id)
                 return
 
-            notifier = await TelegramNotifier.from_settings(session)
-            if notifier is not None:
-                lot = await session.get(Lot, order.lot_id)
-                description = lot.title_ru if lot is not None else "ChatGPT"
-                await notifier.notify_new_order(order_id, description, order.price)
+            if (
+                info.status not in {SaleStatus.PAID, SaleStatus.COMPLETED}
+                or local_order_status not in {"pending", "completed"}
+            ):
+                logger.warning(
+                    "Deferred FunPay sale %s with remote/local status %s/%s",
+                    order_id,
+                    info.status.value,
+                    local_order_status,
+                )
+                return
 
             try:
                 # Выдача аккаунта + welcome сообщение.
@@ -111,12 +153,49 @@ def build_callbacks(
                     settings.default_max_active_rentals if settings else 1
                 )
                 await rental_service.fulfill_order(
-                    session, gateway, order.id, max_rentals,
+                    session, gateway, local_order_id, max_rentals,
                 )
                 await session.commit()
             except Exception:
+                if session.in_transaction():
+                    await session.rollback()
                 logger.exception(
                     "Failed to fulfill order %s (order record saved)",
+                    order_id,
+                )
+
+            if info.status is SaleStatus.COMPLETED:
+                try:
+                    await order_notifications.notify_confirmed(
+                        session, gateway, local_order_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to notify buyer about confirmed order %s",
+                        order_id,
+                    )
+
+            # Seller alerts are auxiliary and deliberately run only after all
+            # buyer delivery/confirmation work. A hard timeout prevents
+            # Telegram from pinning the FunPay callback.
+            try:
+                notifier = await TelegramNotifier.from_settings(session)
+                if notifier is not None:
+                    lot = await session.get(Lot, local_lot_id)
+                    description = lot.title_ru if lot is not None else "ChatGPT"
+                    await asyncio.wait_for(
+                        notifier.notify_new_order(
+                            order_id,
+                            description,
+                            local_price,
+                        ),
+                        timeout=SELLER_NOTIFICATION_TIMEOUT_SECONDS,
+                    )
+            except Exception:
+                if session.in_transaction():
+                    await session.rollback()
+                logger.exception(
+                    "Failed to notify Telegram about new order %s",
                     order_id,
                 )
 
@@ -133,19 +212,49 @@ def build_callbacks(
                     )
                     await session.rollback()
                     return
-                await order_processor.process_sale_closed(session, order_id)
+                order, transitioned = (
+                    await order_processor.process_sale_closed_transition(
+                        session, order_id,
+                    )
+                )
+                await order_notifications.mark_confirmed_due(session, order)
                 await session.commit()
-                notifier = await TelegramNotifier.from_settings(session)
-                if notifier is not None:
-                    await notifier.notify_order_confirmed(order_id)
             except KeyError:
                 await session.rollback()
                 logger.info(
                     "Closed sale %s has no local fulfillment order", order_id
                 )
+                return
             except Exception:
                 await session.rollback()
                 logger.exception("Failed to process sale closed %s", order_id)
+                return
+
+            try:
+                # Retry even when this is a duplicate close callback: the
+                # durable sent marker makes success idempotent, while a prior
+                # transient send failure remains eligible.
+                await order_notifications.notify_confirmed(
+                    session, gateway, order.id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to notify buyer about confirmed order %s",
+                    order_id,
+                )
+
+            if transitioned:
+                try:
+                    notifier = await TelegramNotifier.from_settings(session)
+                    if notifier is not None:
+                        await notifier.notify_order_confirmed(order_id)
+                except Exception:
+                    if session.in_transaction():
+                        await session.rollback()
+                    logger.exception(
+                        "Failed to notify Telegram about confirmed order %s",
+                        order_id,
+                    )
 
     async def on_sale_refunded(order_id: str) -> None:
         async with session_factory() as session:
@@ -162,6 +271,11 @@ def build_callbacks(
                     return
                 order = await order_processor.process_sale_refunded(session, order_id)
                 await session.commit()
+                if capacity_changed is not None:
+                    try:
+                        capacity_changed()
+                    except Exception:
+                        logger.exception("Failed to queue capacity reconciliation")
                 notifier = await TelegramNotifier.from_settings(session)
                 if notifier is not None:
                     await notifier.notify_order_refunded(
@@ -220,13 +334,13 @@ def build_callbacks(
                 lang="ru",
                 gateway=gateway,
             )
-            if ctx.parsed is not None and msg.order_id:
+            if ctx.parsed is not None and ctx.order_id:
                 # The selected command alias is an explicit language signal.
                 # Persist it for later automated messages in the same order.
                 order = (
                     await session.execute(
                         select(Order).where(
-                            Order.funpay_order_id == msg.order_id,
+                            Order.funpay_order_id == ctx.order_id,
                             Order.buyer_funpay_id == str(msg.sender_id),
                             Order.funpay_chat_id == str(msg.chat_id),
                             exact_lot_binding_exists(Order),

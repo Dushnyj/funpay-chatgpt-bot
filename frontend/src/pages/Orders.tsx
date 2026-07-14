@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useDurations } from '../api/catalog'
-import { useOrders } from '../api/orders'
+import { useOrders, useRetryOrderConfirmation } from '../api/orders'
 import { useRentals, useRetryRentalDelivery } from '../api/rentals'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
@@ -42,6 +42,7 @@ export default function Orders() {
 function OrdersTab({ query, durations }: { query: ReturnType<typeof useOrders>; durations: Duration[] }) {
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState('all')
+  const retryConfirmation = useRetryOrderConfirmation()
   const orders = useMemo(() => query.data ?? [], [query.data])
   const filtered = useMemo(() => {
     const text = search.trim().toLowerCase()
@@ -52,7 +53,7 @@ function OrdersTab({ query, durations }: { query: ReturnType<typeof useOrders>; 
   return (
     <section className="panel panel--flush">
       <div className="toolbar"><label className="search-field"><Icon name="search" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Заказ или покупатель" aria-label="Поиск заказов" /></label><label className="select-field"><span>Статус</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">Все</option><option value="pending">Ожидают</option><option value="completed">Завершены</option><option value="refund_pending">Возврат обрабатывается</option><option value="refunded">Возвраты</option></select><Icon name="chevron-down" size={15} /></label><span className="toolbar__count">Показано: {filtered.length}</span></div>
-      {orders.length === 0 ? <EmptyState icon="deals" title="Заказов пока нет" description="Здесь появятся оплаченные заказы, полученные от FunPay. Убедитесь, что интеграция подключена и на витрине есть активный лот." action={<Link className="button button--secondary" to="/lots">Проверить лоты<Icon name="arrow-right" /></Link>} /> : filtered.length === 0 ? <EmptyState icon="search" title="Заказы не найдены" description="Измените поиск или фильтр статуса." /> : <TableShell><table className="data-table"><thead><tr><th>Заказ</th><th>Покупатель</th><th>Создан</th><th>Лот, срок и условие</th><th>Сумма</th><th>Статус</th></tr></thead><tbody>{filtered.map((order) => <tr key={order.id}><td><div className="identity-cell"><span className="identity-avatar identity-avatar--blue"><Icon name="deals" size={16} /></span><span><strong>#{order.funpay_order_id}</strong><small>Внутренний ID {order.id}</small></span></div></td><td><strong>{order.buyer_funpay_id}</strong><small className="table-subline">Чат {order.funpay_chat_id}</small></td><td>{formatDateTime(order.created_at)}</td><td>{order.lot_id ? `#${order.lot_id}` : '—'}<small className="table-subline">Срок: {purchasedDuration(order.duration_id, durations)}</small><small className="table-subline">{purchasedLimitCondition(order)}</small></td><td className="table-number">{formatCurrency(order.price)}</td><td><div className="credential-delivery-cell"><StatusBadge value={order.status} />{order.fulfillment_attempts > 0 && <small>Попыток: {order.fulfillment_attempts}</small>}{order.fulfillment_next_attempt_at && <small>Следующая: {formatDateTime(order.fulfillment_next_attempt_at)}</small>}{safeOrderRetryError(order.fulfillment_last_error) && <small className="credential-delivery-error">{safeOrderRetryError(order.fulfillment_last_error)}</small>}</div></td></tr>)}</tbody></table></TableShell>}
+      {orders.length === 0 ? <EmptyState icon="deals" title="Заказов пока нет" description="Здесь появятся оплаченные заказы, полученные от FunPay. Убедитесь, что интеграция подключена и на витрине есть активный лот." action={<Link className="button button--secondary" to="/lots">Проверить лоты<Icon name="arrow-right" /></Link>} /> : filtered.length === 0 ? <EmptyState icon="search" title="Заказы не найдены" description="Измените поиск или фильтр статуса." /> : <TableShell><table className="data-table"><thead><tr><th>Заказ</th><th>Покупатель</th><th>Создан</th><th>Лот, срок и условие</th><th>Сумма</th><th>Статус и подтверждение</th></tr></thead><tbody>{filtered.map((order) => <tr key={order.id}><td><div className="identity-cell"><span className="identity-avatar identity-avatar--blue"><Icon name="deals" size={16} /></span><span><strong>#{order.funpay_order_id}</strong><small>Внутренний ID {order.id}</small></span></div></td><td><strong>{order.buyer_funpay_id}</strong><small className="table-subline">Чат {order.funpay_chat_id}</small></td><td>{formatDateTime(order.created_at)}</td><td>{order.lot_id ? `#${order.lot_id}` : '—'}<small className="table-subline">Срок: {purchasedDuration(order.duration_id, durations)}</small><small className="table-subline">{purchasedLimitCondition(order)}</small></td><td className="table-number">{formatCurrency(order.price)}</td><td><div className="credential-delivery-cell"><StatusBadge value={order.status} />{order.fulfillment_attempts > 0 && <small>Выдача: {order.fulfillment_attempts} попыток</small>}{order.fulfillment_next_attempt_at && <small>Следующая выдача: {formatDateTime(order.fulfillment_next_attempt_at)}</small>}{safeOrderRetryError(order.fulfillment_last_error) && <small className="credential-delivery-error">{safeOrderRetryError(order.fulfillment_last_error)}</small>}{order.status === 'completed' && <><StatusBadge value={confirmationTone(order.confirmation_delivery_status)} label={confirmationLabel(order.confirmation_delivery_status)} />{order.confirmation_delivery_next_attempt_at && <small>Повтор подтверждения: {formatDateTime(order.confirmation_delivery_next_attempt_at)}</small>}{order.confirmation_delivery_status === 'manual' && <button className="button button--ghost button--compact" disabled={retryConfirmation.isPending} onClick={() => retryConfirmation.mutate(order.id)}>{retryConfirmation.isPending ? 'Ставим в очередь…' : 'Повторить подтверждение'}</button>}</>}</div></td></tr>)}</tbody></table></TableShell>}
     </section>
   )
 }
@@ -135,6 +136,24 @@ function deliveryLabel(status: string) {
     manual: 'Нужен оператор',
   }
   return labels[status] ?? 'Неизвестно'
+}
+
+function confirmationTone(status: string) {
+  if (status === 'sent') return 'active'
+  if (status === 'pending' || status === 'sending') return 'pending'
+  return 'failed'
+}
+
+function confirmationLabel(status: string) {
+  const labels: Record<string, string> = {
+    none: 'Подтверждение не требуется',
+    pending: 'Подтверждение в очереди',
+    sending: 'Подтверждение отправляется',
+    failed: 'Повтор подтверждения',
+    sent: 'Подтверждение отправлено',
+    manual: 'Подтверждение: нужен оператор',
+  }
+  return labels[status] ?? 'Подтверждение: неизвестно'
 }
 
 function safeDeliveryError(error: string | null) {

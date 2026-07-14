@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import time
+from uuid import uuid4
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -17,10 +20,12 @@ from app.integrations.email.provider import (
     FreshVerificationCode,
 )
 from app.integrations.funpay.gateway import ChatGateway
+from app.integrations.funpay.types import SaleStatus
 from app.models.account import Account, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier
 from app.models.rental import Order, Rental
+from app.services.command_parser import normalize_order_reference
 from app.services.command_router import CommandContext
 from app.services.account_limits import MeasureResult, measure_account_limits
 from app.services.durations import (
@@ -34,6 +39,8 @@ from app.services.order_provenance import (
     is_verified_bot_sale_order,
     verified_sale_for_order_exists,
 )
+from app.services.order_processor import OrderProcessor
+from app.services.sale_registry import SaleRegistryService
 from app.services.totp import generate_totp
 from app.telegram_notifier import TelegramNotifier
 
@@ -41,11 +48,17 @@ from app.telegram_notifier import TelegramNotifier
 # Анти-спам для !код: не чаще раза в 30 секунд на одну аренду.
 _CODE_RATE_LIMIT = timedelta(seconds=30)
 _EMAIL_CODE_LOOKBACK = timedelta(minutes=10)
-_EMAIL_CODE_AUDIT_EVENT = "buyer_email_code_delivered"
+_LEGACY_EMAIL_CODE_AUDIT_EVENT = "buyer_email_code_delivered"
+_OTP_DELIVERY_CLAIM_EVENT = "buyer_otp_delivery_claimed"
+_OTP_DELIVERY_SENT_EVENT = "buyer_otp_delivery_sent"
+_OTP_DELIVERY_UNCERTAIN_EVENT = "buyer_otp_delivery_uncertain"
 _TOTP_STEP_SECONDS = 30.0
 _TOTP_MIN_VALIDITY_SECONDS = 20.0
 _CODE_DISCLOSURE_MIN_REMAINING = timedelta(seconds=60)
 _CODE_SEND_TIMEOUT_SECONDS = 10.0
+_LIVE_ORDER_CHECK_TIMEOUT_SECONDS = 10.0
+
+logger = logging.getLogger(__name__)
 
 
 class AmbiguousRentalError(RuntimeError):
@@ -99,7 +112,7 @@ async def _find_rental_for_context(
 ) -> Rental | None:
     """Resolve the rental by order first; never guess between active rentals."""
 
-    if ctx.sender_id is None:
+    if ctx.sender_id is None or ctx.order_reference_invalid:
         return None
     sender_id = str(ctx.sender_id)
     chat_id = str(ctx.chat_id)
@@ -240,8 +253,53 @@ async def _send_bounded_after_transaction(
     )
 
 
+async def _active_order_summary(
+    session: AsyncSession,
+    ctx: CommandContext,
+) -> str:
+    """List only active orders proven to belong to this buyer and chat."""
+
+    if ctx.sender_id is None:
+        return ""
+    order_ids = list((await session.execute(
+        select(Order.funpay_order_id)
+        .join(Rental, Rental.order_id == Order.id)
+        .where(
+            exact_lot_binding_exists(Order),
+            verified_sale_for_order_exists(Order),
+            Order.buyer_funpay_id == str(ctx.sender_id),
+            Order.funpay_chat_id == str(ctx.chat_id),
+            Rental.buyer_funpay_id == str(ctx.sender_id),
+            Rental.buyer_funpay_chat_id == str(ctx.chat_id),
+            Rental.status.in_(["active", "expiry_pending"]),
+        )
+        .order_by(Rental.started_at.desc(), Rental.id.desc())
+        .limit(20)
+    )).scalars())
+    references: list[str] = []
+    for order_id in order_ids:
+        normalized = normalize_order_reference(f"#{order_id}")
+        # Do not advertise a reference that the strict command parser could
+        # not resolve back to this exact stored order.
+        if normalized is not None and normalized == order_id:
+            references.append(f"#{normalized}")
+    if references:
+        label = "Active orders" if ctx.lang == "en" else "Активные заказы"
+        return f"{label}: {', '.join(references)}"
+    return (
+        "Find the order number on its FunPay page."
+        if ctx.lang == "en"
+        else "Номер заказа указан на его странице FunPay."
+    )
+
+
 async def _send_ambiguous_rental(ctx: CommandContext, session: AsyncSession) -> None:
-    text = await render_message(session, "rental_ambiguous", ctx.lang)
+    text = await render_message(
+        session,
+        "rental_ambiguous",
+        ctx.lang,
+        active_orders=await _active_order_summary(session, ctx),
+    )
     await _send_bounded_after_transaction(ctx, session, text)
 
 
@@ -309,7 +367,114 @@ async def _rental_access_denial(
     return None
 
 
-async def _email_code_was_delivered(
+async def _live_revalidate_funpay_order(
+    ctx: CommandContext,
+    session: AsyncSession,
+    rental: Rental,
+    *,
+    refund_processor: OrderProcessor,
+    capacity_changed: Callable[[], None] | None = None,
+) -> str | None:
+    """Fail closed unless FunPay still proves the exact paid sale.
+
+    The remote request is made only after committing the read transaction.
+    Callers must then reacquire Order -> Rental -> Account locks and repeat
+    local authorization before disclosing a secret or revoking credentials.
+    """
+
+    order = await session.scalar(
+        select(Order).where(
+            Order.id == rental.order_id,
+            exact_lot_binding_exists(Order),
+            verified_sale_for_order_exists(Order),
+        )
+    )
+    local_identity_matches = bool(
+        order is not None
+        and ctx.sender_id is not None
+        and order.buyer_funpay_id == str(ctx.sender_id)
+        and order.funpay_chat_id == str(ctx.chat_id)
+        and rental.buyer_funpay_id == order.buyer_funpay_id
+        and rental.buyer_funpay_chat_id == order.funpay_chat_id
+        and (ctx.order_id is None or ctx.order_id == order.funpay_order_id)
+    )
+    if not local_identity_matches or order is None:
+        if session.in_transaction():
+            await session.commit()
+        return "code_expired"
+
+    remote_order_id = order.funpay_order_id
+    expected_buyer_id = order.buyer_funpay_id
+    expected_chat_id = order.funpay_chat_id
+    await session.commit()
+    try:
+        remote = await asyncio.wait_for(
+            ctx.gateway.get_order(remote_order_id),
+            timeout=_LIVE_ORDER_CHECK_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            "Live FunPay order check failed for %s",
+            remote_order_id,
+            exc_info=True,
+        )
+        return "seller_required"
+
+    remote_identity_matches = (
+        remote.order_id == remote_order_id
+        and remote.buyer_id > 0
+        and str(remote.buyer_id) == expected_buyer_id
+        and remote.chat_id > 0
+        and str(remote.chat_id) == expected_chat_id
+    )
+    if not remote_identity_matches:
+        logger.warning(
+            "Live FunPay order identity mismatch for %s",
+            remote_order_id,
+        )
+        return "seller_required"
+
+    if remote.status is SaleStatus.REFUNDED:
+        try:
+            sale = await SaleRegistryService().update_status(
+                session, remote_order_id, SaleStatus.REFUNDED,
+            )
+            if sale is None:
+                await session.rollback()
+                return "code_expired"
+            await refund_processor.process_sale_refunded(
+                session, remote_order_id,
+            )
+            if session.in_transaction():
+                await session.commit()
+        except Exception:
+            if session.in_transaction():
+                await session.rollback()
+            logger.exception(
+                "Live-refunded FunPay order could not be finalized: %s",
+                remote_order_id,
+            )
+        finally:
+            if capacity_changed is not None:
+                try:
+                    capacity_changed()
+                except Exception:
+                    logger.exception(
+                        "Failed to queue capacity reconciliation after live refund"
+                    )
+        return "code_expired"
+
+    if remote.status not in {SaleStatus.PAID, SaleStatus.COMPLETED}:
+        logger.warning(
+            "Live FunPay order %s is not fulfillable: %s",
+            remote_order_id,
+            remote.status.value,
+        )
+        return "seller_required"
+    return None
+
+
+async def _email_code_was_claimed(
     session: AsyncSession,
     rental_id: int,
     fingerprint: str,
@@ -317,8 +482,16 @@ async def _email_code_was_delivered(
     rows = (
         await session.execute(
             select(AuditLog.metadata_).where(
-                AuditLog.event_type == _EMAIL_CODE_AUDIT_EVENT,
+                AuditLog.event_type.in_([
+                    _LEGACY_EMAIL_CODE_AUDIT_EVENT,
+                    _OTP_DELIVERY_CLAIM_EVENT,
+                ]),
                 AuditLog.rental_id == rental_id,
+                AuditLog.timestamp >= (
+                    datetime.now(timezone.utc)
+                    - _EMAIL_CODE_LOOKBACK
+                    - timedelta(minutes=1)
+                ),
             )
         )
     ).scalars()
@@ -327,6 +500,89 @@ async def _email_code_was_delivered(
         and metadata.get("fingerprint") == fingerprint
         for metadata in rows
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _OtpDeliveryClaim:
+    claim_id: str
+    totp_window: int
+    status: str
+
+
+def _totp_window_id() -> int:
+    """Return the public TOTP time-step identifier, never the OTP itself."""
+
+    return int(time.time() // _TOTP_STEP_SECONDS)
+
+
+def _totp_window_retry_seconds() -> int:
+    return max(1, math.ceil(_totp_window_remaining()))
+
+
+async def _otp_delivery_claim_for_window(
+    session: AsyncSession,
+    rental_id: int,
+    totp_window: int,
+) -> _OtpDeliveryClaim | None:
+    """Resolve the durable outcome of the latest claim for one TOTP step.
+
+    A claim without an outcome is deliberately treated as ambiguous: the
+    process may have stopped immediately before or after FunPay accepted the
+    message.  No secret value is present in any audit metadata.
+    """
+
+    rows = list((await session.execute(
+        select(AuditLog.id, AuditLog.event_type, AuditLog.metadata_)
+        .where(
+            AuditLog.rental_id == rental_id,
+            AuditLog.timestamp >= (
+                datetime.fromtimestamp(
+                    totp_window * _TOTP_STEP_SECONDS,
+                    timezone.utc,
+                )
+                - timedelta(seconds=1)
+            ),
+            AuditLog.event_type.in_([
+                _OTP_DELIVERY_CLAIM_EVENT,
+                _OTP_DELIVERY_SENT_EVENT,
+                _OTP_DELIVERY_UNCERTAIN_EVENT,
+            ]),
+        )
+        .order_by(AuditLog.id.asc())
+    )).all())
+    claims: dict[str, _OtpDeliveryClaim] = {}
+    latest_claim_id: str | None = None
+    for _row_id, event_type, metadata in rows:
+        if not isinstance(metadata, dict):
+            continue
+        claim_id = metadata.get("claim_id")
+        if not isinstance(claim_id, str) or not claim_id:
+            continue
+        if event_type == _OTP_DELIVERY_CLAIM_EVENT:
+            stored_window = metadata.get("totp_window")
+            if stored_window != totp_window:
+                continue
+            claims[claim_id] = _OtpDeliveryClaim(
+                claim_id=claim_id,
+                totp_window=totp_window,
+                status="claimed",
+            )
+            latest_claim_id = claim_id
+            continue
+        existing = claims.get(claim_id)
+        if existing is None:
+            continue
+        status = (
+            "sent"
+            if event_type == _OTP_DELIVERY_SENT_EVENT
+            else "uncertain"
+        )
+        claims[claim_id] = _OtpDeliveryClaim(
+            claim_id=claim_id,
+            totp_window=totp_window,
+            status=status,
+        )
+    return claims.get(latest_claim_id) if latest_claim_id is not None else None
 
 
 async def _code_account_if_available(
@@ -366,6 +622,8 @@ class CodeHandler:
         email_provider_builder: EmailProviderBuilder | None = None,
         email_timeout_s: float = 10.0,
         totp_min_validity_s: float = _TOTP_MIN_VALIDITY_SECONDS,
+        refund_processor: OrderProcessor | None = None,
+        capacity_changed: Callable[[], None] | None = None,
     ) -> None:
         self._email_provider_builder = email_provider_builder
         self._email_timeout_s = max(0.0, email_timeout_s)
@@ -373,6 +631,8 @@ class CodeHandler:
             _TOTP_STEP_SECONDS - 1,
             max(0.0, totp_min_validity_s),
         )
+        self._refunds = refund_processor or OrderProcessor()
+        self._capacity_changed = capacity_changed
 
     async def __call__(self, ctx: CommandContext) -> None:
         session = _session_from_ctx(ctx)
@@ -397,6 +657,13 @@ class CodeHandler:
             await self._send_non_secret(
                 ctx, session, "account_unavailable",
             )
+            return
+
+        current_claim = await _otp_delivery_claim_for_window(
+            session, rental.id, _totp_window_id(),
+        )
+        if current_claim is not None and current_claim.status != "sent":
+            await self._send_uncertain_delivery(ctx, session, rental)
             return
 
         if await self._send_rate_limit_if_needed(ctx, session, rental, now):
@@ -424,6 +691,23 @@ class CodeHandler:
 
         while True:
             await _wait_for_safe_totp_window(self._totp_min_validity_s)
+
+            # FunPay is the payment authority. A delayed/missed refund event
+            # must not leave a local active Rental sufficient for disclosure.
+            # This bounded request runs without DB locks; the exact rows are
+            # locked and re-authorized immediately afterward.
+            denial_template = await _live_revalidate_funpay_order(
+                ctx,
+                session,
+                rental,
+                refund_processor=self._refunds,
+                capacity_changed=self._capacity_changed,
+            )
+            if denial_template is not None:
+                await self._send_non_secret(
+                    ctx, session, denial_template,
+                )
+                return
 
             # Lock order is Order -> Rental -> Account, matching refund and
             # expiry paths. Re-authorize the exact sale after every wait.
@@ -464,7 +748,23 @@ class CodeHandler:
                 await session.commit()
                 continue
 
-            if email_code is not None and await _email_code_was_delivered(
+            totp_window = _totp_window_id()
+            current_claim = await _otp_delivery_claim_for_window(
+                session, rental.id, totp_window,
+            )
+            if current_claim is not None:
+                if current_claim.status != "sent":
+                    await self._send_uncertain_delivery(ctx, session, rental)
+                else:
+                    await self._send_non_secret(
+                        ctx,
+                        session,
+                        "code_rate_limited",
+                        retry_in_sec=_totp_window_retry_seconds(),
+                    )
+                return
+
+            if email_code is not None and await _email_code_was_claimed(
                 session, rental.id, email_code.fingerprint,
             ):
                 email_code = None
@@ -483,24 +783,79 @@ class CodeHandler:
                 )
                 return
             break
+
+        # The claim is committed before any secret reaches FunPay. If the
+        # process stops before recording the send outcome, the claim remains
+        # ambiguous and the same TOTP step/email OTP is never auto-delivered
+        # again. The row lock above serializes claims for this rental.
+        claim_id = uuid4().hex
+        claim_metadata: dict[str, object] = {
+            "claim_id": claim_id,
+            "totp_window": totp_window,
+        }
         if email_code is not None:
-            session.add(AuditLog(
-                event_type=_EMAIL_CODE_AUDIT_EVENT,
-                account_id=account.id,
-                rental_id=rental.id,
-                chat_id=rental.buyer_funpay_chat_id,
-                metadata_={
-                    "fingerprint": email_code.fingerprint,
-                    "received_at": email_code.received_at.isoformat(),
-                },
-            ))
+            claim_metadata.update({
+                "fingerprint": email_code.fingerprint,
+                "email_received_at": email_code.received_at.isoformat(),
+            })
+        session.add(AuditLog(
+            event_type=_OTP_DELIVERY_CLAIM_EVENT,
+            account_id=account.id,
+            order_id=rental.order_id,
+            rental_id=rental.id,
+            chat_id=rental.buyer_funpay_chat_id,
+            metadata_=claim_metadata,
+        ))
         rental.last_code_request_at = now
         await session.flush()
+        await session.commit()
+
+        # Repeat the complete authorization after the durable claim. The
+        # second lock is retained only for the bounded FunPay send, so a
+        # concurrent refund/expiry cannot revoke access between authorization
+        # and disclosure.
+        try:
+            rental = await _find_rental_for_context(
+                session, ctx, for_update=True,
+            )
+        except AmbiguousRentalError:
+            await _send_ambiguous_rental(ctx, session)
+            return
+        now = datetime.now(timezone.utc)
+        identity_changed = (
+            rental is None
+            or rental.id != rental_id
+            or rental.account_id != account_id
+        )
+        denial_template = (
+            "code_expired"
+            if identity_changed
+            else await _rental_access_denial(session, rental, now)
+        )
+        if denial_template is not None:
+            await self._send_non_secret(ctx, session, denial_template)
+            return
+        if _totp_window_id() != totp_window:
+            await self._send_uncertain_delivery(ctx, session, rental)
+            return
+        account = await _code_account_if_available(
+            session, account_id, for_update=True,
+        )
+        if account is None:
+            await self._send_non_secret(
+                ctx, session, "account_unavailable",
+            )
+            return
+
         totp_code = generate_totp(account.totp_secret_encrypted)
+        if _totp_window_id() != totp_window:
+            # Never send a code whose durable claim names another TOTP step.
+            await self._send_uncertain_delivery(ctx, session, rental)
+            return
         labelled_totp = (
-            f"TOTP (приложение): {totp_code}"
+            f"Код подтверждения: {totp_code}"
             if ctx.lang != "en"
-            else f"TOTP (authenticator): {totp_code}"
+            else f"Authenticator code: {totp_code}"
         )
         text = await render_message(
             session,
@@ -513,9 +868,26 @@ class CodeHandler:
             session, ctx.lang, email_code, email_state,
         )
         text += f"\n\n{email_text}"
-        await asyncio.wait_for(
-            ctx.gateway.send_message(chat_id=ctx.chat_id, text=text),
-            timeout=_CODE_SEND_TIMEOUT_SECONDS,
+        try:
+            await asyncio.wait_for(
+                ctx.gateway.send_message(chat_id=ctx.chat_id, text=text),
+                timeout=_CODE_SEND_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            await self._record_delivery_outcome(
+                session,
+                rental,
+                account_id=account_id,
+                claim_id=claim_id,
+                event_type=_OTP_DELIVERY_UNCERTAIN_EVENT,
+            )
+            raise
+        await self._record_delivery_outcome(
+            session,
+            rental,
+            account_id=account_id,
+            claim_id=claim_id,
+            event_type=_OTP_DELIVERY_SENT_EVENT,
         )
 
     async def _send_non_secret(
@@ -529,6 +901,66 @@ class CodeHandler:
             session, template, ctx.lang, **variables,
         )
         await _send_bounded_after_transaction(ctx, session, text)
+
+    async def _send_uncertain_delivery(
+        self,
+        ctx: CommandContext,
+        session: AsyncSession,
+        rental: Rental,
+    ) -> None:
+        command = "!code" if ctx.lang == "en" else "!код"
+        if ctx.order_id:
+            command = f"{command} #{ctx.order_id}"
+        retry_in = _totp_window_retry_seconds()
+        if rental.last_code_request_at is not None:
+            elapsed = datetime.now(timezone.utc) - _as_utc(
+                rental.last_code_request_at
+            )
+            retry_in = max(
+                retry_in,
+                1,
+                math.ceil(
+                    (_CODE_RATE_LIMIT - elapsed).total_seconds()
+                ),
+            )
+        await self._send_non_secret(
+            ctx,
+            session,
+            "code_delivery_uncertain",
+            retry_in_sec=retry_in,
+            retry_command=command,
+        )
+
+    @staticmethod
+    async def _record_delivery_outcome(
+        session: AsyncSession,
+        rental: Rental,
+        *,
+        account_id: int,
+        claim_id: str,
+        event_type: str,
+    ) -> None:
+        """Persist only a non-secret outcome for the already durable claim."""
+
+        session.add(AuditLog(
+            event_type=event_type,
+            account_id=account_id,
+            order_id=rental.order_id,
+            rental_id=rental.id,
+            chat_id=rental.buyer_funpay_chat_id,
+            metadata_={"claim_id": claim_id},
+        ))
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            # A missing outcome deliberately leaves the durable claim in the
+            # fail-closed ambiguous state. The buyer can never receive the
+            # same code automatically because audit persistence failed here.
+            logger.exception(
+                "Failed to persist OTP delivery outcome rental=%s",
+                rental.id,
+            )
 
     async def _send_rate_limit_if_needed(
         self,
@@ -544,7 +976,7 @@ class CodeHandler:
             return False
         retry_in = max(
             1,
-            int((_CODE_RATE_LIMIT - elapsed).total_seconds()),
+            math.ceil((_CODE_RATE_LIMIT - elapsed).total_seconds()),
         )
         text = await render_message(
             session,
@@ -797,6 +1229,7 @@ _REPLACEABLE_VALIDATION_CODES = {
     ValidationCode.OAUTH_REJECTED.value,
 }
 _REPLACEMENT_REVOKE_LEASE = timedelta(minutes=5)
+_SELLER_REQUIRED_TEMPLATE = "seller_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -834,13 +1267,31 @@ class ReplaceHandler:
         job_queue: CheckJobQueue | None = None,
         rental_service: RentalService | None = None,
         max_replacements: int = 1,
+        capacity_changed: Callable[[], None] | None = None,
     ) -> None:
         self._pool = account_pool or AccountPool()
         self._validator = validator
         self._kick = kick_service or KickService()
         self._jobs = job_queue or CheckJobQueue()
-        self._rentals = rental_service or RentalService()
+        self._refunds = OrderProcessor(
+            kick_service=self._kick,
+            job_queue=self._jobs,
+        )
+        self._rentals = rental_service or RentalService(
+            capacity_changed=capacity_changed,
+        )
         self._max_replacements = max(0, max_replacements)
+        self._capacity_changed = capacity_changed
+
+    def _notify_capacity_changed(self) -> None:
+        if self._capacity_changed is None:
+            return
+        try:
+            self._capacity_changed()
+        except Exception:
+            # Every caller invokes this after its commit. Reconciliation is
+            # best-effort and must never invalidate the durable reservation.
+            logger.exception("Failed to queue capacity reconciliation")
 
     async def __call__(self, ctx: CommandContext) -> None:
         session = _session_from_ctx(ctx)
@@ -856,7 +1307,7 @@ class ReplaceHandler:
         original_account_id = rental.account_id if rental is not None else None
 
         if rental is None:
-            text = await render_message(session, "replace_declined", ctx.lang)
+            text = await render_message(session, "code_expired", ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
         denial_template = await _rental_access_denial(session, rental, now)
@@ -878,7 +1329,9 @@ class ReplaceHandler:
                 metadata_={"limit": self._max_replacements},
             ))
             await session.flush()
-            text = await render_message(session, "seller_called", ctx.lang)
+            text = await render_message(
+                session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
+            )
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
@@ -892,7 +1345,9 @@ class ReplaceHandler:
             # Fast path for a duplicate command while another replacement,
             # refund or expiry worker owns the shared logout lease. The locked
             # claim phase below repeats this check to close the race.
-            text = await render_message(session, "seller_called", ctx.lang)
+            text = await render_message(
+                session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
+            )
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
@@ -909,7 +1364,7 @@ class ReplaceHandler:
             )
             if not released:
                 text = await render_message(
-                    session, "seller_called", ctx.lang,
+                    session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
                 )
                 await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
                 return
@@ -926,7 +1381,9 @@ class ReplaceHandler:
             ))
             await session.flush()
             if exc.code not in _REPLACEABLE_VALIDATION_CODES:
-                text = await render_message(session, "seller_called", ctx.lang)
+                text = await render_message(
+                    session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
+                )
                 await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
                 return
             validation = None
@@ -939,7 +1396,9 @@ class ReplaceHandler:
                 metadata_={"error_type": type(exc).__name__},
             ))
             await session.flush()
-            text = await render_message(session, "seller_called", ctx.lang)
+            text = await render_message(
+                session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
+            )
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
@@ -955,10 +1414,42 @@ class ReplaceHandler:
             template = (
                 "replace_declined"
                 if validation is ValidationOutcome.OK
-                else "seller_called"
+                else _SELLER_REQUIRED_TEMPLATE
             )
             text = await render_message(session, template, ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
+            return
+
+        # Account validation may perform slow browser/email I/O. Resolve the
+        # same buyer rental again, check the authoritative FunPay order outside
+        # locks, then let the claim phase reacquire Order -> Rental -> Account.
+        try:
+            live_rental = await _find_rental_for_context(session, ctx)
+        except AmbiguousRentalError:
+            await _send_ambiguous_rental(ctx, session)
+            return
+        if (
+            live_rental is None
+            or live_rental.id != original_rental_id
+            or live_rental.account_id != original_account_id
+        ):
+            text = await render_message(
+                session, "code_expired", ctx.lang,
+            )
+            await _send_bounded_after_transaction(ctx, session, text)
+            return
+        denial_template = await _live_revalidate_funpay_order(
+            ctx,
+            session,
+            live_rental,
+            refund_processor=self._refunds,
+            capacity_changed=self._capacity_changed,
+        )
+        if denial_template is not None:
+            text = await render_message(
+                session, denial_template, ctx.lang,
+            )
+            await _send_bounded_after_transaction(ctx, session, text)
             return
 
         claim, denial_template = await self._claim_replacement_revoke(
@@ -968,11 +1459,39 @@ class ReplaceHandler:
             original_account_id=original_account_id,
         )
         if claim is None:
+            if denial_template == "rental_ambiguous":
+                await _send_ambiguous_rental(ctx, session)
+                return
             text = await render_message(
-                session, denial_template or "seller_called", ctx.lang,
+                session, denial_template or _SELLER_REQUIRED_TEMPLATE, ctx.lang,
             )
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
+
+        # The exact buyer/rental claim is already durable and provenance-
+        # checked. Telegram remains auxiliary and cannot block the logout.
+        try:
+            old_login = await session.scalar(
+                select(Account.login).where(Account.id == claim.account_id)
+            )
+            notifier = await TelegramNotifier.from_settings(session)
+            if notifier is not None and old_login:
+                await asyncio.wait_for(
+                    notifier.notify_replace_requested(
+                        str(ctx.sender_id), old_login,
+                    ),
+                    timeout=10.0,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to notify Telegram about replacement request"
+            )
+        finally:
+            if session.in_transaction():
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
 
         # The claim and maintenance state are durable. KickService is allowed
         # to use the session for mailbox/browser preparation, but no Order,
@@ -1057,6 +1576,7 @@ class ReplaceHandler:
             },
         ))
         await session.commit()
+        self._notify_capacity_changed()
         return True
 
     async def _claim_replacement_revoke(
@@ -1084,7 +1604,7 @@ class ReplaceHandler:
             or rental.account_id != original_account_id
         ):
             await session.commit()
-            return None, "seller_called"
+            return None, _SELLER_REQUIRED_TEMPLATE
 
         now = datetime.now(timezone.utc)
         denial_template = await _rental_access_denial(session, rental, now)
@@ -1103,7 +1623,7 @@ class ReplaceHandler:
                 metadata_={"limit": self._max_replacements},
             ))
             await session.commit()
-            return None, "seller_called"
+            return None, _SELLER_REQUIRED_TEMPLATE
 
         stored_claim = rental.expiry_revoke_started_at
         if stored_claim is not None:
@@ -1122,15 +1642,16 @@ class ReplaceHandler:
                 metadata_={"claim_started_at": stored_claim.isoformat()},
             ))
             await session.commit()
-            return None, "seller_called"
+            return None, _SELLER_REQUIRED_TEMPLATE
 
         # A crashed replacement may leave a stale target reservation. Only
         # the worker holding Order -> Rental may release it, and only after
         # the shared revoke lease is no longer live.
-        if (
+        released_stale_reservation = bool(
             stored_claim is not None
             or rental.replacement_target_account_id is not None
-        ):
+        )
+        if released_stale_reservation:
             rental.expiry_revoke_started_at = None
             rental.replacement_target_account_id = None
             await session.flush()
@@ -1145,13 +1666,17 @@ class ReplaceHandler:
         ).scalar_one_or_none()
         if old_account is None:
             await session.commit()
-            return None, "seller_called"
+            if released_stale_reservation:
+                self._notify_capacity_changed()
+            return None, _SELLER_REQUIRED_TEMPLATE
 
         duration = await session.get(Duration, rental.duration_id)
         scope = await session.get(LimitScope, rental.limit_scope_id)
         if duration is None:
             await session.commit()
-            return None, "seller_called"
+            if released_stale_reservation:
+                self._notify_capacity_changed()
+            return None, _SELLER_REQUIRED_TEMPLATE
         criteria = AccountCriteria(
             tier_id=rental.tier_id,
             duration_minutes=duration.minutes,
@@ -1180,6 +1705,8 @@ class ReplaceHandler:
             # changed here: a buyer must never lose working credentials merely
             # because the replacement pool is empty.
             await session.commit()
+            if released_stale_reservation:
+                self._notify_capacity_changed()
             return None, "replace_no_account"
 
         # AccountPool is DB-only, nevertheless repeat every authorization
@@ -1189,13 +1716,19 @@ class ReplaceHandler:
         denial_template = await _rental_access_denial(session, rental, now)
         if denial_template is not None:
             await session.commit()
+            if released_stale_reservation:
+                self._notify_capacity_changed()
             return None, denial_template
         if _replacement_window_is_too_short(rental, now):
             await session.commit()
+            if released_stale_reservation:
+                self._notify_capacity_changed()
             return None, "replace_expiring"
         if rental.replacement_count >= self._max_replacements:
             await session.commit()
-            return None, "seller_called"
+            if released_stale_reservation:
+                self._notify_capacity_changed()
+            return None, _SELLER_REQUIRED_TEMPLATE
 
         old_account.status = "maintenance"
         rental.expiry_revoke_started_at = now
@@ -1218,6 +1751,7 @@ class ReplaceHandler:
             },
         ))
         await session.commit()
+        self._notify_capacity_changed()
         return claim, None
 
     async def _finalize_replacement(
@@ -1302,9 +1836,11 @@ class ReplaceHandler:
             rental.expiry_revoke_started_at = None
             rental.replacement_target_account_id = None
 
-        denial_template = "seller_called"
+        denial_template = _SELLER_REQUIRED_TEMPLATE
         if not owns_claim or not identity_matches:
             await session.commit()
+            if owns_claim:
+                self._notify_capacity_changed()
             text = await render_message(session, denial_template, ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
@@ -1312,6 +1848,7 @@ class ReplaceHandler:
             # The old account remains in maintenance. It must not be returned
             # to the pool until an operator confirms safe recovery.
             await session.commit()
+            self._notify_capacity_changed()
             text = await render_message(session, denial_template, ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
@@ -1324,7 +1861,10 @@ class ReplaceHandler:
             # The reservation is released, but the already revoked old account
             # remains in maintenance for explicit operator recovery.
             await session.commit()
-            text = await render_message(session, "seller_called", ctx.lang)
+            self._notify_capacity_changed()
+            text = await render_message(
+                session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
+            )
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
@@ -1333,6 +1873,7 @@ class ReplaceHandler:
         # acquire the now-cleared common lease and finish revocation later.
         if order.status in {"refund_pending", "refunded"}:
             await session.commit()
+            self._notify_capacity_changed()
             text = await render_message(session, "code_expired", ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
@@ -1341,11 +1882,13 @@ class ReplaceHandler:
         denial_template = await _rental_access_denial(session, rental, now)
         if denial_template is not None:
             await session.commit()
+            self._notify_capacity_changed()
             text = await render_message(session, denial_template, ctx.lang)
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
         if _replacement_window_is_too_short(rental, now):
             await session.commit()
+            self._notify_capacity_changed()
             text = await render_message(
                 session, "replace_expiring", ctx.lang,
             )
@@ -1360,7 +1903,10 @@ class ReplaceHandler:
                 metadata_={"limit": self._max_replacements},
             ))
             await session.commit()
-            text = await render_message(session, "seller_called", ctx.lang)
+            self._notify_capacity_changed()
+            text = await render_message(
+                session, _SELLER_REQUIRED_TEMPLATE, ctx.lang,
+            )
             await ctx.gateway.send_message(chat_id=ctx.chat_id, text=text)
             return
 
@@ -1414,6 +1960,7 @@ class ReplaceHandler:
         # before touching FunPay. A retry then sends this same account instead
         # of allocating another one or getting stuck behind replacement_count.
         await session.commit()
+        self._notify_capacity_changed()
         await self._rentals.deliver_claimed_rental(
             session, ctx.gateway, rental.id,
         )

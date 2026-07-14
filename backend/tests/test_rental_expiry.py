@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import FakeChatGateway
@@ -105,11 +107,50 @@ async def test_expire_marks_overdue_rentals(session: AsyncSession):
     rental = await _make_rental(session, expires_delta=timedelta(seconds=-1))
     gateway = FakeChatGateway()
     svc = _service()
-    expired = await svc.expire_overdue(session, gateway)
+    notifier = AsyncMock()
+    with patch(
+        "app.services.rental_expiry.TelegramNotifier.from_settings",
+        new=AsyncMock(return_value=notifier),
+    ):
+        expired = await svc.expire_overdue(session, gateway)
     assert len(expired) == 1
     await session.refresh(rental)
     assert rental.status == "expired"
     assert len(gateway.sent_messages) == 1
+    notifier.notify_rental_expired.assert_awaited_once_with("acc1")
+
+
+async def test_expiry_never_kicks_account_for_unverified_order(
+    session: AsyncSession,
+):
+    rental = await _make_rental(
+        session, expires_delta=timedelta(seconds=-1),
+    )
+    order = await session.get(Order, rental.order_id)
+    account = await session.get(Account, rental.account_id)
+    assert order is not None
+    assert account is not None
+    await session.execute(
+        delete(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    await session.commit()
+    kick = FakeKickService()
+    service = RentalExpiryService(kick_service=kick)
+
+    assert await service.prepare_overdue_batch(session) == []
+    result = await service.expire_candidate(
+        session,
+        gateway=None,
+        rental_id=rental.id,
+        order_id=order.id,
+    )
+
+    await session.refresh(rental)
+    await session.refresh(account)
+    assert result is None
+    assert kick.account_ids == []
+    assert rental.status == "active"
+    assert account.status == "active"
 
 
 async def test_expiry_releases_stale_replacement_target(

@@ -8,12 +8,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
 from app.integrations.funpay.types import OfferFieldsDTO
+from app.models.catalog import SubscriptionTier
 from app.models.lot import Lot
+from app.services.funpay_offer_mapping import funpay_offer_plan_fields
 
 
 _PROVENANCE_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _PROVENANCE_MARKER_RE = re.compile(r"\[FPBOT:([0-9a-f]{32})\]")
 _FUNPAY_DESCRIPTION_MAX_LENGTH = 4000
+_PAYMENT_MESSAGE_RU = (
+    "Заказ принят. Бот отправит данные для входа в чат заказа. "
+    "Код для входа: !код. Помощь: !помощь."
+)
+_PAYMENT_MESSAGE_EN = (
+    "Order accepted. The bot will send sign-in details in the order chat. "
+    "Sign-in code: !code. Help: !help."
+)
 
 
 def provenance_marker(token: str) -> str:
@@ -48,12 +58,18 @@ def extract_provenance_token(full_description: str | None) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def build_offer_fields(lot: Lot, offer_id: int, active: bool) -> OfferFieldsDTO:
+def build_offer_fields(
+    lot: Lot,
+    tier: SubscriptionTier,
+    offer_id: int,
+    active: bool,
+) -> OfferFieldsDTO:
     """Сборка OfferFieldsDTO из доменного Lot.
 
     offer_id=0 — создание нового лота на FunPay.
     subcategory_id = lot.funpay_node_id (ID ноды FunPay, куда публикуется лот).
     """
+    plan_fields = funpay_offer_plan_fields(tier)
     return OfferFieldsDTO(
         offer_id=offer_id,
         subcategory_id=lot.funpay_node_id or 0,
@@ -67,7 +83,15 @@ def build_offer_fields(lot: Lot, offer_id: int, active: bool) -> OfferFieldsDTO:
             lot.description_en,
             lot.provenance_token,
         ),
+        payment_msg_ru=_PAYMENT_MESSAGE_RU,
+        payment_msg_en=_PAYMENT_MESSAGE_EN,
+        subscription=plan_fields.subscription,
+        subscription_type=plan_fields.subscription_type,
         price=float(lot.price),
+        # The reconciler advertises only one immediately allocatable unit and
+        # re-runs after every durable allocation/capacity change.  This keeps
+        # FunPay stock aligned with the bot's single-rental-per-account rule.
+        amount=1,
         active=active,
         auto_delivery=False,
     )
@@ -102,7 +126,15 @@ class LotSyncService:
             offer_id = await self._recover_uncommitted_remote_offer(
                 session, gateway, lot,
             )
-        fields = build_offer_fields(lot, offer_id=offer_id, active=active)
+        tier = await session.get(SubscriptionTier, lot.tier_id)
+        if tier is None:
+            raise RuntimeError(f"Subscription tier {lot.tier_id} not found")
+        fields = build_offer_fields(
+            lot,
+            tier,
+            offer_id=offer_id,
+            active=active,
+        )
         result_id = await gateway.save_offer_fields(fields)
         if result_id <= 0:
             raise RuntimeError("FunPay did not return a valid offer id")
@@ -118,11 +150,13 @@ class LotSyncService:
         gateway: ChatGateway,
         lot: Lot,
     ) -> int:
-        """Adopt one exact, locally-unclaimed offer before creating another.
+        """Recover only an offer carrying this lot's immutable bot marker.
 
-        A process can die after FunPay accepts a create but before ``funpay_id``
-        is committed. Matching the deterministic title and price makes the
-        next reconciliation recover that offer instead of duplicating it.
+        A title and price are public, operator-editable display attributes and
+        cannot prove that the bot created an offer.  They only bound the small
+        set whose full descriptions are fetched; adoption requires the exact
+        persisted provenance token.  A manual lookalike is therefore left
+        untouched and normal creation proceeds.
         """
         remote = await gateway.get_my_offers(lot.funpay_node_id or 0)
         used_result = await session.execute(
@@ -140,18 +174,32 @@ class LotSyncService:
             _normalize_title(lot.title_en),
         }
         titles.discard("")
-        matches = [
+        candidates = [
             offer for offer in remote
             if offer.offer_id not in used_ids
             and _normalize_title(offer.title) in titles
             and offer.price is not None
             and math.isclose(offer.price, float(lot.price), abs_tol=0.01)
         ]
+        matches = []
+        for offer in candidates:
+            try:
+                desc_ru, desc_en = await gateway.get_offer_descriptions(
+                    offer.offer_id
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Unable to verify provenance of an unclaimed FunPay offer"
+                ) from exc
+            if _descriptions_have_exact_provenance(
+                (desc_ru, desc_en), lot.provenance_token,
+            ):
+                matches.append(offer)
         if len(matches) == 1:
             return matches[0].offer_id
         if len(matches) > 1:
             raise RuntimeError(
-                "More than one unclaimed FunPay offer matches the local lot"
+                "More than one unclaimed FunPay offer carries the local lot marker"
             )
         return 0
 
@@ -202,3 +250,28 @@ class LotSyncService:
 
 def _normalize_title(value: str | None) -> str:
     return " ".join((value or "").casefold().split())
+
+
+def _descriptions_have_exact_provenance(
+    descriptions: tuple[str | None, str | None],
+    token: str,
+) -> bool:
+    """Accept one canonical marker per localized description, and no other."""
+
+    markers_by_description = [
+        _PROVENANCE_MARKER_RE.findall(description or "")
+        for description in descriptions
+    ]
+    markers = [
+        marker
+        for description_markers in markers_by_description
+        for marker in description_markers
+    ]
+    return (
+        bool(markers)
+        and all(
+            len(description_markers) <= 1
+            for description_markers in markers_by_description
+        )
+        and all(marker == token for marker in markers)
+    )

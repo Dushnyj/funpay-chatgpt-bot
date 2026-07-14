@@ -140,6 +140,59 @@ async def test_metrics_report_free_rental_capacity(
     assert response.json()["available_accounts"] == 1
 
 
+async def test_metrics_count_only_paid_accounts_with_trusted_expiry(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier = SubscriptionTier(
+        code="plus",
+        name="Plus",
+        is_active=True,
+        is_sellable=True,
+    )
+    session.add(tier)
+    await session.flush()
+    now = datetime.now(timezone.utc)
+    accounts = [
+        Account(
+            login="trusted-paid@example.test",
+            password_encrypted="password",
+            totp_secret_encrypted="totp",
+            tier_id=tier.id,
+            status="active",
+            subscription_expires_at=now.replace(year=now.year + 1),
+            subscription_expiry_source="accounts_check",
+        ),
+        Account(
+            login="unsourced-paid@example.test",
+            password_encrypted="password",
+            totp_secret_encrypted="totp",
+            tier_id=tier.id,
+            status="active",
+            subscription_expires_at=now.replace(year=now.year + 1),
+        ),
+    ]
+    session.add_all(accounts)
+    await session.flush()
+    session.add_all([
+        AccountLimits(
+            account_id=account.id,
+            refresh_token_encrypted="refresh",
+            refresh_status="ok",
+            measured_at=now,
+            plan_type="plus",
+            plan_window_status="ok",
+        )
+        for account in accounts
+    ])
+    await session.commit()
+
+    response = await auth_client.get("/api/metrics")
+
+    assert response.status_code == 200
+    assert response.json()["available_accounts"] == 1
+
+
 async def test_metrics_exclude_replacement_target_from_available_capacity(
     auth_client: AsyncClient,
     session: AsyncSession,

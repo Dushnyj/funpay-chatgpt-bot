@@ -72,6 +72,43 @@ def test_lifecycle_creates_components():
     assert lc.runner is None  # без golden_key
 
 
+async def test_capacity_reconcile_requests_coalesce_in_same_tick():
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = object()
+    lifecycle.reconcile_lots = AsyncMock(return_value=[])
+
+    lifecycle.request_capacity_reconcile()
+    lifecycle.request_capacity_reconcile()
+    lifecycle.request_capacity_reconcile()
+    task = lifecycle._capacity_reconcile_task
+    assert task is not None
+    await task
+
+    lifecycle.reconcile_lots.assert_awaited_once_with(refresh_stock=True)
+    assert lifecycle._capacity_reconcile_dirty is False
+
+
+async def test_capacity_reconcile_failure_keeps_dirty_and_retries():
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = object()
+    lifecycle._capacity_reconcile_retry_seconds = 0
+    lifecycle.reconcile_lots = AsyncMock(
+        side_effect=[RuntimeError("temporary remote error"), []],
+    )
+
+    lifecycle.request_capacity_reconcile()
+    task = lifecycle._capacity_reconcile_task
+    assert task is not None
+    await task
+
+    assert lifecycle.reconcile_lots.await_count == 2
+    assert all(
+        call.kwargs == {"refresh_stock": True}
+        for call in lifecycle.reconcile_lots.await_args_list
+    )
+    assert lifecycle._capacity_reconcile_dirty is False
+
+
 def test_order_retry_backoff_saturates_for_corrupt_large_attempt_count():
     now = datetime(2026, 7, 13, tzinfo=timezone.utc)
     order = Order(
@@ -175,6 +212,7 @@ async def test_manual_delivery_retry_rechecks_remote_refund(monkeypatch):
 
 async def test_manual_retry_preserves_nonzero_disclosure_attempts(monkeypatch):
     import app.app_lifecycle as lifecycle_module
+    from sqlalchemy import select
     from app.integrations.funpay.types import OrderInfo, SaleStatus
     from app.models.rental import Rental
 
@@ -263,8 +301,322 @@ async def test_register_periodic_tasks():
     assert "refund_revoke" in lc.scheduler._tasks
     assert "pending_order_retry" in lc.scheduler._tasks
     assert "funpay_sale_sync" in lc.scheduler._tasks
+    assert "order_confirmed_notify" in lc.scheduler._tasks
     assert lc.scheduler._tasks["funpay_sale_sync"].interval == 120
+    assert lc.scheduler._tasks["order_confirmed_notify"].interval == 60
     await lc.stop()
+
+
+async def test_confirmed_order_notification_task_is_exact_and_idempotent(
+    session,
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+    from sqlalchemy import select
+
+    from app.integrations.funpay.gateway import FakeChatGateway
+    from app.models.audit import AuditLog
+    from app.services.order_notifications import (
+        BUYER_ORDER_CONFIRMED_DUE_EVENT,
+        BUYER_ORDER_CONFIRMED_EVENT,
+        OrderNotificationService,
+    )
+    from app.services.seed_data import seed_message_templates
+
+    await seed_message_templates(session)
+    order = await _seed_verified_pending_order(session, "notify-retry")
+    order.status = "completed"
+    await session.commit()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "async_session_factory",
+        lambda: Context(),
+    )
+    gateway = FakeChatGateway()
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = gateway
+
+    await OrderNotificationService().mark_confirmed_due(session, order)
+    await session.commit()
+
+    await lifecycle._task_order_confirmed_notify()
+    await lifecycle._task_order_confirmed_notify()
+
+    assert len(gateway.sent_messages) == 1
+    assert gateway.sent_messages[0][0] == int(order.funpay_chat_id)
+    markers = list((await session.execute(
+        select(AuditLog).where(
+            AuditLog.event_type == BUYER_ORDER_CONFIRMED_EVENT,
+            AuditLog.order_id == order.id,
+        )
+    )).scalars())
+    assert len(markers) == 1
+    due_markers = list((await session.execute(
+        select(AuditLog).where(
+            AuditLog.event_type == BUYER_ORDER_CONFIRMED_DUE_EVENT,
+            AuditLog.order_id == order.id,
+        )
+    )).scalars())
+    assert len(due_markers) == 1
+
+
+async def test_confirmed_order_notification_failure_becomes_manual(
+    session,
+):
+    from app.integrations.funpay.gateway import FakeChatGateway
+    from app.services.order_notifications import (
+        ORDER_NOTIFICATION_MAX_ATTEMPTS,
+        OrderNotificationService,
+    )
+    from app.services.seed_data import seed_message_templates
+
+    class FailingGateway(FakeChatGateway):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def send_message(self, chat_id: int, text: str) -> int:
+            self.calls += 1
+            raise RuntimeError("permanent chat failure")
+
+    await seed_message_templates(session)
+    order = await _seed_verified_pending_order(session, "notify-manual")
+    order.status = "completed"
+    service = OrderNotificationService()
+    await service.mark_confirmed_due(session, order)
+    order.confirmation_delivery_status = "failed"
+    order.confirmation_delivery_attempts = ORDER_NOTIFICATION_MAX_ATTEMPTS - 1
+    order.confirmation_delivery_next_attempt_at = None
+    await session.commit()
+    gateway = FailingGateway()
+
+    with pytest.raises(RuntimeError, match="permanent chat failure"):
+        await service.notify_confirmed(session, gateway, order.id)
+
+    await session.refresh(order)
+    assert order.confirmation_delivery_status == "manual"
+    assert order.confirmation_delivery_attempts == ORDER_NOTIFICATION_MAX_ATTEMPTS
+    assert order.confirmation_delivery_next_attempt_at is None
+    assert order.confirmation_delivery_last_error == "RuntimeError"
+    assert await service.notify_confirmed(session, gateway, order.id) is False
+    assert gateway.calls == 1
+
+
+async def test_confirmed_order_global_outage_stays_self_healing(
+    session,
+):
+    from app.integrations.funpay.gateway import FakeChatGateway
+    from app.services.order_notifications import (
+        GlobalOrderNotificationDeliveryError,
+        ORDER_NOTIFICATION_MAX_ATTEMPTS,
+        OrderNotificationService,
+    )
+    from app.services.seed_data import seed_message_templates
+
+    class OfflineGateway(FakeChatGateway):
+        async def send_message(self, chat_id: int, text: str) -> int:
+            raise ConnectionError("shared FunPay outage")
+
+    await seed_message_templates(session)
+    order = await _seed_verified_pending_order(session, "notify-outage")
+    order.status = "completed"
+    service = OrderNotificationService()
+    await service.mark_confirmed_due(session, order)
+    order.confirmation_delivery_status = "failed"
+    order.confirmation_delivery_attempts = ORDER_NOTIFICATION_MAX_ATTEMPTS - 1
+    order.confirmation_delivery_next_attempt_at = None
+    await session.commit()
+
+    with pytest.raises(GlobalOrderNotificationDeliveryError) as error:
+        await service.notify_confirmed(session, OfflineGateway(), order.id)
+
+    assert isinstance(error.value.cause, ConnectionError)
+    assert error.value.__cause__ is error.value.cause
+
+    await session.refresh(order)
+    assert order.confirmation_delivery_status == "failed"
+    assert order.confirmation_delivery_attempts == ORDER_NOTIFICATION_MAX_ATTEMPTS
+    assert order.confirmation_delivery_next_attempt_at is not None
+
+
+async def test_confirmed_order_notification_batch_stops_on_global_outage(
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+    from app.services.order_notifications import (
+        GlobalOrderNotificationDeliveryError,
+    )
+
+    oldest = MagicMock()
+    oldest.scalars.return_value = [11, 12, 13]
+    newest = MagicMock()
+    newest.scalars.return_value = [13, 12, 11]
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[oldest, newest])
+    session.commit = AsyncMock()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = object()
+    lifecycle._order_notifications.notify_confirmed = AsyncMock(
+        side_effect=GlobalOrderNotificationDeliveryError(
+            ConnectionError("shared FunPay outage")
+        )
+    )
+
+    await lifecycle._task_order_confirmed_notify()
+
+    lifecycle._order_notifications.notify_confirmed.assert_awaited_once_with(
+        session,
+        lifecycle._gateway,
+        11,
+    )
+
+
+async def test_confirmed_order_notification_batch_skips_per_chat_failure(
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+
+    oldest = MagicMock()
+    oldest.scalars.return_value = [21, 22]
+    newest = MagicMock()
+    newest.scalars.return_value = [22, 21]
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[oldest, newest])
+    session.commit = AsyncMock()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = object()
+    lifecycle._order_notifications.notify_confirmed = AsyncMock(
+        side_effect=[RuntimeError("one poisoned chat"), False]
+    )
+
+    await lifecycle._task_order_confirmed_notify()
+
+    assert lifecycle._order_notifications.notify_confirmed.await_count == 2
+    assert [
+        call.args[2]
+        for call in lifecycle._order_notifications.notify_confirmed.await_args_list
+    ] == [21, 22]
+
+
+async def test_confirmed_order_notification_queue_mixes_oldest_and_newest(
+    session,
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+
+    from app.models.audit import AuditLog
+    from app.models.funpay_sale import FunPaySale
+    from app.services.order_notifications import BUYER_ORDER_CONFIRMED_DUE_EVENT
+
+    first = await _seed_verified_pending_order(session, "notify-fair-0")
+    first.status = "completed"
+    first.confirmation_delivery_status = "failed"
+    first.confirmation_delivery_attempts = 1
+    first.confirmation_delivery_next_attempt_at = (
+        datetime.now(timezone.utc) - timedelta(minutes=1)
+    )
+    first.created_at = datetime.now(timezone.utc) - timedelta(days=2)
+    session.add(AuditLog(
+        event_type=BUYER_ORDER_CONFIRMED_DUE_EVENT,
+        order_id=first.id,
+        chat_id=first.funpay_chat_id,
+    ))
+    newest = first
+    for index in range(1, 51):
+        order = Order(
+            funpay_order_id=f"notify-fair-{index}",
+            funpay_chat_id=str(1000 + index),
+            buyer_funpay_id=str(2000 + index),
+            buyer_locale="ru",
+            lot_id=first.lot_id,
+            lot_binding_method=first.lot_binding_method,
+            funpay_offer_id=first.funpay_offer_id,
+            tier_id=first.tier_id,
+            duration_id=first.duration_id,
+            limit_scope_id=first.limit_scope_id,
+            price=first.price,
+            status="completed",
+            confirmation_delivery_status=(
+                "pending" if index == 50 else "failed"
+            ),
+            confirmation_delivery_attempts=(0 if index == 50 else 1),
+            confirmation_delivery_next_attempt_at=(
+                None
+                if index == 50
+                else datetime.now(timezone.utc) - timedelta(minutes=1)
+            ),
+            created_at=(
+                datetime.now(timezone.utc)
+                - timedelta(days=2)
+                + timedelta(minutes=index)
+            ),
+        )
+        session.add(order)
+        await session.flush()
+        session.add_all([
+            FunPaySale(
+                funpay_order_id=order.funpay_order_id,
+                order_id=order.id,
+                funpay_chat_id=order.funpay_chat_id,
+                buyer_funpay_id=order.buyer_funpay_id,
+                status="completed",
+            ),
+            AuditLog(
+                event_type=BUYER_ORDER_CONFIRMED_DUE_EVENT,
+                order_id=order.id,
+                chat_id=order.funpay_chat_id,
+            ),
+        ])
+        newest = order
+    await session.commit()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = object()
+    lifecycle._order_notifications.notify_confirmed = AsyncMock(return_value=False)
+
+    await lifecycle._task_order_confirmed_notify()
+
+    selected = [
+        call.args[2]
+        for call in lifecycle._order_notifications.notify_confirmed.await_args_list
+    ]
+    assert len(selected) == 50
+    assert first.id in selected
+    assert newest.id in selected
 
 
 async def test_sale_sync_bootstraps_legacy_orders_only_once(monkeypatch):
@@ -382,9 +734,21 @@ def test_full_validation_fallback_interval_is_daily():
     assert lifecycle._validation_interval_seconds == 24 * 60 * 60
 
 
+def test_browser_concurrency_cap_defaults_to_one():
+    lifecycle = AppLifecycle(golden_key="", category_id=0)
+
+    assert lifecycle._browser_concurrency_cap == 1
+    assert lifecycle._refresh_concurrency == 1
+    assert lifecycle._revoke_concurrency == 1
+
+
 async def test_load_runtime_settings_configures_scheduler(session, monkeypatch):
     import app.app_lifecycle as lifecycle_module
+    from app.config import get_settings
     from app.models.settings import SellerSettings
+
+    monkeypatch.setenv("BROWSER_CONCURRENCY_CAP", "2")
+    get_settings.cache_clear()
 
     session.add(SellerSettings(
         id=1,
@@ -418,7 +782,9 @@ async def test_load_runtime_settings_configures_scheduler(session, monkeypatch):
     assert lc._lot_interval_seconds == 600
     assert lc._bump_interval_seconds == 7200
     assert lc._refresh_interval_seconds == 45
-    assert lc._refresh_concurrency == 4
+    assert lc._browser_concurrency_cap == 2
+    assert lc._refresh_concurrency == 2
+    assert lc._revoke_concurrency == 2
     assert lc._refresh_max_attempts == 5
     assert lc._refresh_retry_delay_seconds == 420
 
@@ -440,6 +806,7 @@ async def test_limits_task_includes_never_measured_accounts(session, monkeypatch
         tier_id=tier.id,
         status="active",
         subscription_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+        subscription_expiry_source="accounts_check",
     )
     session.add(account)
     await session.flush()
@@ -869,6 +1236,7 @@ async def test_refresh_task_uses_configured_concurrency(monkeypatch):
     lifecycle._refresh_max_attempts = 6
     lifecycle._recover_stale_validation_leases = AsyncMock()
     lifecycle._enqueue_due_refresh_recoveries = AsyncMock()
+    lifecycle.request_capacity_reconcile = MagicMock()
 
     process = AsyncMock(return_value=False)
     monkeypatch.setattr(
@@ -890,6 +1258,13 @@ async def test_refresh_task_uses_configured_concurrency(monkeypatch):
     await lifecycle._task_refresh_recover()
 
     assert process.await_count == 4
+    lifecycle.request_capacity_reconcile.assert_not_called()
+
+    process.return_value = True
+    await lifecycle._task_refresh_recover()
+
+    assert process.await_count == 8
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
 
 
 async def test_reload_settings_updates_validation_not_lot_interval(
@@ -1166,6 +1541,10 @@ async def test_reconcile_pauses_invalid_manual_lot_without_global_node(
 async def test_expiry_revoke_batch_does_not_head_of_line_block(monkeypatch):
     import asyncio
     import app.app_lifecycle as lifecycle_module
+    from app.config import get_settings
+
+    monkeypatch.setenv("BROWSER_CONCURRENCY_CAP", "2")
+    get_settings.cache_clear()
 
     sessions: list[object] = []
 
@@ -1223,9 +1602,59 @@ async def test_expiry_revoke_batch_does_not_head_of_line_block(monkeypatch):
     await asyncio.wait_for(task, timeout=1)
 
 
+async def test_pending_order_completed_transition_marks_confirmation_due(
+    session,
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+    from sqlalchemy import select
+
+    from app.integrations.funpay.types import OrderInfo, SaleStatus
+    from app.models.audit import AuditLog
+    from app.services.order_notifications import BUYER_ORDER_CONFIRMED_DUE_EVENT
+
+    order = await _seed_verified_pending_order(session, "completed-retry-order")
+    await session.commit()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._gateway = AsyncMock()
+    lifecycle._gateway.get_order.return_value = OrderInfo(
+        order_id=order.funpay_order_id,
+        status=SaleStatus.COMPLETED,
+        chat_id=100,
+        buyer_id=200,
+        subcategory_id=55,
+        title=None,
+        price=100,
+    )
+    delivered = MagicMock(credentials_delivery_status="sent")
+    lifecycle._rentals.fulfill_order = AsyncMock(return_value=delivered)
+
+    await lifecycle._task_pending_orders()
+
+    await session.refresh(order)
+    assert order.status == "completed"
+    assert await session.scalar(select(AuditLog.id).where(
+        AuditLog.event_type == BUYER_ORDER_CONFIRMED_DUE_EVENT,
+        AuditLog.order_id == order.id,
+    )) is not None
+
+
 async def test_refund_revoke_batch_does_not_head_of_line_block(monkeypatch):
     import asyncio
     import app.app_lifecycle as lifecycle_module
+    from app.config import get_settings
+
+    monkeypatch.setenv("BROWSER_CONCURRENCY_CAP", "2")
+    get_settings.cache_clear()
 
     sessions: list[object] = []
 
@@ -1289,3 +1718,40 @@ async def test_refund_revoke_batch_does_not_head_of_line_block(monkeypatch):
 
     release_slow.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+async def test_refund_revoke_batch_skips_unverified_order(
+    monkeypatch,
+    session,
+):
+    import app.app_lifecycle as lifecycle_module
+    from sqlalchemy import delete
+    from app.models.funpay_sale import FunPaySale
+
+    order = await _seed_verified_pending_order(
+        session, "unverified-refund-pending",
+    )
+    order.status = "refund_pending"
+    await session.execute(
+        delete(FunPaySale).where(FunPaySale.order_id == order.id)
+    )
+    await session.commit()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "async_session_factory",
+        lambda: Context(),
+    )
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._refunds.process_sale_refunded = AsyncMock()
+
+    await lifecycle._task_refund_revoke()
+
+    lifecycle._refunds.process_sale_refunded.assert_not_awaited()

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -61,10 +62,20 @@ async def test_bump_lot_records_failure(session: AsyncSession):
 
     lot = await _make_lot(session)
     svc = BumpService()
-    result = await svc.bump_lot(
-        session, FailingGateway(), lot_id=lot.id, category_id=1, subcategory_id=55,
-    )
+    notifier = AsyncMock()
+    with patch(
+        "app.services.bump.TelegramNotifier.from_settings",
+        new=AsyncMock(return_value=notifier),
+    ):
+        result = await svc.bump_lot(
+            session,
+            FailingGateway(),
+            lot_id=lot.id,
+            category_id=1,
+            subcategory_id=55,
+        )
     assert result.success is False
+    notifier.notify_bump_failed.assert_awaited_once_with(lot.id)
     assert "network error" in (result.error or "")
     logs = (await session.execute(select(BumpLog).where(BumpLog.lot_id == lot.id))).scalars().all()
     assert len(logs) == 1

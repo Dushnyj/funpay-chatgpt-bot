@@ -94,3 +94,51 @@ class FunPaySaleSyncState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class FunPaySaleCandidate(Base):
+    """Non-authoritative seller-history row awaiting exact order proof.
+
+    Candidates are deliberately separate from ``FunPaySale``: they must never
+    authorize a buyer chat, command, credential delivery, or account revoke.
+    Only a successful exact offer-id/provenance-token match promotes one into
+    the managed ``Order`` + ``FunPaySale`` pair.
+    """
+
+    __tablename__ = "funpay_sale_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "funpay_order_id",
+            name="uq_funpay_sale_candidates_funpay_order_id",
+        ),
+        Index(
+            "ix_funpay_sale_candidates_recovery_due",
+            "recovery_state",
+            "next_attempt_at",
+            "observed_created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    funpay_order_id: Mapped[str] = mapped_column(String(64))
+    buyer_funpay_id: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), default="unknown")
+    observed_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    recovery_state: Mapped[str] = mapped_column(
+        String(16), default="pending"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    last_error: Mapped[str | None] = mapped_column(
+        String(128), default=None
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

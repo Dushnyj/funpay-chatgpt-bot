@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily verified FunPay backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=funpay-backup.service
+
+[Install]
+WantedBy=timers.target

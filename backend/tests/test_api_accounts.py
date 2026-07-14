@@ -75,6 +75,21 @@ async def test_create_account(auth_client: AsyncClient, session: AsyncSession):
     ]
 
 
+async def test_create_account_rejects_manual_subscription_expiry(
+    auth_client: AsyncClient,
+):
+    response = await auth_client.post(
+        "/api/accounts",
+        json={
+            "login": "manual-expiry@example.com",
+            "password": "password",
+            "subscription_expires_at": "2026-08-01T00:00:00Z",
+        },
+    )
+    assert response.status_code == 422
+    assert "measured automatically" in response.text
+
+
 async def test_account_capacity_above_one_is_rejected(
     auth_client: AsyncClient,
 ):
@@ -878,5 +893,5 @@ async def test_replacement_target_is_mutation_locked_but_not_counted_as_sold(
         await auth_client.delete(f"/api/accounts/{target.id}"),
     ]
     assert [response.status_code for response in blocked_requests] == [
-        409, 409, 409, 409, 409, 409, 409,
+        409, 422, 409, 409, 409, 409, 409,
     ]

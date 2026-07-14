@@ -37,6 +37,9 @@ async def test_update_and_list_templates(auth_client: AsyncClient, session: Asyn
     assert len(items) == 1
     assert items[0]["key"] == "welcome"
     assert {"login", "password"} <= set(items[0]["allowed_fields"])
+    assert "codex_usage_summary" in items[0]["allowed_fields"]
+    assert "chat_5h" not in items[0]["allowed_fields"]
+    assert "chat_weekly" not in items[0]["allowed_fields"]
     assert items[0]["is_custom"] is True
 
 

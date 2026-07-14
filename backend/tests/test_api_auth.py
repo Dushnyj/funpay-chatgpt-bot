@@ -1,9 +1,13 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
-from passlib.hash import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import COOKIE_NAME, create_access_token
+from app.api.auth import (
+    COOKIE_NAME,
+    create_access_token,
+    hash_password,
+    verify_password,
+)
 from app.api.routers.auth import _login_throttles, _login_throttles_lock
 from app.main import app
 from app.models.settings import SellerSettings
@@ -22,8 +26,12 @@ def reset_login_throttles():
         _login_throttles.clear()
 
 
+def test_verify_password_rejects_malformed_hash():
+    assert verify_password("secret123", "not-a-bcrypt-hash") is False
+
+
 async def test_login_success(client: AsyncClient, session: AsyncSession):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
 
     resp = await client.post("/api/auth/login", json={"password": "secret123"})
@@ -35,7 +43,7 @@ async def test_login_success(client: AsyncClient, session: AsyncSession):
 
 
 async def test_login_wrong_password(client: AsyncClient, session: AsyncSession):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
 
     resp = await client.post("/api/auth/login", json={"password": "wrong"})
@@ -46,7 +54,7 @@ async def test_login_rejects_oversized_password_before_bcrypt(
     client: AsyncClient,
     session: AsyncSession,
 ):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
 
     response = await client.post(
@@ -63,7 +71,7 @@ async def test_login_no_settings_returns_500(client: AsyncClient, session: Async
 
 
 async def test_logout_clears_cookie(client: AsyncClient, session: AsyncSession):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
 
     await client.post("/api/auth/login", json={"password": "secret123"})
@@ -74,7 +82,7 @@ async def test_logout_clears_cookie(client: AsyncClient, session: AsyncSession):
 async def test_login_rate_limit_returns_retry_after(
     client: AsyncClient, session: AsyncSession
 ):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
 
     for _ in range(5):
@@ -89,7 +97,7 @@ async def test_login_rate_limit_returns_retry_after(
 async def test_blocked_client_cannot_bypass_throttle_with_correct_guess(
     client: AsyncClient, session: AsyncSession
 ):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
 
     for _ in range(5):
@@ -108,7 +116,7 @@ async def test_throttled_source_does_not_lock_out_another_ip(
     client: AsyncClient,
     session: AsyncSession,
 ):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("secret123")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("secret123")))
     await session.commit()
     for _ in range(5):
         assert (await client.post(
@@ -129,7 +137,7 @@ async def test_throttled_source_does_not_lock_out_another_ip(
 async def test_change_password_revokes_old_cookie_and_allows_new_login(
     client: AsyncClient, session: AsyncSession
 ):
-    session.add(SellerSettings(id=1, admin_password_hash=bcrypt.hash("old-password")))
+    session.add(SellerSettings(id=1, admin_password_hash=hash_password("old-password")))
     await session.commit()
     login = await client.post(
         "/api/auth/login", json={"password": "old-password"}

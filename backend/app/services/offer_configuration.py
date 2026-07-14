@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.services.funpay_offer_mapping import is_funpay_offer_tier_supported
 
 
 class OfferConfiguration(Protocol):
@@ -68,6 +69,11 @@ async def validate_offer_configurations(
         ):
             raise OfferConfigurationError(
                 f"Price row {index}: tariff is unavailable for sale"
+            )
+        if require_sellable_tier and not is_funpay_offer_tier_supported(tier):
+            raise OfferConfigurationError(
+                f"Price row {index}: tariff is not supported by the FunPay "
+                "ChatGPT offer form"
             )
         if duration is None or (
             require_enabled_duration and not duration.is_enabled

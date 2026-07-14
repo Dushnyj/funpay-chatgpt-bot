@@ -16,7 +16,7 @@ from app.services.lot_sync import (
 
 
 async def _make_lot(session: AsyncSession) -> Lot:
-    tier = SubscriptionTier(name="Plus", is_active=True)
+    tier = SubscriptionTier(code="plus", name="Plus", is_active=True)
     session.add(tier)
     duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     session.add(duration)
@@ -43,7 +43,9 @@ async def _make_lot(session: AsyncSession) -> Lot:
 
 async def test_build_offer_fields_new_lot(session: AsyncSession):
     lot = await _make_lot(session)
-    fields = build_offer_fields(lot, offer_id=0, active=True)
+    tier = await session.get(SubscriptionTier, lot.tier_id)
+    assert tier is not None
+    fields = build_offer_fields(lot, tier, offer_id=0, active=True)
     marker = provenance_marker(lot.provenance_token)
     assert fields.offer_id == 0
     assert fields.subcategory_id == 55
@@ -51,7 +53,13 @@ async def test_build_offer_fields_new_lot(session: AsyncSession):
     assert fields.title_en == "Plus 7 days"
     assert fields.desc_ru == f"Описание лота\n\n{marker}"
     assert fields.desc_en == f"Lot description\n\n{marker}"
+    assert fields.payment_msg_ru.startswith("Заказ принят.")
+    assert fields.payment_msg_en.startswith("Order accepted.")
+    assert fields.subscription.value == "С подпиской"
+    assert fields.subscription_type is not None
+    assert fields.subscription_type.value == "Plus"
     assert fields.price == 599.0
+    assert fields.amount == 1
     assert fields.active is True
     assert fields.auto_delivery is False
     assert lot.provenance_marker_synced is False
@@ -64,9 +72,11 @@ async def test_description_marker_is_stable_deduplicated_and_bounded(
     marker = provenance_marker(lot.provenance_token)
     lot.description_ru = f"Описание\n\n{marker}\n\n{marker}"
     lot.description_en = "X" * 5000
+    tier = await session.get(SubscriptionTier, lot.tier_id)
+    assert tier is not None
 
-    first = build_offer_fields(lot, offer_id=0, active=True)
-    second = build_offer_fields(lot, offer_id=0, active=True)
+    first = build_offer_fields(lot, tier, offer_id=0, active=True)
+    second = build_offer_fields(lot, tier, offer_id=0, active=True)
 
     assert first.desc_ru == second.desc_ru == f"Описание\n\n{marker}"
     assert first.desc_ru.count(marker) == 1
@@ -80,14 +90,18 @@ async def test_description_marker_is_stable_deduplicated_and_bounded(
 
 async def test_build_offer_fields_existing_lot(session: AsyncSession):
     lot = await _make_lot(session)
-    fields = build_offer_fields(lot, offer_id=42, active=False)
+    tier = await session.get(SubscriptionTier, lot.tier_id)
+    assert tier is not None
+    fields = build_offer_fields(lot, tier, offer_id=42, active=False)
     assert fields.offer_id == 42
     assert fields.active is False
 
 
 async def test_build_offer_fields_uses_node_id_as_subcategory(session: AsyncSession):
     lot = await _make_lot(session)
-    fields = build_offer_fields(lot, offer_id=0, active=True)
+    tier = await session.get(SubscriptionTier, lot.tier_id)
+    assert tier is not None
+    fields = build_offer_fields(lot, tier, offer_id=0, active=True)
     assert fields.subcategory_id == lot.funpay_node_id
 
 
@@ -137,6 +151,11 @@ async def test_sync_recovers_exact_unclaimed_remote_offer_instead_of_duplicating
         active=True,
         auto_delivery=False,
     )])
+    gateway.set_offer_descriptions(
+        777,
+        desc_ru=f"Создано ботом\n\n{provenance_marker(lot.provenance_token)}",
+        desc_en=f"Created by bot\n\n{provenance_marker(lot.provenance_token)}",
+    )
 
     funpay_id = await LotSyncService().sync_lot(
         session, gateway, lot.id, active=True,
@@ -145,6 +164,65 @@ async def test_sync_recovers_exact_unclaimed_remote_offer_instead_of_duplicating
     assert funpay_id == 777
     assert lot.funpay_id == "777"
     assert set(gateway.saved_offers) == {777}
+
+
+async def test_sync_never_adopts_manual_title_price_lookalike(
+    session: AsyncSession, gateway: FakeChatGateway,
+):
+    lot = await _make_lot(session)
+    await session.commit()
+    gateway.set_my_offers(55, [OfferInfo(
+        offer_id=777,
+        subcategory_id=55,
+        title=lot.title_ru,
+        price=float(lot.price),
+        active=True,
+        auto_delivery=False,
+    )])
+    gateway.set_offer_descriptions(
+        777,
+        desc_ru="Ручной лот продавца",
+        desc_en="Seller's manual offer",
+    )
+
+    funpay_id = await LotSyncService().sync_lot(
+        session, gateway, lot.id, active=True,
+    )
+
+    assert funpay_id != 777
+    assert lot.funpay_id == str(funpay_id)
+    assert gateway.saved_offers[777].desc_ru == "Ручной лот продавца"
+    assert gateway.saved_offers[funpay_id].desc_ru.endswith(
+        provenance_marker(lot.provenance_token)
+    )
+
+
+async def test_sync_rejects_ambiguous_or_mismatched_recovery_marker(
+    session: AsyncSession, gateway: FakeChatGateway,
+):
+    lot = await _make_lot(session)
+    await session.commit()
+    marker = provenance_marker(lot.provenance_token)
+    gateway.set_my_offers(55, [OfferInfo(
+        offer_id=777,
+        subcategory_id=55,
+        title=lot.title_ru,
+        price=float(lot.price),
+        active=True,
+        auto_delivery=False,
+    )])
+    gateway.set_offer_descriptions(
+        777,
+        desc_ru=f"{marker}\n{marker}",
+        desc_en="[FPBOT:ffffffffffffffffffffffffffffffff]",
+    )
+
+    funpay_id = await LotSyncService().sync_lot(
+        session, gateway, lot.id, active=True,
+    )
+
+    assert funpay_id != 777
+    assert gateway.saved_offers[777].desc_ru == f"{marker}\n{marker}"
 
 
 async def test_sync_pause_uses_set_offer_active(session: AsyncSession, gateway: FakeChatGateway):

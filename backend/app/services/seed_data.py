@@ -7,6 +7,7 @@ from app.models.message import MessageTemplate
 from app.services.lot_templates import (
     DEFAULT_LOT_TEMPLATES,
     LEGACY_DAY_LOT_TEMPLATES,
+    PRE_PREMIUM_LOT_TEMPLATES,
     validate_lot_template_values,
 )
 from app.services.subscription_plans import SYSTEM_SUBSCRIPTION_PLANS
@@ -278,9 +279,9 @@ PRE_AGENTIC_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
-# Active defaults describe the single measured agentic pool and use a
-# display-ready duration so sub-day rentals remain truthful in every locale.
-DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+# Defaults shipped before the copy review. They already described the single
+# measured agentic pool and used a display-ready sub-day duration.
+PRE_PREMIUM_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
     **PRE_AGENTIC_MESSAGE_TEMPLATES,
     "code_success": {
         "ru": (
@@ -453,6 +454,400 @@ DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
+# Buyer-facing copy shipped after the message-catalog review.  The preceding
+# dictionaries are intentionally retained as migration sources: bootstrap may
+# upgrade an untouched bundled template, but never an operator-edited one.
+PRE_ORDER_QUALIFIED_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+    "rental_ambiguous": {
+        "ru": (
+            "В этом чате найдено несколько активных заказов. Откройте страницу "
+            "нужного заказа и отправьте команду из его чата."
+        ),
+        "en": (
+            "Several active orders were found in this chat. Open the required "
+            "order page and send the command from its chat."
+        ),
+    },
+    "help": {
+        "ru": (
+            "Команды\n"
+            "!код — получить коды для входа\n"
+            "!подписка — проверить срок доступа и лимит Codex\n"
+            "!замена — запросить замену неисправного аккаунта\n"
+            "!продавец — вызвать продавца\n"
+            "!помощь — показать эту справку"
+        ),
+        "en": (
+            "Commands\n"
+            "!code — get sign-in codes\n"
+            "!sub — check access time and the Codex allowance\n"
+            "!replace — request a replacement for a faulty account\n"
+            "!seller — contact the seller\n"
+            "!help — show this guide"
+        ),
+    },
+}
+
+
+DEFAULT_MESSAGE_TEMPLATES: dict[str, dict[str, str]] = {
+    "welcome": {
+        "ru": (
+            "Доступ выдан\n\n"
+            "Данные для входа\n"
+            "Логин: {login}\n"
+            "Пароль: {password}\n"
+            "Тариф аккаунта: ChatGPT {tier}\n"
+            "Срок доступа: {duration}\n"
+            "Окончание тарифа: {expires_at}\n"
+            "Точное время окончания покажет команда !подписка.\n\n"
+            "Лимит Codex\n"
+            "{codex_usage_summary}\n"
+            "Лимит общий для Codex, Work, Workspace Agents и ChatGPT for Excel. "
+            "Разговоры в Chat не учитываются.\n\n"
+            "Код для входа: !код\n"
+            "Все команды: !помощь"
+        ),
+        "en": (
+            "Access delivered\n\n"
+            "Sign-in details\n"
+            "Login: {login}\n"
+            "Password: {password}\n"
+            "Account plan: ChatGPT {tier}\n"
+            "Access period: {duration}\n"
+            "Plan expires: {expires_at}\n"
+            "Use !sub for the exact access end time.\n\n"
+            "Codex allowance\n"
+            "{codex_usage_summary}\n"
+            "This allowance is shared by Codex, Work, Workspace Agents, and "
+            "ChatGPT for Excel. Chat conversations are not counted.\n\n"
+            "Login code: !code\n"
+            "All commands: !help"
+        ),
+    },
+    "code_success": {
+        "ru": (
+            "Коды для входа\n"
+            "{code}\n"
+            "Код меняется каждые 30 секунд — используйте его сразу.\n"
+            "Доступ действует ещё {expires_in}."
+        ),
+        "en": (
+            "Sign-in codes\n"
+            "{code}\n"
+            "The code changes every 30 seconds — use it immediately.\n"
+            "Access remains active for {expires_in}."
+        ),
+    },
+    "code_expiring": {
+        "ru": (
+            "До окончания доступа не более минуты. Новый код входа уже не "
+            "выдаётся."
+        ),
+        "en": (
+            "One minute or less of access remains. A new sign-in code can "
+            "no longer be issued."
+        ),
+    },
+    "account_unavailable": {
+        "ru": (
+            "Аккаунт временно недоступен. Запросите замену: !замена. "
+            "Если нужна помощь продавца: !продавец."
+        ),
+        "en": (
+            "The account is temporarily unavailable. Request a replacement "
+            "with !replace, or contact the seller with !seller."
+        ),
+    },
+    "delivery_pending": {
+        "ru": (
+            "Выдача аккаунта ещё не завершена. Дождитесь сообщения с данными "
+            "и повторите команду."
+        ),
+        "en": (
+            "Account delivery is not complete yet. Wait for the credentials "
+            "message, then try the command again."
+        ),
+    },
+    "code_expired": {
+        "ru": (
+            "Действующий доступ по этому заказу не найден. Для продолжения "
+            "оформите новый заказ."
+        ),
+        "en": (
+            "No active access was found for this order. Place a new order to "
+            "continue."
+        ),
+    },
+    "rental_ambiguous": {
+        "ru": (
+            "В этом чате несколько активных заказов. Укажите нужный номер "
+            "после команды:\n"
+            "!код #HHHGNZ4N\n"
+            "!подписка #HHHGNZ4N\n"
+            "!замена #HHHGNZ4N\n\n"
+            "{active_orders}"
+        ),
+        "en": (
+            "This chat has several active orders. Add the required order "
+            "number after the command:\n"
+            "!code #HHHGNZ4N\n"
+            "!sub #HHHGNZ4N\n"
+            "!replace #HHHGNZ4N\n\n"
+            "{active_orders}"
+        ),
+    },
+    "code_rate_limited": {
+        "ru": "Новый код можно запросить через {retry_in_sec} сек.",
+        "en": "You can request a new code in {retry_in_sec} sec.",
+    },
+    "code_delivery_uncertain": {
+        "ru": (
+            "Доставка предыдущего кода не подтвердилась. Чтобы не отправить "
+            "тот же одноразовый код дважды, повтор заблокирован.\n"
+            "Подождите {retry_in_sec} сек. и отправьте {retry_command}. "
+            "Если код нужен срочно — !продавец."
+        ),
+        "en": (
+            "Delivery of the previous code was not confirmed. To avoid "
+            "sending the same one-time code twice, that retry was blocked.\n"
+            "Wait {retry_in_sec} sec., then send {retry_command}. If you need "
+            "help now, use !seller."
+        ),
+    },
+    "email_code_success": {
+        "ru": (
+            "Код из письма OpenAI: {email_code}\n"
+            "Используйте его, только если OpenAI запросил код из почты."
+        ),
+        "en": (
+            "OpenAI email code: {email_code}\n"
+            "Use it only when OpenAI asks for a code from your email."
+        ),
+    },
+    "email_code_duplicate": {
+        "ru": (
+            "Нового кода из письма пока нет. Запросите новый код на странице "
+            "OpenAI, затем повторите !код."
+        ),
+        "en": (
+            "There is no new email code yet. Request another code on the "
+            "OpenAI page, then use !code again."
+        ),
+    },
+    "email_code_not_found": {
+        "ru": (
+            "Письмо с новым кодом OpenAI пока не найдено. Подождите 30 секунд "
+            "и повторите !код. Если код не появится — !продавец."
+        ),
+        "en": (
+            "A new OpenAI code email has not arrived yet. Wait 30 seconds and "
+            "use !code again. If it still does not appear, use !seller."
+        ),
+    },
+    "email_code_unavailable": {
+        "ru": (
+            "Автоматически получить код из почты не удалось. Вызовите "
+            "продавца: !продавец."
+        ),
+        "en": (
+            "The email code could not be retrieved automatically. Contact the "
+            "seller with !seller."
+        ),
+    },
+    "subscription": {
+        "ru": (
+            "Статус доступа\n"
+            "Тариф аккаунта: ChatGPT {tier}\n"
+            "Окончание тарифа: {expires_at}\n"
+            "Доступ до: {access_expires_at}\n"
+            "Осталось: {expires_in}\n\n"
+            "Лимит Codex\n"
+            "{codex_usage_summary}\n"
+            "Лимит общий для Codex, Work, Workspace Agents и ChatGPT for Excel. "
+            "Разговоры в Chat не учитываются."
+        ),
+        "en": (
+            "Access status\n"
+            "Account plan: ChatGPT {tier}\n"
+            "Plan expires: {expires_at}\n"
+            "Access until: {access_expires_at}\n"
+            "Time remaining: {expires_in}\n\n"
+            "Codex allowance\n"
+            "{codex_usage_summary}\n"
+            "This allowance is shared by Codex, Work, Workspace Agents, and "
+            "ChatGPT for Excel. Chat conversations are not counted."
+        ),
+    },
+    "subscription_limits_unavailable": {
+        "ru": (
+            "Статус доступа\n"
+            "Тариф аккаунта: ChatGPT {tier}\n"
+            "Окончание тарифа: {expires_at}\n"
+            "Доступ до: {access_expires_at}\n"
+            "Осталось: {expires_in}\n\n"
+            "Актуальный лимит Codex получить не удалось, поэтому старые данные "
+            "не показаны. Повторите !подписка через несколько минут. Если "
+            "ошибка сохранится — !продавец."
+        ),
+        "en": (
+            "Access status\n"
+            "Account plan: ChatGPT {tier}\n"
+            "Plan expires: {expires_at}\n"
+            "Access until: {access_expires_at}\n"
+            "Time remaining: {expires_in}\n\n"
+            "The current Codex allowance could not be retrieved, so outdated "
+            "values are hidden. Try !sub again in a few minutes. If the error "
+            "continues, use !seller."
+        ),
+    },
+    "replace_success": {
+        "ru": (
+            "Аккаунт заменён\n\n"
+            "Новые данные для входа\n"
+            "Логин: {login}\n"
+            "Пароль: {password}\n"
+            "Тариф аккаунта: ChatGPT {tier}\n"
+            "Остаток доступа: {duration}\n"
+            "Окончание тарифа: {expires_at}\n"
+            "Доступ до: {access_expires_at}\n\n"
+            "Лимит Codex\n"
+            "{codex_usage_summary}\n"
+            "Лимит общий для Codex, Work, Workspace Agents и ChatGPT for Excel. "
+            "Разговоры в Chat не учитываются.\n\n"
+            "Новый код для входа: !код"
+        ),
+        "en": (
+            "Account replaced\n\n"
+            "New sign-in details\n"
+            "Login: {login}\n"
+            "Password: {password}\n"
+            "Account plan: ChatGPT {tier}\n"
+            "Access remaining: {duration}\n"
+            "Plan expires: {expires_at}\n"
+            "Access until: {access_expires_at}\n\n"
+            "Codex allowance\n"
+            "{codex_usage_summary}\n"
+            "This allowance is shared by Codex, Work, Workspace Agents, and "
+            "ChatGPT for Excel. Chat conversations are not counted.\n\n"
+            "New login code: !code"
+        ),
+    },
+    "replace_declined": {
+        "ru": (
+            "Проверка завершена: аккаунт доступен. Если проблема сохраняется, "
+            "вызовите продавца: !продавец."
+        ),
+        "en": (
+            "The check is complete: the account is available. If the problem "
+            "continues, contact the seller with !seller."
+        ),
+    },
+    "replace_expiring": {
+        "ru": (
+            "До окончания доступа не более 2 минут. Безопасная замена уже "
+            "недоступна. Для помощи: !продавец."
+        ),
+        "en": (
+            "Two minutes or less of access remain, so a safe replacement is "
+            "no longer available. For help, use !seller."
+        ),
+    },
+    "replace_no_account": {
+        "ru": (
+            "Подходящий аккаунт для замены сейчас недоступен. Повторите позже "
+            "или вызовите продавца: !продавец."
+        ),
+        "en": (
+            "No suitable replacement account is available right now. Try "
+            "again later or contact the seller with !seller."
+        ),
+    },
+    "seller_required": {
+        "ru": (
+            "Автоматически завершить замену не удалось. Вызовите продавца: "
+            "!продавец."
+        ),
+        "en": (
+            "The replacement could not be completed automatically. Contact "
+            "the seller with !seller."
+        ),
+    },
+    "seller_called": {
+        "ru": (
+            "Запрос зарегистрирован. Продавец сможет ответить в этом чате."
+        ),
+        "en": (
+            "Request registered. The seller can reply in this chat."
+        ),
+    },
+    "help": {
+        "ru": (
+            "Команды\n"
+            "!код — получить коды для входа\n"
+            "!подписка — проверить срок доступа и лимит Codex\n"
+            "!замена — запросить замену неисправного аккаунта\n"
+            "!продавец — вызвать продавца\n"
+            "!помощь — показать эту справку\n\n"
+            "Если в одном чате несколько заказов, укажите нужный номер:\n"
+            "!код #HHHGNZ4N · !подписка #HHHGNZ4N · "
+            "!замена #HHHGNZ4N"
+        ),
+        "en": (
+            "Commands\n"
+            "!code — get sign-in codes\n"
+            "!sub — check access time and the Codex allowance\n"
+            "!replace — request a replacement for a faulty account\n"
+            "!seller — contact the seller\n"
+            "!help — show this guide\n\n"
+            "If one chat has several orders, add the required number:\n"
+            "!code #HHHGNZ4N · !sub #HHHGNZ4N · "
+            "!replace #HHHGNZ4N"
+        ),
+    },
+    "order_confirmed": {
+        "ru": "Заказ подтверждён. Спасибо за покупку. Все команды: !помощь.",
+        "en": "Order confirmed. Thank you for your purchase. All commands: !help.",
+    },
+    "expiry": {
+        "ru": (
+            "Доступ завершён\n"
+            "Тариф: ChatGPT {tier}\n"
+            "Заказанный срок: {duration}\n\n"
+            "Чтобы продолжить, оформите новый заказ."
+        ),
+        "en": (
+            "Access ended\n"
+            "Plan: ChatGPT {tier}\n"
+            "Ordered period: {duration}\n\n"
+            "Place a new order to continue."
+        ),
+    },
+    "disconnect": {
+        "ru": (
+            "Текущий сеанс аккаунта завершён. Доступ действует ещё "
+            "{expires_in}. Для нового входа запросите код: !код."
+        ),
+        "en": (
+            "The current account session has ended. Access remains active for "
+            "{expires_in}. Request a new sign-in code with !code."
+        ),
+    },
+    "no_account_available": {
+        "ru": (
+            "Выдача задерживается: подходящего аккаунта пока нет. Заказ "
+            "остаётся активным. Бот продолжит автоматическую проверку. Если "
+            "аккаунт появится, данные придут в этот чат."
+        ),
+        "en": (
+            "Delivery is delayed because no suitable account is currently "
+            "available. Your order remains active and automatic checks will "
+            "continue. If an account becomes available, credentials will "
+            "arrive in this chat."
+        ),
+    },
+}
+
+
 async def seed_catalog(
     session: AsyncSession,
     *,
@@ -552,8 +947,7 @@ async def seed_message_templates(
     """Create missing templates and safely upgrade exact legacy defaults.
 
     Operator-edited content is preserved. A stored template is upgraded only
-    when it is byte-for-byte equal to the old bundled default that described
-    Codex limits as fixed 5-hour/weekly windows.
+    when it is byte-for-byte equal to any previously bundled default.
     """
     for key, translations in DEFAULT_MESSAGE_TEMPLATES.items():
         for lang, content in translations.items():
@@ -572,6 +966,8 @@ async def seed_message_templates(
                 for value in (
                     LEGACY_LIMIT_MESSAGE_TEMPLATES.get(key, {}).get(lang),
                     PRE_AGENTIC_MESSAGE_TEMPLATES.get(key, {}).get(lang),
+                    PRE_PREMIUM_MESSAGE_TEMPLATES.get(key, {}).get(lang),
+                    PRE_ORDER_QUALIFIED_MESSAGE_TEMPLATES.get(key, {}).get(lang),
                 )
                 if value is not None
             }
@@ -605,14 +1001,24 @@ async def seed_lot_templates(
             existing.name = default.name
             existing.system_managed = True
             existing.is_enabled = True
-            legacy = LEGACY_DAY_LOT_TEMPLATES.get(key)
-            if legacy is not None and all(
-                (
-                    existing.title_template_ru == legacy.title_ru,
-                    existing.title_template_en == legacy.title_en,
-                    existing.description_template_ru == legacy.description_ru,
-                    existing.description_template_en == legacy.description_en,
+            migration_sources = tuple(
+                source
+                for source in (
+                    LEGACY_DAY_LOT_TEMPLATES.get(key),
+                    PRE_PREMIUM_LOT_TEMPLATES.get(key),
                 )
+                if source is not None
+            )
+            if any(
+                all(
+                    (
+                        existing.title_template_ru == source.title_ru,
+                        existing.title_template_en == source.title_en,
+                        existing.description_template_ru == source.description_ru,
+                        existing.description_template_en == source.description_en,
+                    )
+                )
+                for source in migration_sources
             ):
                 existing.title_template_ru = default.title_ru
                 existing.title_template_en = default.title_en

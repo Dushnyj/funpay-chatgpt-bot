@@ -79,7 +79,7 @@ LEGACY_DAY_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
     )
 }
 
-DEFAULT_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
+PRE_PREMIUM_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
     "default": DefaultLotTemplate(
         key="default",
         name="Основной шаблон лота",
@@ -100,6 +100,36 @@ DEFAULT_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
             "7 days on paid plans). Before delivery, the "
             "bot checks the actual OpenAI allowance.\n"
             "Credentials arrive in FunPay chat. Login code: !code, help: !help."
+        ),
+    )
+}
+
+
+DEFAULT_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
+    "default": DefaultLotTemplate(
+        key="default",
+        name="Основной шаблон лота",
+        title_ru="ChatGPT {plan} · {duration} · {condition}",
+        title_en="ChatGPT {plan} · {duration} · {condition}",
+        description_ru=(
+            "Доступ к аккаунту ChatGPT {plan} на {duration}.\n"
+            "Условие выдачи: {condition}.\n\n"
+            "Лимит Codex\n"
+            "Длительное окно: {long_window_days} дн. — 30 дней только на "
+            "Free, 7 дней на платных тарифах. Перед выдачей бот сверяет "
+            "последнюю успешную проверку остатка лимита Codex.\n\n"
+            "Данные для входа придут в чат FunPay. Код для входа: !код. "
+            "Помощь: !помощь."
+        ),
+        description_en=(
+            "Access to a ChatGPT {plan} account for {duration}.\n"
+            "Delivery terms: {condition}.\n\n"
+            "Codex allowance\n"
+            "Long window: {long_window_days} days — 30 days for Free and "
+            "7 days for paid plans. Before delivery, the bot checks the latest "
+            "successful Codex allowance reading.\n\n"
+            "Sign-in details will arrive in FunPay chat. Sign-in code: !code. "
+            "Help: !help."
         ),
     )
 }

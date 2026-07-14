@@ -9,13 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.check_job_queue import CheckJobQueue
 from app.integrations.funpay.gateway import ChatGateway
-from app.integrations.funpay.types import OrderInfo
+from app.integrations.funpay.types import OrderInfo, SaleStatus
 from app.models.account import Account
 from app.models.audit import AuditLog
 from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.services.kick_service import KickResult, KickService
 from app.services.lot_sync import extract_provenance_token
+from app.services.order_provenance import is_verified_bot_sale_order
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,10 @@ class _LotBinding:
 
 class LotNotFoundError(Exception):
     """The sale has no exact offer-id or provenance-token lot binding."""
+
+
+class UnverifiedOrderProvenanceError(RuntimeError):
+    """A refund attempted to revoke an account for an unverified sale."""
 
 
 class OrderProcessor:
@@ -93,7 +98,15 @@ class OrderProcessor:
             max_5h_pct=lot.max_5h_pct,
             max_weekly_pct=lot.max_weekly_pct,
             price=lot.price,
-            status="pending",
+            status=(
+                "refunded"
+                if info.status is SaleStatus.REFUNDED
+                else (
+                    "completed"
+                    if info.status is SaleStatus.COMPLETED
+                    else "pending"
+                )
+            ),
         )
         session.add(order)
         await session.flush()
@@ -104,15 +117,28 @@ class OrderProcessor:
         session: AsyncSession,
         order_id: str,
     ) -> Order:
+        order, _transitioned = await self.process_sale_closed_transition(
+            session, order_id,
+        )
+        return order
+
+    async def process_sale_closed_transition(
+        self,
+        session: AsyncSession,
+        order_id: str,
+    ) -> tuple[Order, bool]:
+        """Apply a close monotonically and report the locked state transition."""
+
         order = await self._get_order_or_raise(session, order_id, for_update=True)
         # Refund and revoke states are terminal/monotonic. FunPay callbacks may
         # be duplicated or reordered, so a delayed close must never resurrect
         # a refunded order or cancel a pending credential revocation.
         if order.status in {"refunded", "refund_pending"}:
-            return order
+            return order, False
+        transitioned = order.status != "completed"
         order.status = "completed"
         await session.flush()
-        return order
+        return order, transitioned
 
     async def process_sale_refunded(
         self,
@@ -158,6 +184,16 @@ class OrderProcessor:
         if order.status == "refunded":
             await session.commit()
             return order, None
+        # Refund handling performs an account-wide logout.  Legacy/corrupt
+        # rows must not be able to reach that side effect merely by having a
+        # matching local order id or ``refund_pending`` status.  Re-check both
+        # the immutable bot-lot binding and the exact sale/buyer/chat tuple
+        # while the Order row is locked.
+        if not await is_verified_bot_sale_order(session, order):
+            await session.commit()
+            raise UnverifiedOrderProvenanceError(
+                f"Order {order_id} has no exact verified bot-sale provenance"
+            )
 
         rental = (
             await session.execute(

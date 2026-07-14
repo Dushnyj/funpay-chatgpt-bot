@@ -243,7 +243,7 @@ export default function Accounts() {
                     </td>
                     <td data-label="План"><span className={`soft-badge account-plan ${account.tier_id === null ? 'soft-badge--muted' : ''}`}>{tierName(account.tier_id)}</span></td>
                     <td data-label="Лимит Codex"><CompactLimits account={account} /></td>
-                    <td data-label="Подписка"><span className="account-subscription">{isFreePlan(account, tiers) ? 'Без срока' : formatDateTime(account.subscription_expires_at)}</span></td>
+                    <td data-label="Подписка"><span className="account-subscription">{subscriptionLabel(account, tiers)}</span></td>
                     <td data-label="Аренды"><span className="rental-capacity" title={activeRentals == null ? 'Фактическое число аренд ещё не загружено; безопасный максимум — 1' : `Фактически продано: ${activeRentals}; безопасный максимум: 1`}>{rentalCapacityLabel(activeRentals)}</span></td>
                     <td data-label="Проверка"><ValidationStatus account={account} /></td>
                     <td data-label="Действия">
@@ -275,7 +275,7 @@ export default function Accounts() {
                             <Icon name="eye" size={15} />
                           </button>
                         </span>
-                        <button type="button" className="icon-button account-icon-action" onClick={() => setEditTarget(account)} aria-label={`Изменить параметры ${account.login}`} title="Изменить срок подписки, ёмкость и статус">
+                        <button type="button" className="icon-button account-icon-action" onClick={() => setEditTarget(account)} aria-label={`Изменить параметры ${account.login}`} title="Изменить ёмкость, статус и заметку">
                           <Icon name="settings" size={15} />
                         </button>
                         <span className="action-help" title={accountOccupied ? 'Сначала завершите аренду или замену' : undefined} tabIndex={accountOccupied ? 0 : undefined} aria-label={accountOccupied ? `Удаление ${account.login} недоступно: аккаунт занят арендой или заменой` : undefined}>
@@ -586,7 +586,6 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
   const [error, setError] = useState('')
   const accountOccupied = (account.active_rentals_count ?? 0) > 0 || account.replacement_reserved
   const [form, setForm] = useState({
-    expiresAt: toDateTimeLocal(account.subscription_expires_at),
     maxRentals: account.max_active_rentals == null ? '' : '1',
     operatorStatus: (account.operator_status_override ?? '') as '' | 'maintenance' | 'disabled',
     notes: account.notes ?? '',
@@ -600,18 +599,11 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
       setError('Безопасный лимит — только 1 активная аренда на аккаунт или системное значение.')
       return
     }
-    const expiresAt = form.expiresAt ? new Date(form.expiresAt) : null
-    if (expiresAt && Number.isNaN(expiresAt.getTime())) {
-      setError('Укажите корректные дату и время окончания подписки.')
-      return
-    }
-
     try {
       const safeStatus = accountOccupied ? '' : form.operatorStatus
       await updateAccount.mutateAsync({
         id: account.id,
         ...(!accountOccupied ? {
-          subscription_expires_at: expiresAt?.toISOString() ?? null,
           max_active_rentals: maxRentals,
           ...(safeStatus ? { status: safeStatus } : {}),
         } : {}),
@@ -629,14 +621,13 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
         <div className="modal__header"><div><span className="eyebrow">Операторские параметры</span><h2 id="edit-account-title">Настроить {account.login}</h2><p>Тариф здесь не меняется: Free, Go, Plus и Pro определяются только автоматической проверкой OpenAI.</p></div><button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button></div>
         <form className="form-stack" onSubmit={submit}>
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
-          <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для платного тарифа дата окончания служит проверенным fallback, если OpenAI не вернул её сам. Для Free оставьте поле пустым.</span></div>
-          {accountOccupied && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Аккаунт занят арендой или зарезервирован для замены. До освобождения можно сохранить только заметку; дата подписки, ёмкость и приостановка защищены.</span></div>}
-          <label className="field"><span className="field__label">Подписка активна до</span><input data-autofocus type="datetime-local" value={form.expiresAt} onChange={(event) => setForm((current) => ({ ...current, expiresAt: event.target.value }))} /><span className="field__hint">Пустое значение означает, что ручной fallback не задан.</span></label>
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>Тариф и срок подписки определяются только автоматической проверкой OpenAI. Ручное изменение отключено, чтобы аккаунт с неподтверждённой подпиской не попал в выдачу.</span></div>
+          {accountOccupied && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Аккаунт занят арендой или зарезервирован для замены. До освобождения можно сохранить только заметку; ёмкость и приостановка защищены.</span></div>}
           <div className="form-grid">
             <label className="field"><span className="field__label">Лимит активных аренд</span><select value={form.maxRentals} disabled={accountOccupied} onChange={(event) => setForm((current) => ({ ...current, maxRentals: event.target.value }))}><option value="">Системный лимит — 1</option><option value="1">Явный лимит — 1</option></select><span className="field__hint">Аккаунт нельзя одновременно выдать нескольким покупателям: завершение аренды закрывает его общую сессию.</span></label>
             <label className="field"><span className="field__label">Ручная приостановка</span><select value={form.operatorStatus} disabled={accountOccupied} onChange={(event) => setForm((current) => ({ ...current, operatorStatus: event.target.value as '' | 'maintenance' | 'disabled' }))}><option value="">Не менять текущий статус</option><option value="maintenance">Перевести на обслуживание</option><option value="disabled">Отключить аккаунт</option></select><span className="field__hint">{accountOccupied ? 'Недоступно, пока аккаунт занят арендой или заменой.' : `Сейчас: ${accountStatusLabel(account.status)}. Возврат в работу выполняется только повторной проверкой аккаунта.`}</span></label>
           </div>
-          <label className="field"><span className="field__label">Заметка оператора</span><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} maxLength={4000} placeholder="Причина ручной даты, обслуживание или другой контекст" /></label>
+          <label className="field"><span className="field__label">Заметка оператора</span><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} maxLength={4000} placeholder="Обслуживание или другой важный контекст" /></label>
           <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={updateAccount.isPending}>{updateAccount.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <><Icon name="check" />Сохранить</>}</button></div>
         </form>
       </div>
@@ -979,6 +970,14 @@ function isFreePlan(account: Account, tiers: Array<{ id: number; code?: string }
   return candidates.some((value) => value != null && normalizePlanCode(value) === 'free')
 }
 
+function subscriptionLabel(account: Account, tiers: Array<{ id: number; code?: string }>) {
+  if (isFreePlan(account, tiers)) return 'Без срока'
+  if (!['accounts_check', 'id_token'].includes(account.subscription_expiry_source ?? '')) {
+    return 'Не подтверждена'
+  }
+  return formatDateTime(account.subscription_expires_at)
+}
+
 function normalizePlanCode(value: string) {
   return value
     .trim()
@@ -995,14 +994,6 @@ function isOutlookAddress(value: string | null | undefined) {
 
 function isOutlookAccount(account: Account) {
   return isOutlookAddress(account.email)
-}
-
-function toDateTimeLocal(value: string | null) {
-  if (!value) return ''
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return ''
-  const pad = (part: number) => String(part).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
 function formatDeviceAuthExpiry(value: string) {

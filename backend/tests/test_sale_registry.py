@@ -14,11 +14,17 @@ from app.integrations.funpay.types import (
     SaleStatus,
 )
 from app.models.chat import ChatConversation, ChatMessage
-from app.models.funpay_sale import FunPaySale, FunPaySaleSyncState
+from app.models.audit import AuditLog
+from app.models.funpay_sale import (
+    FunPaySale,
+    FunPaySaleCandidate,
+    FunPaySaleSyncState,
+)
 from app.models.lot import Lot
 from app.models.rental import Order, Rental
 from app.services.chat_service import ChatService, UnverifiedConversationError
 from app.services.sale_registry import SaleRegistryService
+from app.services.order_notifications import BUYER_ORDER_CONFIRMED_DUE_EVENT
 
 
 _MANAGED_OFFER_ID = "9001"
@@ -120,13 +126,27 @@ async def _add_managed_sale(
 async def test_global_previews_do_not_import_or_authorize_unmanaged_sales(
     session: AsyncSession,
 ):
-    class RateLimitedGateway(FakeChatGateway):
+    class UnmanagedGateway(FakeChatGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.detail_calls: list[str] = []
+
         async def get_order(self, order_id: str) -> OrderInfo:
-            raise AssertionError(
-                f"unmanaged preview must not fetch order detail: {order_id}"
+            self.detail_calls.append(order_id)
+            preview = next(
+                item for item in self._sales if item.order_id == order_id
+            )
+            return OrderInfo(
+                order_id=order_id,
+                status=preview.status,
+                chat_id=700 + preview.buyer_id,
+                buyer_id=preview.buyer_id,
+                subcategory_id=999,
+                title="Manual seller offer",
+                price=100,
             )
 
-    gateway = RateLimitedGateway()
+    gateway = UnmanagedGateway()
     gateway.set_sales([
         _preview("sale-1", 101),
         _preview("sale-2", 102, minutes_ago=1),
@@ -141,10 +161,329 @@ async def test_global_previews_do_not_import_or_authorize_unmanaged_sales(
 
     sales = list((await session.execute(select(FunPaySale))).scalars())
     assert sales == []
+    assert len(gateway.detail_calls) == 1
     assert result.imported == 0
     assert result.enriched == 0
     assert result.enrichment_errors == 0
     assert list((await session.execute(select(ChatConversation))).scalars()) == []
+    candidates = list((await session.execute(
+        select(FunPaySaleCandidate).order_by(FunPaySaleCandidate.id)
+    )).scalars())
+    assert len(candidates) == 3
+    assert sum(item.recovery_state == "ignored" for item in candidates) == 1
+    assert sum(item.recovery_state == "pending" for item in candidates) == 2
+
+
+async def test_recovery_candidate_specific_errors_become_terminal(
+    session: AsyncSession,
+):
+    class MalformedDetailGateway(FakeChatGateway):
+        async def get_order(self, order_id: str) -> OrderInfo:
+            raise ValueError(f"malformed detail for {order_id}")
+
+    preview = _preview("terminal-candidate", 111)
+    candidate = FunPaySaleCandidate(
+        funpay_order_id=preview.order_id,
+        buyer_funpay_id=str(preview.buyer_id),
+        status=SaleStatus.PAID.value,
+        observed_created_at=preview.created_at,
+        recovery_state="pending",
+        attempts=11,
+        observed_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    session.add(candidate)
+    await session.flush()
+    gateway = MalformedDetailGateway()
+    gateway.set_sales([preview])
+
+    result = await SaleRegistryService().sync_recent_sales(
+        session,
+        gateway,
+        detail_limit=2,
+    )
+
+    await session.refresh(candidate)
+    assert result.enrichment_errors == 1
+    assert candidate.recovery_state == "failed"
+    assert candidate.attempts == 12
+    assert candidate.next_attempt_at is None
+    assert candidate.last_error == "retry_exhausted:ValueError"
+
+
+async def test_recovery_candidates_age_out_and_old_previews_stay_out(
+    session: AsyncSession,
+):
+    stale_at = datetime.now(timezone.utc) - timedelta(days=91)
+    session.add(FunPaySaleCandidate(
+        funpay_order_id="stale-pending",
+        buyer_funpay_id="112",
+        status=SaleStatus.PAID.value,
+        recovery_state="pending",
+        attempts=3,
+        observed_at=stale_at,
+        updated_at=stale_at,
+    ))
+    await session.flush()
+    old_preview = _preview("ancient-history", 113)
+    old_preview = SalePreviewInfo(
+        order_id=old_preview.order_id,
+        status=old_preview.status,
+        buyer_id=old_preview.buyer_id,
+        buyer_username=old_preview.buyer_username,
+        buyer_avatar_url=old_preview.buyer_avatar_url,
+        buyer_is_online=old_preview.buyer_is_online,
+        buyer_status_text=old_preview.buyer_status_text,
+        created_at=stale_at,
+    )
+    gateway = FakeChatGateway()
+    gateway.set_sales([old_preview])
+
+    await SaleRegistryService().sync_recent_sales(
+        session,
+        gateway,
+        detail_limit=0,
+    )
+
+    candidates = list((await session.execute(
+        select(FunPaySaleCandidate)
+    )).scalars())
+    assert candidates == []
+
+
+async def test_active_global_backoff_skips_all_recovery_candidates(
+    session: AsyncSession,
+):
+    class OfflineGateway(FakeChatGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.detail_calls: list[str] = []
+
+        async def get_order(self, order_id: str) -> OrderInfo:
+            self.detail_calls.append(order_id)
+            raise ConnectionError("FunPay unavailable")
+
+    gateway = OfflineGateway()
+    gateway.set_sales([
+        _preview("offline-a", 114),
+        _preview("offline-b", 115, minutes_ago=1),
+    ])
+    service = SaleRegistryService()
+
+    first = await service.sync_recent_sales(session, gateway, detail_limit=3)
+    state = await session.get(FunPaySaleSyncState, 1)
+    assert state is not None
+    assert first.enrichment_errors == 1
+    assert len(gateway.detail_calls) == 1
+    assert state.page_backoff_until is not None
+    candidates = list((await session.execute(
+        select(FunPaySaleCandidate)
+    )).scalars())
+    assert candidates
+    assert all(candidate.attempts == 0 for candidate in candidates)
+
+    second = await service.sync_recent_sales(session, gateway, detail_limit=3)
+
+    assert second.enrichment_errors == 0
+    assert len(gateway.detail_calls) == 1
+
+
+async def test_successful_recovery_resets_global_backoff_and_marks_due(
+    session: AsyncSession,
+):
+    await _ensure_managed_lot(session)
+    state = FunPaySaleSyncState(
+        id=1,
+        page_backoff_attempts=9,
+        page_backoff_until=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+    session.add(state)
+    preview = _preview("recovered-completed", 116)
+    gateway = FakeChatGateway()
+    gateway.set_sales([SalePreviewInfo(
+        order_id=preview.order_id,
+        status=SaleStatus.COMPLETED,
+        buyer_id=preview.buyer_id,
+        buyer_username=preview.buyer_username,
+        buyer_avatar_url=preview.buyer_avatar_url,
+        buyer_is_online=preview.buyer_is_online,
+        buyer_status_text=preview.buyer_status_text,
+        created_at=preview.created_at,
+    )])
+    gateway.set_order(OrderInfo(
+        order_id=preview.order_id,
+        status=SaleStatus.COMPLETED,
+        chat_id=336,
+        buyer_id=116,
+        subcategory_id=55,
+        title="T",
+        price=100,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    result = await SaleRegistryService().sync_recent_sales(
+        session,
+        gateway,
+        detail_limit=2,
+    )
+
+    order = await session.scalar(select(Order).where(
+        Order.funpay_order_id == preview.order_id,
+    ))
+    assert result.imported == 1
+    assert order is not None and order.status == "completed"
+    assert state.page_backoff_attempts == 0
+    assert state.page_backoff_until is None
+    assert await session.scalar(select(AuditLog.id).where(
+        AuditLog.event_type == BUYER_ORDER_CONFIRMED_DUE_EVENT,
+        AuditLog.order_id == order.id,
+    )) is not None
+
+
+async def test_periodic_sync_recovers_missed_exact_managed_sale(
+    session: AsyncSession,
+):
+    await _ensure_managed_lot(session)
+    gateway = FakeChatGateway()
+    gateway.set_sales([_preview("missed-managed", 222)])
+    gateway.set_order(OrderInfo(
+        order_id="missed-managed",
+        status=SaleStatus.PAID,
+        chat_id=333,
+        buyer_id=222,
+        subcategory_id=55,
+        title="T",
+        price=100,
+        offer_id=int(_MANAGED_OFFER_ID),
+        buyer_username="buyer-222",
+    ))
+    service = SaleRegistryService()
+
+    first = await service.sync_recent_sales(
+        session,
+        gateway,
+        detail_limit=2,
+    )
+    await session.commit()
+    second = await service.sync_recent_sales(
+        session,
+        gateway,
+        detail_limit=2,
+    )
+
+    orders = list((await session.execute(
+        select(Order).where(Order.funpay_order_id == "missed-managed")
+    )).scalars())
+    sales = list((await session.execute(
+        select(FunPaySale).where(
+            FunPaySale.funpay_order_id == "missed-managed"
+        )
+    )).scalars())
+    conversation = await session.scalar(
+        select(ChatConversation).where(
+            ChatConversation.funpay_chat_id == "333"
+        )
+    )
+    assert first.imported == 1
+    assert second.imported == 0
+    assert len(orders) == 1
+    assert orders[0].lot_binding_method == "offer_id"
+    assert orders[0].funpay_offer_id == _MANAGED_OFFER_ID
+    assert len(sales) == 1
+    assert sales[0].order_id == orders[0].id
+    assert conversation is not None
+    assert conversation.verified_sale is True
+    assert await session.scalar(
+        select(FunPaySaleCandidate).where(
+            FunPaySaleCandidate.funpay_order_id == "missed-managed"
+        )
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("remote_status", "expected_status"),
+    [
+        (SaleStatus.COMPLETED, "completed"),
+        (SaleStatus.REFUNDED, "refund_pending"),
+    ],
+)
+async def test_recovery_reconciles_terminal_status_for_existing_order_race(
+    session: AsyncSession,
+    remote_status: SaleStatus,
+    expected_status: str,
+):
+    # Model an event callback that created the Order just before the periodic
+    # recovery worker won the sale-registry insert. The exact detail page must
+    # still advance that existing Order to its authoritative terminal state.
+    order = await _add_managed_order(
+        session,
+        order_id=f"recovery-race-{remote_status.value}",
+        buyer_id=223,
+        chat_id="334",
+    )
+    gateway = FakeChatGateway()
+    preview = _preview(f"recovery-race-{remote_status.value}", 223)
+    gateway.set_sales([SalePreviewInfo(
+        order_id=preview.order_id,
+        status=remote_status,
+        buyer_id=preview.buyer_id,
+        buyer_username=preview.buyer_username,
+        buyer_avatar_url=preview.buyer_avatar_url,
+        buyer_is_online=preview.buyer_is_online,
+        buyer_status_text=preview.buyer_status_text,
+        created_at=preview.created_at,
+    )])
+    gateway.set_order(OrderInfo(
+        order_id=f"recovery-race-{remote_status.value}",
+        status=remote_status,
+        chat_id=334,
+        buyer_id=223,
+        subcategory_id=55,
+        title="T",
+        price=100,
+        offer_id=int(_MANAGED_OFFER_ID),
+    ))
+
+    result = await SaleRegistryService().sync_recent_sales(
+        session,
+        gateway,
+        detail_limit=2,
+    )
+
+    await session.refresh(order)
+    sale = await session.scalar(select(FunPaySale).where(
+        FunPaySale.funpay_order_id == order.funpay_order_id,
+    ))
+    assert result.imported == 1
+    assert order.status == expected_status
+    assert sale is not None
+    assert sale.status == remote_status.value
+
+
+@pytest.mark.parametrize(
+    "delayed_status",
+    [SaleStatus.COMPLETED, SaleStatus.PAID, SaleStatus.UNKNOWN],
+)
+async def test_refunded_sale_status_is_monotonic(
+    session: AsyncSession,
+    delayed_status: SaleStatus,
+):
+    sale = await _add_managed_sale(
+        session,
+        order_id="terminal-refund",
+        buyer_id=41,
+        chat_id="51",
+        status=SaleStatus.REFUNDED.value,
+    )
+
+    updated = await SaleRegistryService().update_status(
+        session,
+        sale.funpay_order_id,
+        delayed_status,
+    )
+
+    assert updated is sale
+    assert sale.status == SaleStatus.REFUNDED.value
 
 
 async def test_exact_order_sync_imports_only_existing_managed_order(

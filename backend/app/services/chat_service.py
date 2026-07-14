@@ -51,14 +51,24 @@ class ChatConversationSummary:
 
 
 _LOGIN_CODE_RE = re.compile(
-    r"(?i)(\b(?:TOTP(?:\s*\([^)]*\))?|Email OTP OpenAI|OpenAI email OTP)"
+    r"(?i)(\b(?:TOTP(?:\s*\([^)]*\))?|Email OTP OpenAI|OpenAI email OTP|"
+    r"Код подтверждения|Authenticator code|Код из письма OpenAI|"
+    r"OpenAI email code)"
     r"\s*:\s*)\d{6}\b"
 )
+_SIX_DIGIT_CODE_RE = re.compile(r"\b\d{6}\b")
 
 
 def _redact_login_codes(text: str) -> str:
     """Prevent buyer TOTP/email OTP values from entering local chat history."""
-    return _LOGIN_CODE_RE.sub(r"\1[скрыто]", text)
+    redacted = _LOGIN_CODE_RE.sub(r"\1[скрыто]", text)
+    if redacted == text:
+        return text
+    # ``email_code_success`` is operator-editable, so its surrounding label is
+    # not trustworthy. A !code response always contains the required labelled
+    # TOTP value; once that marker is detected, redact every other six-digit
+    # token in the same response as a potential email OTP as well.
+    return _SIX_DIGIT_CODE_RE.sub("[скрыто]", redacted)
 
 
 class ChatService:

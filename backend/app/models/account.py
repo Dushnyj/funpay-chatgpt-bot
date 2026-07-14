@@ -15,12 +15,23 @@ from app.db.base import Base
 from app.types.encrypted import FernetEncrypted
 
 
+# Only OpenAI-owned responses may attest a paid subscription deadline. Keep
+# this allow-list next to the persisted fields so every allocator uses the
+# same trust contract.
+TRUSTED_SUBSCRIPTION_EXPIRY_SOURCES = ("accounts_check", "id_token")
+
+
 class Account(Base):
     __tablename__ = "accounts"
     __table_args__ = (
         CheckConstraint(
             "max_active_rentals IS NULL OR max_active_rentals = 1",
             name="single_active_rental",
+        ),
+        CheckConstraint(
+            "subscription_expiry_source IS NULL OR "
+            "subscription_expiry_source IN ('accounts_check', 'id_token')",
+            name="subscription_expiry_source_trusted",
         ),
     )
 
@@ -41,6 +52,9 @@ class Account(Base):
         DateTime(timezone=True), default=None
     )
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    subscription_expiry_source: Mapped[str | None] = mapped_column(
+        String(32), default=None
+    )
     max_active_rentals: Mapped[int | None] = mapped_column(Integer, default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending_validation")
     # Durable operator intent is separate from validation status. Browser jobs
@@ -60,6 +74,13 @@ class Account(Base):
 
 class AccountLimits(Base):
     __tablename__ = "account_limits"
+    __table_args__ = (
+        CheckConstraint(
+            "subscription_expiry_source IS NULL OR "
+            "subscription_expiry_source IN ('accounts_check', 'id_token')",
+            name="subscription_expiry_source_trusted",
+        ),
+    )
 
     # Один к одному с Account: PK он же FK, что гарантирует уникальность
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), primary_key=True)
@@ -92,6 +113,9 @@ class AccountLimits(Base):
         DateTime(timezone=True), default=None
     )
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    subscription_expiry_source: Mapped[str | None] = mapped_column(
+        String(32), default=None
+    )
     measured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     refresh_status: Mapped[str] = mapped_column(String(16), default="ok")
     refresh_failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

@@ -245,8 +245,13 @@ async def test_login_codes_are_never_persisted_in_local_chat_history(
     service = ChatService()
     conversation = await service.get_conversation(session, conversation_id)
     plaintext = (
-        "TOTP (приложение): 123456\n"
-        "Email OTP OpenAI: 654321"
+        "Код подтверждения: 123456\n"
+        "Код из письма OpenAI: 654321\n"
+        "Authenticator code: 111111\n"
+        "OpenAI email code: 222222\n"
+        "TOTP (приложение): 333333\n"
+        "Email OTP OpenAI: 444444\n"
+        "Почтовый код из панели: 555555"
     )
     pending = await service.create_outgoing_pending(
         session, conversation, plaintext,
@@ -271,9 +276,28 @@ async def test_login_codes_are_never_persisted_in_local_chat_history(
     assert echoed.id == pending.id
     assert "123456" not in pending.text
     assert "654321" not in pending.text
-    assert pending.text.count("[скрыто]") == 2
+    assert "111111" not in pending.text
+    assert "222222" not in pending.text
+    assert "333333" not in pending.text
+    assert "444444" not in pending.text
+    assert "555555" not in pending.text
+    assert pending.text.count("[скрыто]") == 7
     assert all("123456" not in item.text for item in history)
     assert all("654321" not in item.text for item in history)
+
+
+async def test_unrelated_six_digit_number_is_not_redacted(session: AsyncSession):
+    conversation_id = await _seed_conversation(session)
+    service = ChatService()
+    conversation = await service.get_conversation(session, conversation_id)
+
+    pending = await service.create_outgoing_pending(
+        session,
+        conversation,
+        "Номер обращения: 123456",
+    )
+
+    assert pending.text == "Номер обращения: 123456"
 
 
 async def test_chat_text_is_encrypted_at_rest_but_available_to_admin(

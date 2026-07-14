@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     BrowserContext,
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 _OUTLOOK_URL = "https://outlook.live.com/mail/0/"
 _OUTLOOK_LOGIN_URL = "https://outlook.live.com/mail/?prompt=select_account"
 _OUTLOOK_DOMAINS = frozenset({"outlook.com", "hotmail.com", "live.com", "msn.com"})
+_MICROSOFT_LOGIN_HOSTS = frozenset({
+    "login.live.com",
+    "login.microsoftonline.com",
+})
 _OPENAI_SENDER_MARKERS = (
     "noreply@tm.openai.com",
     "noreply@openai.com",
@@ -74,6 +79,13 @@ class _MessageSnapshot:
 def is_outlook_address(email: str) -> bool:
     domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
     return domain in _OUTLOOK_DOMAINS
+
+
+def _is_trusted_microsoft_login_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in (
+        _MICROSOFT_LOGIN_HOSTS
+    )
 
 
 def _normalise_text(text: str) -> str:
@@ -356,6 +368,11 @@ class OutlookWebProvider:
             await self._switch_to_password_if_offered(page)
             await self._raise_for_login_failure_or_challenge(page)
             await password_input.wait_for(timeout=5_000)
+        if not _is_trusted_microsoft_login_url(page.url):
+            raise EmailProviderError(
+                EmailErrorCode.CONNECTION_FAILED,
+                "Outlook перенаправил ввод пароля на недоверенный адрес.",
+            )
         await password_input.fill(self._password)
         await self._click_submit(page)
 
@@ -400,6 +417,9 @@ class OutlookWebProvider:
 
     async def _switch_to_password_if_offered(self, page: Page) -> None:
         deadline = time.monotonic() + 10.0
+        password_input = page.locator(
+            "input[name='passwd'], input[type='password']"
+        ).first
         selectors = (
             "#idA_PWD_SwitchToPassword",
             "a[data-bind*='switchToPassword']",
@@ -407,17 +427,30 @@ class OutlookWebProvider:
             "button:has-text('Используйте свой пароль')",
             "a:has-text('Use your password')",
             "a:has-text('Используйте свой пароль')",
+            "[role='button']:has-text('Use your password')",
+            "[role='button']:has-text('Используйте свой пароль')",
         )
         while time.monotonic() < deadline:
-            if await page.locator("input[name='passwd'], input[type='password']").first.is_visible():
+            if await password_input.is_visible():
                 return
             for selector in selectors:
                 switch = page.locator(selector).first
                 if await switch.is_visible():
                     await switch.click()
+                    # The Fluent UI control is a span with role=button and
+                    # updates the same document asynchronously. Do not inspect
+                    # the old challenge copy before the password form appears.
+                    try:
+                        await password_input.wait_for(
+                            state="visible",
+                            timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+                        )
+                    except PlaywrightTimeoutError:
+                        await self._raise_for_login_failure_or_challenge(page)
+                        return
                     return
-            await self._raise_for_login_failure_or_challenge(page)
             await asyncio.sleep(0.25)
+        await self._raise_for_login_failure_or_challenge(page)
 
     async def _click_submit(self, page: Page) -> None:
         submit = page.locator(
@@ -427,9 +460,14 @@ class OutlookWebProvider:
 
     async def _handle_stay_signed_in(self, page: Page) -> None:
         deadline = time.monotonic() + 12.0
+        password_proof_used = False
         while time.monotonic() < deadline:
             if await self._mailbox_is_ready(page):
                 return
+            if not password_proof_used and await self._submit_password_proof_if_offered(page):
+                password_proof_used = True
+                await asyncio.sleep(0.5)
+                continue
             text = await self._safe_body_text(page)
             if any(
                 marker in text
@@ -448,6 +486,41 @@ class OutlookWebProvider:
                 return
             await self._raise_for_login_failure_or_challenge(page)
             await asyncio.sleep(0.25)
+
+    async def _submit_password_proof_if_offered(self, page: Page) -> bool:
+        """Complete Microsoft's one-time post-login password proof.
+
+        Consumer accounts can ask to confirm a recovery address while still
+        offering the already configured account password as an alternative.
+        Fluent UI renders that action as a ``span[role=button]``. The proof is
+        attempted once and only on Microsoft's exact HTTPS login hosts.
+        """
+
+        selector = (
+            "[role='button']:has-text('Use your password'), "
+            "[role='button']:has-text('Используйте свой пароль')"
+        )
+        switch = page.locator(selector).first
+        if not await switch.is_visible():
+            return False
+        if not _is_trusted_microsoft_login_url(page.url):
+            raise EmailProviderError(
+                EmailErrorCode.CONNECTION_FAILED,
+                "Outlook перенаправил ввод пароля на недоверенный адрес.",
+            )
+        await switch.click(force=True)
+        password_input = page.locator(
+            "input[name='passwd'], input[type='password']"
+        ).first
+        await password_input.wait_for(state="visible", timeout=10_000)
+        if not _is_trusted_microsoft_login_url(page.url):
+            raise EmailProviderError(
+                EmailErrorCode.CONNECTION_FAILED,
+                "Outlook перенаправил ввод пароля на недоверенный адрес.",
+            )
+        await password_input.fill(self._password)
+        await self._click_submit(page)
+        return True
 
     async def _wait_for_mailbox(self, page: Page) -> None:
         deadline = time.monotonic() + self._navigation_timeout_ms / 1000
@@ -511,23 +584,25 @@ class OutlookWebProvider:
                 "Outlook отклонил адрес почты или пароль.",
             )
 
-        challenge_markers = (
+        blocking_challenge_markers = (
             "prove you're human",
             "help us beat the robots",
             "unusual activity",
-            "verify your identity",
-            "help us protect your account",
             "подтвердите, что вы человек",
-            "подтвердите свою личность",
             "необычная активность",
-            "помогите нам защитить вашу учетную запись",
             "слишком много попыток",
-            "send a code",
-            "отправить код",
             "just a moment",
             "verify you are human",
             "checking your browser",
             "проверка безопасности",
+        )
+        verification_markers = (
+            "verify your identity",
+            "help us protect your account",
+            "подтвердите свою личность",
+            "помогите нам защитить вашу учетную запись",
+            "send a code",
+            "отправить код",
         )
         challenge_frame = page.locator(
             "iframe[src*='captcha'], iframe[title*='captcha'], [id*='captcha'], "
@@ -537,10 +612,20 @@ class OutlookWebProvider:
             "button:has-text('Send code'), button:has-text('Отправить код'), "
             "input[value='Send code'], input[value='Отправить код']"
         ).first
+        password_input = page.locator(
+            "input[name='passwd'], input[type='password']"
+        ).first
+        password_visible = await password_input.is_visible()
         if (
-            any(marker in text for marker in challenge_markers)
+            any(marker in text for marker in blocking_challenge_markers)
             or await challenge_frame.is_visible()
-            or await send_code_action.is_visible()
+            or (
+                not password_visible
+                and (
+                    any(marker in text for marker in verification_markers)
+                    or await send_code_action.is_visible()
+                )
+            )
         ):
             raise EmailProviderError(
                 EmailErrorCode.SECURITY_CHALLENGE,

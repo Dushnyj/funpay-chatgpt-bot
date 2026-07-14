@@ -20,10 +20,14 @@ from app.services.account_pool import (
     limits_freshness_for_duration,
 )
 from app.services.lot_sync import LotSyncService
+from app.services.funpay_offer_mapping import SUPPORTED_FUNPAY_TIER_CODES
 from app.services.lot_templates import (
     LotTemplateRenderError,
     render_lot_template,
     resolve_lot_template,
+)
+from app.services.subscription_eligibility import (
+    trusted_paid_subscription_expiry,
 )
 
 
@@ -53,6 +57,8 @@ class LotAutoManager:
         self,
         session: AsyncSession,
         gateway: ChatGateway,
+        *,
+        refresh_stock: bool = False,
     ) -> list[LotAction]:
         actions = await self._pause_catalog_invalid_lots(session, gateway)
         actions.extend(
@@ -119,7 +125,7 @@ class LotAutoManager:
             )
 
             if has_capacity and automatically_paused:
-                if changed:
+                if changed or refresh_stock:
                     await self._sync.sync_lot(session, gateway, lot.id, active=True)
                 else:
                     await self._sync.activate_lot(session, gateway, lot.id)
@@ -128,10 +134,13 @@ class LotAutoManager:
                 await session.commit()
                 actions.append(LotAction(lot.id, "activate"))
             elif has_capacity and lot.status == "active":
-                if changed:
+                if changed or refresh_stock:
                     await self._sync.sync_lot(session, gateway, lot.id, active=True)
                     await session.commit()
-                actions.append(LotAction(lot.id, "update" if changed else "none"))
+                actions.append(LotAction(
+                    lot.id,
+                    "update" if changed or refresh_stock else "none",
+                ))
             elif not has_capacity and lot.status == "active":
                 # Full sync updates a changed price and deactivates atomically
                 # from the application's perspective.
@@ -169,10 +178,13 @@ class LotAutoManager:
         """
 
         result = await session.execute(
-            select(Lot.id, Lot.status).where(
+            select(Lot.id, Lot.status)
+            .join(SubscriptionTier, SubscriptionTier.id == Lot.tier_id)
+            .where(
                 Lot.funpay_id.is_not(None),
                 Lot.status != "deleted",
                 Lot.provenance_marker_synced.is_(False),
+                SubscriptionTier.code.in_(SUPPORTED_FUNPAY_TIER_CODES),
             )
         )
         actions: list[LotAction] = []
@@ -224,6 +236,8 @@ class LotAutoManager:
                 or_(
                     SubscriptionTier.is_active.is_(False),
                     SubscriptionTier.is_sellable.is_(False),
+                    SubscriptionTier.code.is_(None),
+                    SubscriptionTier.code.not_in(SUPPORTED_FUNPAY_TIER_CODES),
                     Duration.is_enabled.is_(False),
                     LimitScope.is_enabled.is_(False),
                     LimitScope.code.not_in(("any", "codex")),
@@ -281,6 +295,7 @@ class LotAutoManager:
             .where(
                 SubscriptionTier.is_active.is_(True),
                 SubscriptionTier.is_sellable.is_(True),
+                SubscriptionTier.code.in_(SUPPORTED_FUNPAY_TIER_CODES),
                 Duration.is_enabled.is_(True),
                 LimitScope.is_enabled.is_(True),
                 LimitScope.code.in_(("any", "codex")),
@@ -324,7 +339,9 @@ class LotAutoManager:
             + timedelta(minutes=duration.minutes)
             + DELIVERY_ALLOCATION_HEADROOM
         )
-        expiry_condition = Account.subscription_expires_at >= required_expires_at
+        expiry_condition = trusted_paid_subscription_expiry(
+            required_expires_at
+        )
         if tier.code == "free":
             expiry_condition = or_(
                 expiry_condition,

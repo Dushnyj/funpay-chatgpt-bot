@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -8,6 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
 from app.models.lot import BumpLog, Lot
+from app.telegram_notifier import TelegramNotifier
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,18 @@ class BumpService:
         except Exception as exc:
             error = str(exc)
             await self._log(session, lot.id, success=False, error=error)
+            try:
+                notifier = await TelegramNotifier.from_settings(session)
+                if notifier is not None:
+                    await asyncio.wait_for(
+                        notifier.notify_bump_failed(lot.id),
+                        timeout=10.0,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to notify Telegram about lot %s bump failure",
+                    lot.id,
+                )
             return BumpResult(success=False, error=error)
         await self._log(session, lot.id, success=True, error=None)
         return BumpResult(success=True)
