@@ -177,6 +177,8 @@ class AccountOut(_Base):
     email_oauth_provider: str | None = None
     email_oauth_status: str | None = None
     validation_job: ValidationJobOut | None = None
+    manual_browser_confirmation_available: bool = False
+    manual_browser_confirmation_expires_at: datetime | None = None
 
 
 class AccountCreate(BaseModel):

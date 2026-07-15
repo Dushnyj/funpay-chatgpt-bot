@@ -59,6 +59,40 @@ test('a failed refresh or limit check still requires attention', () => {
   }), 'validation_failed')
 })
 
+test('a running periodic limit check keeps a proven account active', () => {
+  for (const status of ['pending', 'running', 'processing']) {
+    assert.equal(validationState({
+      status: 'active',
+      operator_status_override: null,
+      validation_job: {
+        id: 14,
+        status,
+        job_type: 'limit_check',
+        stage: 'limit_measurement',
+        created_at: '2026-07-13T10:26:23Z',
+        started_at: '2026-07-13T10:26:42Z',
+        finished_at: null,
+      },
+    }), 'active')
+  }
+})
+
+test('a running full validation still has a visible detecting state', () => {
+  assert.equal(validationState({
+    status: 'pending_validation',
+    operator_status_override: null,
+    validation_job: {
+      id: 15,
+      status: 'running',
+      job_type: 'full_validation',
+      stage: 'login',
+      created_at: '2026-07-13T10:26:23Z',
+      started_at: '2026-07-13T10:26:42Z',
+      finished_at: null,
+    },
+  }), 'detecting')
+})
+
 test('manual revalidation remains pending after the account is removed from the pool', () => {
   assert.equal(validationState({
     status: 'pending_validation',

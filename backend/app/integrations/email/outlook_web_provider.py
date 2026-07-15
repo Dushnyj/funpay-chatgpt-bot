@@ -36,13 +36,14 @@ _MICROSOFT_LOGIN_HOSTS = frozenset({
     "login.live.com",
     "login.microsoftonline.com",
 })
-_OPENAI_SENDER_MARKERS = (
+_OPENAI_SENDER_ADDRESSES = frozenset({
     "noreply@tm.openai.com",
     "noreply@openai.com",
-)
+})
 _OPENAI_SUBJECT_MARKERS = (
     "temporary chatgpt code",
     "temporary code",
+    "authentication code",
     "verification code",
     "login code",
     "sign-in code",
@@ -50,6 +51,16 @@ _OPENAI_SUBJECT_MARKERS = (
     "временный код",
     "код подтверждения",
     "код входа",
+)
+_EMAIL_ADDRESS_PATTERN = re.compile(
+    r"(?<![\w.+-])([a-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)(?![\w.-])",
+    re.IGNORECASE,
+)
+_OPENAI_DISPLAY_NAME_PATTERN = re.compile(
+    r"(?<![\w@.])openai(?![\w@.])",
+    re.IGNORECASE,
 )
 _ROW_SELECTOR_CANDIDATES = (
     "[data-item-id]",
@@ -92,14 +103,45 @@ def _normalise_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
-def _looks_like_openai_code_message(text: str) -> bool:
+def _has_openai_code_subject(text: str) -> bool:
     normalised = _normalise_text(text)
-    has_sender = any(marker in normalised for marker in _OPENAI_SENDER_MARKERS)
-    has_code_subject = any(marker in normalised for marker in _OPENAI_SUBJECT_MARKERS)
+    return any(marker in normalised for marker in _OPENAI_SUBJECT_MARKERS)
+
+
+def _has_trusted_openai_sender(texts: list[str] | tuple[str, ...]) -> bool:
+    for text in texts:
+        addresses = _EMAIL_ADDRESS_PATTERN.findall(str(text))
+        if any(
+            address.casefold() in _OPENAI_SENDER_ADDRESSES
+            for address in addresses
+        ):
+            return True
+    return False
+
+
+def _looks_like_openai_code_message(text: str) -> bool:
+    has_sender = _has_trusted_openai_sender((text,))
+    has_code_subject = _has_openai_code_subject(text)
     # A display name alone is attacker-controlled and is not enough to treat a
-    # row as an OpenAI login message.  Outlook Web is a compatibility fallback;
-    # fail closed unless the visible sender address and a code subject agree.
+    # fully opened message as an OpenAI login message.
     return has_sender and has_code_subject
+
+
+def _looks_like_openai_code_candidate(text: str) -> bool:
+    """Return whether an Outlook list row is worth opening.
+
+    Outlook currently renders the sender as the display name ``OpenAI`` and
+    the subject as ``Your authentication code`` without exposing the raw
+    address in the list.  A display name is attacker-controlled, so this is
+    deliberately only a candidate filter.  ``_read_code`` independently
+    verifies the opened message's sender metadata before parsing any code.
+    """
+
+    if not _has_openai_code_subject(text):
+        return False
+    if _has_trusted_openai_sender((text,)):
+        return True
+    return _OPENAI_DISPLAY_NAME_PATTERN.search(_normalise_text(text)) is not None
 
 
 def _message_fingerprint(payload: dict[str, Any]) -> str:
@@ -726,7 +768,7 @@ class OutlookWebProvider:
         snapshots: list[_MessageSnapshot] = []
         for payload in payloads:
             text = str(payload.get("text") or "")
-            if not _looks_like_openai_code_message(text):
+            if not _looks_like_openai_code_candidate(text):
                 continue
             selector = str(payload.get("selector"))
             dom_index = int(payload.get("dom_index", 0))
@@ -793,6 +835,13 @@ class OutlookWebProvider:
         await current.locator.click(timeout=10_000)
         await asyncio.sleep(0.5)
 
+        # The Outlook list may expose only the attacker-controlled display
+        # name.  After opening the candidate, trust it only when Outlook's
+        # message-header metadata contains an exact allow-listed sender
+        # address.  Values inside the message body are deliberately excluded.
+        if not await self._has_trusted_openai_sender_header(page):
+            return None
+
         body_parts: list[str] = []
         for selector in (
             "[role='document']",
@@ -805,9 +854,76 @@ class OutlookWebProvider:
                 body_parts.extend(await locator.all_inner_texts())
 
         combined = "\n".join((current.text, *body_parts))
-        if not _looks_like_openai_code_message(combined):
+        if not _has_openai_code_subject(combined):
             return None
         return parse_verification_code(combined)
+
+    @staticmethod
+    async def _has_trusted_openai_sender_header(page: Page) -> bool:
+        """Verify the sender from opened-message metadata, never body text.
+
+        Outlook's generated class names are unstable, while sender controls
+        expose semantic attributes such as ``aria-label``, ``title`` and
+        ``data-email-address``.  Read those attributes only from the active
+        mail-reading surface and exclude every message-body subtree.  No link
+        is followed and no security notification is acted upon.
+        """
+
+        values: object = await page.evaluate(
+            """() => {
+                const isVisible = (element) => {
+                    const style = window.getComputedStyle(element);
+                    return element.getClientRects().length > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const readSurfaces = Array.from(document.querySelectorAll(
+                    "[data-app-section='MailReadCompose']"
+                )).filter(isVisible);
+                const root = readSurfaces[0] || document;
+                const bodySelector = [
+                    "[role='document']",
+                    "[aria-label*='Message body']",
+                    "[aria-label*='Тело сообщения']"
+                ].join(", ");
+                const bodies = Array.from(root.querySelectorAll(bodySelector));
+                const metadataSelector = [
+                    "[aria-label*='@']",
+                    "[title*='@']",
+                    "[data-email-address]",
+                    "[data-email]",
+                    "[data-address]",
+                    "a[href^='mailto:']"
+                ].join(", ");
+                const attributes = [
+                    "aria-label",
+                    "title",
+                    "data-email-address",
+                    "data-email",
+                    "data-address",
+                    "href"
+                ];
+                const values = [];
+                for (const element of root.querySelectorAll(metadataSelector)) {
+                    if (!isVisible(element)) continue;
+                    if (bodies.some(
+                        (body) => body === element || body.contains(element)
+                    )) {
+                        continue;
+                    }
+                    for (const attribute of attributes) {
+                        const value = element.getAttribute(attribute);
+                        if (value) values.push(value);
+                    }
+                    if (values.length >= 100) break;
+                }
+                return values;
+            }"""
+        )
+        if not isinstance(values, list):
+            return False
+        return _has_trusted_openai_sender(
+            tuple(value for value in values if isinstance(value, str))
+        )
 
     @staticmethod
     async def _safe_body_text(page: Page) -> str:

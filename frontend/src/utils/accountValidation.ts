@@ -5,6 +5,11 @@ type AccountValidationSnapshot = Pick<
   'status' | 'operator_status_override' | 'validation_job'
 >
 
+type ManualBrowserConfirmationSnapshot = AccountValidationSnapshot & Pick<
+  Account,
+  'manual_browser_confirmation_available' | 'manual_browser_confirmation_expires_at'
+>
+
 export function isValidationInProgress(account: AccountValidationSnapshot) {
   const jobStatus = account.validation_job?.status
   if (jobStatus) return jobStatus === 'pending'
@@ -30,8 +35,29 @@ export function validationState(account: AccountValidationSnapshot) {
   if (account.status === 'validation_failed') return 'validation_failed'
 
   if (account.validation_job?.status === 'failed') return 'validation_failed'
-  if (isValidationInProgress(account)) return 'detecting'
+  // A periodic limit check refreshes usage data in the background. It may keep
+  // row actions locked while it owns the account job slot, but it must not
+  // visually demote an already classified account to "detecting".
+  if (
+    isValidationInProgress(account)
+    && account.validation_job?.job_type !== 'limit_check'
+  ) return 'detecting'
   return account.status
+}
+
+export function isCloudflareBrowserChallenge(account: AccountValidationSnapshot) {
+  if (account.operator_status_override) return false
+  const job = account.validation_job
+  return job?.status === 'failed'
+    && job.job_type === 'full_validation'
+    && job.error_code === 'cloudflare_challenge'
+}
+
+export function isManualBrowserConfirmationAvailable(
+  account: ManualBrowserConfirmationSnapshot,
+) {
+  return isCloudflareBrowserChallenge(account)
+    && account.manual_browser_confirmation_available === true
 }
 
 export interface CompactUsageWindow {

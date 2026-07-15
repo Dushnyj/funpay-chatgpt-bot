@@ -7,6 +7,7 @@ import pytest
 from app.integrations.email.outlook_web_provider import (
     OutlookWebProvider,
     _MessageSnapshot,
+    _looks_like_openai_code_candidate,
     _looks_like_openai_code_message,
     _message_fingerprint,
     _is_trusted_microsoft_login_url,
@@ -51,10 +52,31 @@ def test_password_entry_host_allowlist(url, expected):
     [
         "OpenAI <noreply@tm.openai.com> Your temporary ChatGPT code",
         "noreply@openai.com Verification code",
+        "OpenAI <noreply@tm.openai.com> Your authentication code",
     ],
 )
 def test_identifies_openai_login_mail(text):
     assert _looks_like_openai_code_message(text)
+
+
+def test_live_outlook_row_is_only_an_openai_code_candidate():
+    text = "OpenAI\nYour authentication code\nPlease use this code to continue."
+
+    assert _looks_like_openai_code_candidate(text)
+    assert not _looks_like_openai_code_message(text)
+
+
+def test_spoofed_display_sender_is_only_a_candidate_until_header_verification():
+    text = "OpenAI\nYour authentication code\nCode: 123456"
+
+    assert _looks_like_openai_code_candidate(text)
+    assert not _looks_like_openai_code_message(text)
+
+
+def test_rejects_lookalike_openai_sender_domain():
+    text = "noreply@openai.com.evil.example Your authentication code"
+
+    assert not _looks_like_openai_code_message(text)
 
 
 @pytest.mark.parametrize(
@@ -62,6 +84,7 @@ def test_identifies_openai_login_mail(text):
     [
         "Newsletter ChatGPT weekly update",
         "Microsoft account security code 123456",
+        "Microsoft account team Unusual sign-in activity Review recent activity",
         "OpenAI product announcement",
         "OpenAI Ваш временный код ChatGPT",
     ],
@@ -355,6 +378,9 @@ async def test_read_code_rebinds_locator_to_captured_mailbox_view(monkeypatch):
     empty_body = MagicMock()
     empty_body.count = AsyncMock(return_value=0)
     page.locator.return_value = empty_body
+    page.evaluate = AsyncMock(
+        return_value=["From: OpenAI <noreply@openai.com>"]
+    )
     monkeypatch.setattr(provider, "_restore_snapshot", AsyncMock(return_value=current))
     monkeypatch.setattr(
         "app.integrations.email.outlook_web_provider.asyncio.sleep",
@@ -364,6 +390,89 @@ async def test_read_code_rebinds_locator_to_captured_mailbox_view(monkeypatch):
     assert await provider._read_code(page, stored) == "654321"
     stale_locator.click.assert_not_awaited()
     live_locator.click.assert_awaited_once_with(timeout=10_000)
+
+
+async def test_read_code_accepts_live_outlook_format_after_header_verification(
+    monkeypatch,
+):
+    provider = OutlookWebProvider("user@hotmail.com", "password")
+    page = MagicMock()
+    locator = MagicMock()
+    locator.click = AsyncMock()
+    snapshot = _MessageSnapshot(
+        "live-message",
+        "OpenAI\nYour authentication code\nPlease use the code below.",
+        locator,
+    )
+    body = MagicMock()
+    body.count = AsyncMock(return_value=1)
+    body.all_inner_texts = AsyncMock(
+        return_value=["Your authentication code is 654321"]
+    )
+    page.locator.return_value = body
+    page.evaluate = AsyncMock(
+        return_value=["From: OpenAI <noreply@tm.openai.com>"]
+    )
+    monkeypatch.setattr(provider, "_restore_snapshot", AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(
+        "app.integrations.email.outlook_web_provider.asyncio.sleep",
+        AsyncMock(),
+    )
+
+    assert await provider._read_code(page, snapshot) == "654321"
+    locator.click.assert_awaited_once_with(timeout=10_000)
+
+
+async def test_read_code_rejects_spoofed_openai_display_sender(monkeypatch):
+    provider = OutlookWebProvider("user@hotmail.com", "password")
+    page = MagicMock()
+    locator = MagicMock()
+    locator.click = AsyncMock()
+    snapshot = _MessageSnapshot(
+        "spoofed-message",
+        "OpenAI\nYour authentication code\nCode: 123456",
+        locator,
+    )
+    page.evaluate = AsyncMock(
+        return_value=["From: OpenAI <attacker@example.com>"]
+    )
+    monkeypatch.setattr(provider, "_restore_snapshot", AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(
+        "app.integrations.email.outlook_web_provider.asyncio.sleep",
+        AsyncMock(),
+    )
+
+    assert await provider._read_code(page, snapshot) is None
+    locator.click.assert_awaited_once_with(timeout=10_000)
+    page.locator.assert_not_called()
+
+
+async def test_read_code_rejects_microsoft_security_notification(monkeypatch):
+    provider = OutlookWebProvider("user@hotmail.com", "password")
+    page = MagicMock()
+    locator = MagicMock()
+    locator.click = AsyncMock()
+    snapshot = _MessageSnapshot(
+        "security-message",
+        "Microsoft account team\nUnusual sign-in activity\nReview recent activity",
+        locator,
+    )
+    page.evaluate = AsyncMock(
+        return_value=[
+            "From: Microsoft account team "
+            "<account-security-noreply@accountprotection.microsoft.com>"
+        ]
+    )
+    monkeypatch.setattr(provider, "_restore_snapshot", AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(
+        "app.integrations.email.outlook_web_provider.asyncio.sleep",
+        AsyncMock(),
+    )
+
+    assert not _looks_like_openai_code_candidate(snapshot.text)
+    assert await provider._read_code(page, snapshot) is None
+    locator.click.assert_awaited_once_with(timeout=10_000)
+    page.locator.assert_not_called()
 
 
 async def test_security_challenge_is_typed_and_secret_free():

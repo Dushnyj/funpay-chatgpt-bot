@@ -6,7 +6,7 @@ import { useSettings } from '../api/settings'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpCode, TotpExport } from '../types/api'
-import { compactCodexUsage, formatUsageWindow, isValidationInProgress, rentalCapacityLabel, validationState } from '../utils/accountValidation'
+import { compactCodexUsage, formatUsageWindow, isCloudflareBrowserChallenge, isManualBrowserConfirmationAvailable, isValidationInProgress, rentalCapacityLabel, validationState } from '../utils/accountValidation'
 import { formatDateTime } from '../utils/format'
 
 export default function Accounts() {
@@ -81,6 +81,9 @@ export default function Accounts() {
   const activeCount = accounts.filter((account) => validationState(account) === 'active').length
   const attentionCount = accounts.filter(accountNeedsAttention).length
   const hasDeviceAuthCandidate = accounts.some(isDeviceAuthEligible)
+  const browserValidationDeadline = formatManualBrowserConfirmationDeadline(
+    browserValidationTarget?.manual_browser_confirmation_expires_at ?? null,
+  )
 
   const openTotpCode = async (account: Account) => {
     setActionError('')
@@ -207,13 +210,13 @@ export default function Accounts() {
       {actionError && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{actionError}</span></div>}
       {actionSuccess && <div className="form-alert form-alert--success" role="status"><Icon name="check" /><span>{actionSuccess}</span></div>}
       {!settingsQuery.isLoading && !graphConfigured && accounts.some(isOutlookAccount) && (
-        <div className="form-alert form-alert--warning" role="status">
-          <Icon name="warning" />
-          <span>Microsoft Graph не настроен — «Почта OAuth» недоступна.</span>
+        <div className="form-alert form-alert--info" role="status">
+          <Icon name="activity" />
+          <span>Outlook OAuth не настроен. Если сохранён пароль почты, коды читаются через резервный веб-вход; Microsoft Graph сделает доступ стабильнее.</span>
         </div>
       )}
       {hasDeviceAuthCandidate && !actionSuccess && (
-        <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для кнопки «Вход» включите в ChatGPT: <strong>Настройки → Безопасность и вход → Авторизация кода устройства для Codex</strong>.</span></div>
+        <div className="form-alert form-alert--info"><Icon name="activity" /><span>«Вход OpenAI» запускает Device Auth. Для него включите в ChatGPT: <strong>Настройки → Безопасность и вход → Авторизация кода устройства для Codex</strong>. Обычная автопроверка Device Auth не выполняет.</span></div>
       )}
 
       <section className="panel panel--flush">
@@ -252,7 +255,19 @@ export default function Accounts() {
                 {filteredAccounts.map((account) => {
                   const activeRentals = account.active_rentals_count
                   const accountOccupied = (activeRentals ?? 0) > 0 || account.replacement_reserved
-                  const totpHint = 'Получить текущий одноразовый код или открыть setup key'
+                  const deviceAuthHint = accountOccupied
+                    ? 'Нельзя запускать вход, пока аккаунт занят арендой или заменой'
+                    : 'Вход OpenAI (Device Auth): получить токены в браузере'
+                  const autoValidationHint = accountOccupied
+                    ? 'Нельзя перезапускать проверку во время активной аренды'
+                    : 'Повторить автоматическую проверку пароля и TOTP. Device Auth не выполняется.'
+                  const totpHint = 'Показать текущий код TOTP для ручного входа или открыть setup key'
+                  const manualConfirmationDeadline = formatManualBrowserConfirmationDeadline(
+                    account.manual_browser_confirmation_expires_at,
+                  )
+                  const manualConfirmationHint = accountOccupied
+                    ? 'Нельзя подтверждать вход во время активной аренды'
+                    : `Подтвердить уже выполненный ручной вход${manualConfirmationDeadline ? ` до ${manualConfirmationDeadline}` : ''}`
                   return (
                     <tr key={account.id}>
                     <td data-label="Аккаунт">
@@ -266,7 +281,7 @@ export default function Accounts() {
                     <td data-label="Действия">
                       <div className="row-actions account-actions">
                         {isDeviceAuthEligible(account) && (
-                          <button type="button" className="icon-button account-icon-action account-icon-action--primary" onClick={() => startDeviceAuth(account)} disabled={accountOccupied || deviceAuthTarget === account.id} aria-label={`Войти в ${account.login} через браузер`} title={accountOccupied ? 'Нельзя запускать вход, пока аккаунт занят арендой или заменой' : 'Ручная проверка через браузер'}>
+                          <button type="button" className="icon-button account-icon-action account-icon-action--primary" onClick={() => startDeviceAuth(account)} disabled={accountOccupied || deviceAuthTarget === account.id} aria-label={`Запустить вход OpenAI (Device Auth) для ${account.login}`} title={deviceAuthHint}>
                             {deviceAuthTarget === account.id ? <span className="spinner spinner--light" /> : <Icon name="external" size={15} />}
                           </button>
                         )}
@@ -277,8 +292,8 @@ export default function Accounts() {
                             </button>
                           </span>
                         )}
-                        {!isValidationInProgress(account) && (
-                          <button type="button" className="icon-button account-icon-action" onClick={() => recheck(account)} disabled={accountOccupied || recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}`} title={accountOccupied ? 'Нельзя перезапускать проверку во время активной аренды' : 'Повторить автоматическую проверку'}>
+                        {!isValidationInProgress(account) && !isCloudflareBrowserChallenge(account) && (
+                          <button type="button" className="icon-button account-icon-action" onClick={() => recheck(account)} disabled={accountOccupied || recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}; Device Auth не выполняется`} title={autoValidationHint}>
                             {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
                           </button>
                         )}
@@ -288,7 +303,7 @@ export default function Accounts() {
                           </button>
                         </span>
                         {needsManualBrowserConfirmation(account) && (
-                          <button type="button" className="icon-button account-icon-action account-icon-action--success" onClick={() => setBrowserValidationTarget(account)} disabled={accountOccupied} aria-label={`Подтвердить ручной вход для ${account.login}`} title={accountOccupied ? 'Нельзя подтверждать вход во время активной аренды' : 'Подтвердить успешный ручной вход'}>
+                          <button type="button" className="icon-button account-icon-action account-icon-action--success" onClick={() => setBrowserValidationTarget(account)} disabled={accountOccupied} aria-label={`Подтвердить ручной вход для ${account.login}`} title={manualConfirmationHint}>
                             <Icon name="shield" size={15} />
                           </button>
                         )}
@@ -332,7 +347,11 @@ export default function Accounts() {
             <h2 id="confirm-browser-validation-title">Подтвердить ручной вход?</h2>
             <p id="confirm-browser-validation-description">
               Подтверждайте только если вы успешно вошли в <strong>{browserValidationTarget.login}</strong> с сохранённым паролем и одноразовым кодом из кнопки «Ключ». После подтверждения аккаунт снова сможет участвовать в выдаче.
+              {browserValidationDeadline && <> Подтверждение доступно до <strong>{browserValidationDeadline}</strong>.</>}
             </p>
+            <a href="https://chatgpt.com/auth/login" target="_blank" rel="noopener noreferrer" className="inline-action-link">
+              Открыть вход ChatGPT в новой вкладке <Icon name="external" size={14} />
+            </a>
             <div className="modal__actions">
               <button className="button button--secondary" onClick={() => setBrowserValidationTarget(null)} disabled={confirmBrowserValidation.isPending}>Отмена</button>
               <button className="button button--primary" onClick={confirmManualBrowserValidation} disabled={confirmBrowserValidation.isPending}>
@@ -362,13 +381,14 @@ export default function Accounts() {
 }
 
 function isDeviceAuthEligible(account: Account) {
+  if (isManualBrowserConfirmationAvailable(account)) return false
+  if (isCloudflareBrowserChallenge(account)) return true
   const state = validationState(account)
   return state === 'validation_failed' || state === 'detecting' || state === 'pending'
 }
 
 function needsManualBrowserConfirmation(account: Account) {
-  return validationState(account) === 'validation_failed'
-    && account.validation_job?.error_code === 'cloudflare_challenge'
+  return isManualBrowserConfirmationAvailable(account)
 }
 
 function normalizeVerificationUrl(value: string) {
@@ -420,6 +440,7 @@ function areLimitsStale(limits: Account['limits']) {
 }
 
 function accountNeedsAttention(account: Account) {
+  if (isCloudflareBrowserChallenge(account)) return true
   const state = validationState(account)
   if (state === 'validation_failed') return true
   if (state !== 'active') return false
@@ -431,20 +452,38 @@ function accountNeedsAttention(account: Account) {
 function ValidationStatus({ account }: { account: Account }) {
   const job = account.validation_job
   const state = validationState(account)
-  const nonBlockingFailure = state === 'active' && job?.status === 'failed'
-  const label = state === 'detecting'
-    ? 'Определяется'
-    : state === 'validation_failed'
-      ? 'Ошибка проверки'
-      : undefined
+  const cloudflareChallenge = isCloudflareBrowserChallenge(account)
+  const manualConfirmationAvailable = isManualBrowserConfirmationAvailable(account)
+  const nonBlockingFailure = !cloudflareChallenge && state === 'active' && job?.status === 'failed'
+  const label = cloudflareChallenge
+    ? manualConfirmationAvailable
+      ? 'Подтвердите вход'
+      : 'Нужен вход через браузер'
+    : state === 'detecting'
+      ? 'Определяется'
+      : state === 'validation_failed'
+        ? 'Ошибка проверки'
+        : undefined
+  const statusValue = cloudflareChallenge ? 'pending' : state
+  const manualConfirmationDeadline = formatManualBrowserConfirmationDeadline(
+    account.manual_browser_confirmation_expires_at,
+  )
+  const cloudflareGuidance = manualConfirmationAvailable
+    ? `Войдите вручную: пароль + код из «Ключ»; затем нажмите зелёный щит${manualConfirmationDeadline ? ` · до ${manualConfirmationDeadline}` : ''}`
+    : 'Запустите «Вход OpenAI» (Device Auth) — обычная автопроверка его не выполняет'
 
   return (
-    <div className="validation-state">
-      <StatusBadge value={state} label={label} />
+    <div className={`validation-state ${cloudflareChallenge ? 'validation-state--manual' : ''}`}>
+      <StatusBadge value={statusValue} label={label} />
       {state === 'detecting' && job?.stage && <small>{humanizeValidationStage(job.stage)}</small>}
-      {state === 'validation_failed' && (job?.error_detail || job?.error_code) && (
+      {state === 'validation_failed' && !cloudflareChallenge && (job?.error_detail || job?.error_code) && (
         <small className="validation-state__error" title={job.error_detail ?? job.error_code ?? undefined}>
           {humanizeValidationError(job.error_code ?? '') || 'Проверка не пройдена'}
+        </small>
+      )}
+      {cloudflareChallenge && (
+        <small className="validation-state__warning" title={cloudflareGuidance}>
+          {cloudflareGuidance}
         </small>
       )}
       {nonBlockingFailure && (
@@ -454,6 +493,11 @@ function ValidationStatus({ account }: { account: Account }) {
       )}
     </div>
   )
+}
+
+function formatManualBrowserConfirmationDeadline(value: string | null) {
+  if (!value || Number.isNaN(new Date(value).getTime())) return ''
+  return formatCompactDateTime(value)
 }
 
 function humanizeValidationStage(stage: string) {

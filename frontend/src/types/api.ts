@@ -90,6 +90,8 @@ export interface Account {
   email_oauth_provider?: string | null
   email_oauth_status?: string | null
   validation_job?: AccountValidationJob | null
+  manual_browser_confirmation_available: boolean
+  manual_browser_confirmation_expires_at: string | null
   limits?: AccountLimits | null
 }
 

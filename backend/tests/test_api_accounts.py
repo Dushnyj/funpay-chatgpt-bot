@@ -447,6 +447,144 @@ async def test_manual_browser_confirmation_activates_only_attested_account(
     }
 
 
+async def test_account_views_keep_manual_confirmation_after_limit_checks(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, _limits, _device_job, validation_job = (
+        await _seed_browser_confirmation_evidence(session)
+    )
+    now = datetime.now(timezone.utc)
+    session.add_all(
+        [
+            AccountCheckJob(
+                account_id=account.id,
+                priority="limit_check",
+                job_type="limit_check",
+                status="done",
+                result="ok",
+                created_at=now - timedelta(seconds=20),
+                started_at=now - timedelta(seconds=19),
+                finished_at=now - timedelta(seconds=18),
+            ),
+            AccountCheckJob(
+                account_id=account.id,
+                priority="limit_check",
+                job_type="limit_check",
+                status="done",
+                result="ok",
+                created_at=now - timedelta(seconds=10),
+                started_at=now - timedelta(seconds=9),
+                finished_at=now - timedelta(seconds=8),
+            ),
+        ]
+    )
+    await session.commit()
+
+    listed = await auth_client.get("/api/accounts")
+    detailed = await auth_client.get(f"/api/accounts/{account.id}")
+
+    assert listed.status_code == 200
+    assert detailed.status_code == 200
+    list_payload = next(
+        item for item in listed.json() if item["id"] == account.id
+    )
+    for payload in (list_payload, detailed.json()):
+        assert payload["validation_job"]["id"] == validation_job.id
+        assert payload["validation_job"]["job_type"] == "full_validation"
+        assert payload["validation_job"]["error_code"] == "cloudflare_challenge"
+        assert payload["manual_browser_confirmation_available"] is True
+        assert payload["manual_browser_confirmation_expires_at"] is not None
+
+
+async def test_manual_browser_confirmation_succeeds_after_intervening_limit_checks(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, _limits, _device_job, _validation_job = (
+        await _seed_browser_confirmation_evidence(session)
+    )
+    now = datetime.now(timezone.utc)
+    session.add(
+        AccountCheckJob(
+            account_id=account.id,
+            priority="limit_check",
+            job_type="limit_check",
+            status="done",
+            result="ok",
+            created_at=now - timedelta(seconds=5),
+            started_at=now - timedelta(seconds=4),
+            finished_at=now - timedelta(seconds=3),
+        )
+    )
+    await session.commit()
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "active"
+    assert response.json()["manual_browser_confirmation_available"] is False
+    assert response.json()["manual_browser_confirmation_expires_at"] is None
+
+
+async def test_expired_device_auth_is_not_offered_for_manual_confirmation(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, _limits, device_job, _validation_job = (
+        await _seed_browser_confirmation_evidence(session)
+    )
+    device_job.finished_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    await session.commit()
+
+    response = await auth_client.get(f"/api/accounts/{account.id}")
+
+    assert response.status_code == 200
+    assert response.json()["manual_browser_confirmation_available"] is False
+    assert response.json()["manual_browser_confirmation_expires_at"] is None
+
+
+async def test_plain_recheck_cloudflare_failure_has_no_manual_confirmation(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, _limits, _device_job, _validation_job = (
+        await _seed_browser_confirmation_evidence(session)
+    )
+    now = datetime.now(timezone.utc)
+    recheck_job = AccountCheckJob(
+        account_id=account.id,
+        priority="manual",
+        job_type="full_validation",
+        status="failed",
+        created_at=now - timedelta(seconds=20),
+        started_at=now - timedelta(seconds=19),
+        finished_at=now - timedelta(seconds=18),
+        error=json.dumps(
+            {
+                "stage": "authorize",
+                "code": "cloudflare_challenge",
+                "detail": "Cloudflare blocked the server browser.",
+            }
+        ),
+    )
+    session.add(recheck_job)
+    await session.commit()
+
+    detailed = await auth_client.get(f"/api/accounts/{account.id}")
+    confirmation = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert detailed.status_code == 200
+    assert detailed.json()["validation_job"]["id"] == recheck_job.id
+    assert detailed.json()["manual_browser_confirmation_available"] is False
+    assert detailed.json()["manual_browser_confirmation_expires_at"] is None
+    assert confirmation.status_code == 409
+
+
 @pytest.mark.parametrize(
     ("password", "totp_secret"),
     [

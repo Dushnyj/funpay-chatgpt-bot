@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +48,16 @@ from app.integrations.openai.device_auth import DeviceAuthError
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depends(get_current_user)])
 _check_job_queue = CheckJobQueue()
 _MANUAL_BROWSER_CONFIRMATION_MAX_AGE = timedelta(minutes=30)
+
+
+@dataclass(frozen=True)
+class _ManualBrowserConfirmationEvidence:
+    available: bool = False
+    expires_at: datetime | None = None
+    validation_job: AccountCheckJob | None = None
+    device_auth_job: AccountCheckJob | None = None
+    rejection_status: int = 409
+    rejection_detail: str = "Аккаунт не ожидает ручного подтверждения входа."
 
 
 class BulkAccountItem(BaseModel):
@@ -119,6 +130,7 @@ def _account_out(
     email_oauth: EmailOAuthCredential | None = None,
     active_rentals_count: int = 0,
     replacement_reserved: bool = False,
+    manual_browser_confirmation: _ManualBrowserConfirmationEvidence | None = None,
 ) -> AccountOut:
     base = AccountOut.model_validate(account)
     return base.model_copy(
@@ -135,6 +147,16 @@ def _account_out(
             ),
             "active_rentals_count": active_rentals_count,
             "replacement_reserved": replacement_reserved,
+            "manual_browser_confirmation_available": bool(
+                manual_browser_confirmation is not None
+                and manual_browser_confirmation.available
+            ),
+            "manual_browser_confirmation_expires_at": (
+                manual_browser_confirmation.expires_at
+                if manual_browser_confirmation is not None
+                and manual_browser_confirmation.available
+                else None
+            ),
         }
     )
 
@@ -146,6 +168,7 @@ def _account_with_limits(
     email_oauth: EmailOAuthCredential | None = None,
     active_rentals_count: int = 0,
     replacement_reserved: bool = False,
+    manual_browser_confirmation: _ManualBrowserConfirmationEvidence | None = None,
 ) -> AccountWithLimits:
     base = _account_out(
         account,
@@ -153,6 +176,7 @@ def _account_with_limits(
         email_oauth,
         active_rentals_count,
         replacement_reserved,
+        manual_browser_confirmation,
     )
     return AccountWithLimits(
         **base.model_dump(),
@@ -165,29 +189,42 @@ def _account_with_limits(
 
 
 async def _latest_jobs(
-    session: AsyncSession, account_ids: list[int],
+    session: AsyncSession,
+    account_ids: list[int],
+    *,
+    for_update: bool = False,
 ) -> dict[int, AccountCheckJob]:
     if not account_ids:
         return {}
-    result = await session.execute(
-        select(AccountCheckJob)
-        .where(AccountCheckJob.account_id.in_(account_ids))
-        .order_by(AccountCheckJob.account_id, AccountCheckJob.id.desc())
+    latest_ids = (
+        select(func.max(AccountCheckJob.id))
+        .where(
+            AccountCheckJob.account_id.in_(account_ids),
+            AccountCheckJob.job_type != "limit_check",
+        )
+        .group_by(AccountCheckJob.account_id)
     )
-    latest: dict[int, AccountCheckJob] = {}
-    for job in result.scalars():
-        latest.setdefault(job.account_id, job)
-    return latest
+    statement = select(AccountCheckJob).where(AccountCheckJob.id.in_(latest_ids))
+    if for_update:
+        statement = statement.with_for_update()
+    result = await session.execute(statement)
+    return {job.account_id: job for job in result.scalars()}
 
 
 async def _limits_by_account(
-    session: AsyncSession, account_ids: list[int],
+    session: AsyncSession,
+    account_ids: list[int],
+    *,
+    for_update: bool = False,
 ) -> dict[int, AccountLimits]:
     if not account_ids:
         return {}
-    result = await session.execute(
-        select(AccountLimits).where(AccountLimits.account_id.in_(account_ids))
+    statement = select(AccountLimits).where(
+        AccountLimits.account_id.in_(account_ids)
     )
+    if for_update:
+        statement = statement.with_for_update()
+    result = await session.execute(statement)
     return {limits.account_id: limits for limits in result.scalars()}
 
 
@@ -215,6 +252,324 @@ async def _active_rental_count(session: AsyncSession, account_id: int) -> int:
     return counts.get(account_id, 0)
 
 
+def _manual_confirmation_rejected(
+    detail: str,
+    *,
+    status_code: int = 409,
+    validation_job: AccountCheckJob | None = None,
+) -> _ManualBrowserConfirmationEvidence:
+    return _ManualBrowserConfirmationEvidence(
+        validation_job=validation_job,
+        rejection_status=status_code,
+        rejection_detail=detail,
+    )
+
+
+def _metadata_job_id(metadata: dict | None, key: str) -> int | None:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _manual_browser_confirmation_evidence(
+    session: AsyncSession,
+    accounts: list[Account],
+    *,
+    latest_jobs: dict[int, AccountCheckJob] | None = None,
+    limits_by_account: dict[int, AccountLimits] | None = None,
+    busy_account_ids: set[int] | None = None,
+    now: datetime | None = None,
+    for_update: bool = False,
+) -> dict[int, _ManualBrowserConfirmationEvidence]:
+    """Return the exact evidence accepted by manual browser confirmation.
+
+    The list/detail API and the mutating confirmation endpoint deliberately use
+    this same evaluator.  Background limit checks may occur after the linked
+    Device Auth/full-validation pair, but any other intervening validation or
+    credential operation invalidates the attestation chain.
+    """
+
+    if not accounts:
+        return {}
+    account_ids = [account.id for account in accounts]
+    if latest_jobs is None:
+        latest_jobs = await _latest_jobs(
+            session, account_ids, for_update=for_update
+        )
+    if limits_by_account is None:
+        limits_by_account = await _limits_by_account(
+            session, account_ids, for_update=for_update
+        )
+    if busy_account_ids is None:
+        rental_counts = await _active_rental_counts(session, account_ids)
+        replacement_ids = await replacement_reserved_account_ids(
+            session, account_ids
+        )
+        busy_account_ids = {
+            account_id
+            for account_id, count in rental_counts.items()
+            if count > 0
+        } | replacement_ids
+
+    checked_at = _as_utc(now or datetime.now(timezone.utc))
+    assert checked_at is not None
+    cutoff = checked_at - _MANUAL_BROWSER_CONFIRMATION_MAX_AGE
+    evidence: dict[int, _ManualBrowserConfirmationEvidence] = {}
+    candidates: dict[int, Account] = {}
+
+    for account in accounts:
+        job = latest_jobs.get(account.id)
+        if account.id in busy_account_ids:
+            evidence[account.id] = _manual_confirmation_rejected(
+                "Нельзя подтверждать вход, пока аккаунт занят арендой или "
+                "зарезервирован для замены.",
+                validation_job=job,
+            )
+        elif account.operator_status_override is not None:
+            evidence[account.id] = _manual_confirmation_rejected(
+                "Сначала снимите ручную приостановку аккаунта.",
+                validation_job=job,
+            )
+        elif (
+            account.status != "validation_failed"
+            or account.validation_rerun_requested
+        ):
+            evidence[account.id] = _manual_confirmation_rejected(
+                "Аккаунт не ожидает ручного подтверждения входа.",
+                validation_job=job,
+            )
+        elif not isinstance(account.password_encrypted, str) or not account.password_encrypted.strip():
+            evidence[account.id] = _manual_confirmation_rejected(
+                "Сохранённый пароль недоступен.",
+                status_code=422,
+                validation_job=job,
+            )
+        elif not is_valid_base32(account.totp_secret_encrypted or ""):
+            evidence[account.id] = _manual_confirmation_rejected(
+                "Сохранённый TOTP setup key некорректен.",
+                status_code=422,
+                validation_job=job,
+            )
+        elif (
+            job is None
+            or job.job_type != "full_validation"
+            or job.status != "failed"
+            or _job_error_code(job) != "cloudflare_challenge"
+        ):
+            evidence[account.id] = _manual_confirmation_rejected(
+                "Последняя полная проверка завершилась не только на Cloudflare.",
+                validation_job=job,
+            )
+        else:
+            candidates[account.id] = account
+
+    if not candidates:
+        return evidence
+
+    candidate_ids = list(candidates)
+    active_statement = select(AccountCheckJob.account_id).where(
+        AccountCheckJob.account_id.in_(candidate_ids),
+        AccountCheckJob.status.in_(("pending", "running")),
+    )
+    if for_update:
+        active_statement = active_statement.with_for_update()
+    active_result = await session.execute(active_statement)
+    active_job_accounts = {int(account_id) for account_id in active_result.scalars()}
+
+    audit_statement = (
+        select(AuditLog)
+        .where(
+            AuditLog.account_id.in_(candidate_ids),
+            AuditLog.event_type == "account_device_auth_completed",
+            AuditLog.timestamp >= cutoff,
+        )
+        .order_by(AuditLog.account_id, AuditLog.id.desc())
+    )
+    if for_update:
+        audit_statement = audit_statement.with_for_update()
+    audit_result = await session.execute(audit_statement)
+    completion_audits: dict[int, AuditLog] = {}
+    for audit in audit_result.scalars():
+        account_id = int(audit.account_id or 0)
+        current_job = latest_jobs.get(account_id)
+        if (
+            account_id in completion_audits
+            or current_job is None
+            or _metadata_job_id(
+                audit.metadata_, "credential_validation_job_id"
+            ) != current_job.id
+        ):
+            continue
+        completion_audits[account_id] = audit
+
+    device_job_ids = {
+        device_id
+        for audit in completion_audits.values()
+        if (device_id := _metadata_job_id(audit.metadata_, "job_id")) is not None
+    }
+    device_jobs: dict[int, AccountCheckJob] = {}
+    if device_job_ids:
+        device_statement = select(AccountCheckJob).where(
+            AccountCheckJob.id.in_(device_job_ids)
+        )
+        if for_update:
+            device_statement = device_statement.with_for_update()
+        device_result = await session.execute(device_statement)
+        device_jobs = {job.id: job for job in device_result.scalars()}
+
+    credential_result = await session.execute(
+        select(AuditLog.account_id, func.max(AuditLog.id))
+        .where(
+            AuditLog.account_id.in_(candidate_ids),
+            AuditLog.event_type == "account_credentials_updated",
+        )
+        .group_by(AuditLog.account_id)
+    )
+    latest_credential_audit_ids = {
+        int(account_id): int(audit_id)
+        for account_id, audit_id in credential_result.all()
+        if account_id is not None and audit_id is not None
+    }
+
+    linked_pairs: dict[int, tuple[AccountCheckJob, AccountCheckJob]] = {}
+    for account_id in candidate_ids:
+        audit = completion_audits.get(account_id)
+        current_job = latest_jobs[account_id]
+        device_id = _metadata_job_id(
+            audit.metadata_ if audit is not None else None, "job_id"
+        )
+        device_job = device_jobs.get(device_id or -1)
+        if device_job is not None:
+            linked_pairs[account_id] = (device_job, current_job)
+
+    intervening_non_limit_accounts: set[int] = set()
+    if linked_pairs:
+        min_device_id = min(device.id for device, _current in linked_pairs.values())
+        max_validation_id = max(current.id for _device, current in linked_pairs.values())
+        intervening_result = await session.execute(
+            select(AccountCheckJob.account_id, AccountCheckJob.id).where(
+                AccountCheckJob.account_id.in_(list(linked_pairs)),
+                AccountCheckJob.job_type != "limit_check",
+                AccountCheckJob.id > min_device_id,
+                AccountCheckJob.id < max_validation_id,
+            )
+        )
+        for account_id, job_id in intervening_result.all():
+            pair = linked_pairs.get(int(account_id))
+            if pair is None:
+                continue
+            device_job, current_job = pair
+            if device_job.id < int(job_id) < current_job.id:
+                intervening_non_limit_accounts.add(int(account_id))
+
+    for account_id, account in candidates.items():
+        current_job = latest_jobs[account_id]
+        if account_id in active_job_accounts:
+            evidence[account_id] = _manual_confirmation_rejected(
+                "Новая проверка аккаунта ещё выполняется.",
+                validation_job=current_job,
+            )
+            continue
+
+        completion_audit = completion_audits.get(account_id)
+        device_id = _metadata_job_id(
+            completion_audit.metadata_ if completion_audit is not None else None,
+            "job_id",
+        )
+        device_job = device_jobs.get(device_id or -1)
+        device_finished_at = _as_utc(
+            device_job.finished_at if device_job is not None else None
+        )
+        validation_finished_at = _as_utc(current_job.finished_at)
+        audit_at = _as_utc(
+            completion_audit.timestamp if completion_audit is not None else None
+        )
+        if (
+            completion_audit is None
+            or device_job is None
+            or device_job.account_id != account_id
+            or device_job.id >= current_job.id
+            or device_job.job_type != "device_auth"
+            or device_job.status != "done"
+            or device_job.result != "tokens_connected"
+            or device_finished_at is None
+            or device_finished_at < cutoff
+            or validation_finished_at is None
+            or validation_finished_at < device_finished_at
+            or audit_at is None
+            or audit_at < device_finished_at
+        ):
+            evidence[account_id] = _manual_confirmation_rejected(
+                "Нет свежего успешного подтверждения Device Auth.",
+                validation_job=current_job,
+            )
+            continue
+        if account_id in intervening_non_limit_accounts:
+            evidence[account_id] = _manual_confirmation_rejected(
+                "Цепочка Device Auth и проверки учётных данных изменилась.",
+                validation_job=current_job,
+            )
+            continue
+        if latest_credential_audit_ids.get(account_id, 0) > completion_audit.id:
+            evidence[account_id] = _manual_confirmation_rejected(
+                "Цепочка Device Auth и проверки учётных данных изменилась.",
+                validation_job=current_job,
+            )
+            continue
+
+        limits = limits_by_account.get(account_id)
+        measured_at = _as_utc(limits.measured_at if limits is not None else None)
+        plan_detected_at = _as_utc(account.plan_detected_at)
+        if (
+            limits is None
+            or measured_at is None
+            or measured_at < cutoff
+            or limits.refresh_status != "ok"
+            or limits.plan_window_status != "ok"
+            or not limits.plan_type
+            or limits.plan_type == "unknown"
+            or not limits.expected_long_window_seconds
+            or not limits.refresh_token_encrypted
+            or not limits.access_token_encrypted
+            or account.tier_id is None
+            or plan_detected_at is None
+            or plan_detected_at < cutoff
+        ):
+            evidence[account_id] = _manual_confirmation_rejected(
+                "Нет свежих подтверждённых данных тарифа и лимита.",
+                validation_job=current_job,
+            )
+            continue
+
+        expires_at = min(
+            device_finished_at + _MANUAL_BROWSER_CONFIRMATION_MAX_AGE,
+            audit_at + _MANUAL_BROWSER_CONFIRMATION_MAX_AGE,
+            measured_at + _MANUAL_BROWSER_CONFIRMATION_MAX_AGE,
+            plan_detected_at + _MANUAL_BROWSER_CONFIRMATION_MAX_AGE,
+        )
+        if expires_at <= checked_at:
+            evidence[account_id] = _manual_confirmation_rejected(
+                "Нет свежего успешного подтверждения Device Auth.",
+                validation_job=current_job,
+            )
+            continue
+        evidence[account_id] = _ManualBrowserConfirmationEvidence(
+            available=True,
+            expires_at=expires_at,
+            validation_job=current_job,
+            device_auth_job=device_job,
+            rejection_detail="",
+        )
+
+    return evidence
+
+
 @router.get("", response_model=list[AccountWithLimits])
 async def list_accounts(session: AsyncSession = Depends(get_db_session)):
     result = await session.execute(select(Account).order_by(Account.id))
@@ -227,6 +582,18 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
     replacement_reserved_ids = await replacement_reserved_account_ids(
         session, account_ids,
     )
+    busy_account_ids = {
+        account_id
+        for account_id, count in active_rental_counts.items()
+        if count > 0
+    } | replacement_reserved_ids
+    manual_confirmations = await _manual_browser_confirmation_evidence(
+        session,
+        accounts,
+        latest_jobs=jobs,
+        limits_by_account=limits,
+        busy_account_ids=busy_account_ids,
+    )
     return [
         _account_with_limits(
             account,
@@ -235,6 +602,7 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
             email_oauth.get(account.id),
             active_rental_counts.get(account.id, 0),
             account.id in replacement_reserved_ids,
+            manual_confirmations.get(account.id),
         )
         for account in accounts
     ]
@@ -317,6 +685,19 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
     replacement_reserved_ids = await replacement_reserved_account_ids(
         session, [account.id],
     )
+    busy_account_ids = (
+        {account.id}
+        if active_rental_counts.get(account.id, 0) > 0
+        or account.id in replacement_reserved_ids
+        else set()
+    )
+    manual_confirmations = await _manual_browser_confirmation_evidence(
+        session,
+        [account],
+        latest_jobs=jobs,
+        limits_by_account={account.id: limits} if limits is not None else {},
+        busy_account_ids=busy_account_ids,
+    )
     return _account_with_limits(
         account,
         limits,
@@ -324,6 +705,7 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
         email_oauth,
         active_rental_counts.get(account.id, 0),
         account.id in replacement_reserved_ids,
+        manual_confirmations.get(account.id),
     )
 
 
@@ -520,179 +902,27 @@ async def confirm_browser_validation(
     ).scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
-    # Freshness must be measured after the account lock is acquired. Otherwise
-    # a request waiting behind a long-running credential operation could reuse
-    # evidence that expired while it was blocked.
     now = datetime.now(timezone.utc)
-    cutoff = now - _MANUAL_BROWSER_CONFIRMATION_MAX_AGE
-    if await account_is_busy(session, account.id):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Нельзя подтверждать вход, пока аккаунт занят арендой или "
-                "зарезервирован для замены."
-            ),
-        )
-    if account.operator_status_override is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Сначала снимите ручную приостановку аккаунта.",
-        )
-    if account.status != "validation_failed" or account.validation_rerun_requested:
-        raise HTTPException(
-            status_code=409,
-            detail="Аккаунт не ожидает ручного подтверждения входа.",
-        )
-
-    password = account.password_encrypted
-    totp_secret = account.totp_secret_encrypted or ""
-    if not isinstance(password, str) or not password.strip():
-        raise HTTPException(status_code=422, detail="Сохранённый пароль недоступен.")
-    if not is_valid_base32(totp_secret):
-        raise HTTPException(status_code=422, detail="Сохранённый TOTP setup key некорректен.")
-
-    current_job = (
-        await session.execute(
-            select(AccountCheckJob)
-            .where(AccountCheckJob.account_id == account.id)
-            .order_by(AccountCheckJob.id.desc())
-            .limit(1)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if (
-        current_job is None
-        or current_job.job_type != "full_validation"
-        or current_job.status != "failed"
-        or _job_error_code(current_job) != "cloudflare_challenge"
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Последняя полная проверка завершилась не только на Cloudflare.",
-        )
-
-    active_job = (
-        await session.execute(
-            select(AccountCheckJob.id)
-            .where(
-                AccountCheckJob.account_id == account.id,
-                AccountCheckJob.status.in_(("pending", "running")),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if active_job is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Новая проверка аккаунта ещё выполняется.",
-        )
-
-    # Do not search backwards for any matching Device Auth job. The failed
-    # validation must be the exact follow-up created by the immediately
-    # preceding successful Device Auth, with no validation or credential
-    # operation in between.
-    device_job = (
-        await session.execute(
-            select(AccountCheckJob)
-            .where(
-                AccountCheckJob.account_id == account.id,
-                AccountCheckJob.id < current_job.id,
-            )
-            .order_by(AccountCheckJob.id.desc())
-            .limit(1)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    device_finished_at = _as_utc(
-        device_job.finished_at if device_job is not None else None
+    busy_account_ids = (
+        {account.id} if await account_is_busy(session, account.id) else set()
     )
-    validation_finished_at = _as_utc(current_job.finished_at)
-    if (
-        device_job is None
-        or device_job.job_type != "device_auth"
-        or device_job.status != "done"
-        or device_job.result != "tokens_connected"
-        or device_finished_at is None
-        or device_finished_at < cutoff
-        or validation_finished_at is None
-        or validation_finished_at < device_finished_at
-    ):
+    confirmation = (
+        await _manual_browser_confirmation_evidence(
+            session,
+            [account],
+            busy_account_ids=busy_account_ids,
+            now=now,
+            for_update=True,
+        )
+    )[account.id]
+    if not confirmation.available:
         raise HTTPException(
-            status_code=409,
-            detail="Нет свежего успешного подтверждения Device Auth.",
+            status_code=confirmation.rejection_status,
+            detail=confirmation.rejection_detail,
         )
-
-    completion_audits = list(
-        (
-            await session.execute(
-                select(AuditLog)
-                .where(
-                    AuditLog.account_id == account.id,
-                    AuditLog.event_type == "account_device_auth_completed",
-                    AuditLog.timestamp >= cutoff,
-                )
-                .order_by(AuditLog.id.desc())
-            )
-        ).scalars()
-    )
-    completion_audit = next(
-        (
-            audit
-            for audit in completion_audits
-            if isinstance(audit.metadata_, dict)
-            and audit.metadata_.get("job_id") == device_job.id
-            and audit.metadata_.get("credential_validation_job_id")
-            == current_job.id
-        ),
-        None,
-    )
-    credential_change_after_device_auth = False
-    if completion_audit is not None:
-        credential_change_after_device_auth = (
-            await session.execute(
-                select(AuditLog.id)
-                .where(
-                    AuditLog.account_id == account.id,
-                    AuditLog.event_type == "account_credentials_updated",
-                    AuditLog.id > completion_audit.id,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none() is not None
-    if completion_audit is None or credential_change_after_device_auth:
-        raise HTTPException(
-            status_code=409,
-            detail="Цепочка Device Auth и проверки учётных данных изменилась.",
-        )
-
-    limits = (
-        await session.execute(
-            select(AccountLimits)
-            .where(AccountLimits.account_id == account.id)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    measured_at = _as_utc(limits.measured_at if limits is not None else None)
-    plan_detected_at = _as_utc(account.plan_detected_at)
-    if (
-        limits is None
-        or measured_at is None
-        or measured_at < cutoff
-        or limits.refresh_status != "ok"
-        or limits.plan_window_status != "ok"
-        or not limits.plan_type
-        or limits.plan_type == "unknown"
-        or not limits.expected_long_window_seconds
-        or not limits.refresh_token_encrypted
-        or not limits.access_token_encrypted
-        or account.tier_id is None
-        or plan_detected_at is None
-        or plan_detected_at < cutoff
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="Нет свежих подтверждённых данных тарифа и лимита.",
-        )
+    current_job = confirmation.validation_job
+    device_job = confirmation.device_auth_job
+    assert current_job is not None and device_job is not None
 
     account.status = "active"
     account.chatgpt_last_check_at = now

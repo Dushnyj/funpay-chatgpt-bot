@@ -288,6 +288,8 @@ h3 { margin: 0; font-size: 15px; }
 .modal--wide { width: min(100%, 820px); }
 .modal--compact { width: min(100%, 430px); text-align: center; }
 .modal--compact > p { margin: 9px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
+.inline-action-link { display: inline-flex; align-items: center; gap: 5px; margin-top: 10px; color: var(--primary); font-size: 11px; font-weight: 700; text-decoration: none; }
+.inline-action-link:hover { text-decoration: underline; }
 .modal__header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
 .modal__header h2 { margin-top: 4px; }
 .modal__header p { margin: 5px 0 0; color: var(--text-muted); font-size: 11px; }
@@ -831,6 +833,8 @@ h3 { margin: 0; font-size: 15px; }
 .compact-limits--stale .compact-limit-group small { color: #667085; }
 .accounts-table--operator .validation-state { gap: 4px; }
 .accounts-table--operator .validation-state small { max-width: 100%; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.accounts-table--operator .validation-state--manual .status-badge { max-width: 100%; line-height: 1.25; white-space: normal; }
+.accounts-table--operator .validation-state--manual small { display: -webkit-box; overflow: hidden; text-overflow: clip; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .account-actions { min-width: 0; align-items: center; align-content: center; gap: 3px; }
 .account-actions .action-help { flex: 0 0 auto; }
 .account-icon-action { width: 28px; height: 28px; flex: 0 0 28px; border-radius: 7px; }
@@ -875,6 +879,7 @@ h3 { margin: 0; font-size: 15px; }
 
 @media (max-width: 700px) {
   .compact-limit-group small { overflow: visible; text-overflow: clip; white-space: normal; }
+  .accounts-table--operator .validation-state--manual small { -webkit-line-clamp: 3; }
 }
 
 @media (max-width: 450px) {

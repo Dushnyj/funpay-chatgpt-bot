@@ -207,7 +207,7 @@ Chromium-задач проверки/восстановления аккаунт
 | Симптом | Причина | Решение |
 |---|---|---|
 | FunPay не подключается | Неверный/протухший golden_key | Заменить Golden Key в админке и проверить статус |
-| Аккаунт показывает `cloudflare_challenge` | OpenAI заблокировал headless Chromium | Использовать «Проверить через браузер» и device code flow |
+| Аккаунт показывает `cloudflare_challenge` | OpenAI заблокировал headless Chromium | Запустить «Вход OpenAI» (Device Auth). При доступном подтверждении вручную войти с сохранённым паролем и TOTP-кодом из «Ключ», затем нажать зелёный щит; обычную автопроверку не повторять |
 | Outlook/Hotmail показывает, что OAuth не подключён | Microsoft Graph не настроен или согласие ещё не выдано | Заполнить три `MICROSOFT_GRAPH_*` значения, перезапустить backend и нажать «Почта OAuth» |
 | Outlook показывает `email_security_challenge` | Microsoft потребовал дополнительную проверку нового серверного IP | Подключить Microsoft Graph OAuth; парольный Outlook Web оставить только fallback |
 | Аккаунт показывает `validation_failed` | Ошибка содержит точные stage/code/detail | Исправить указанную причину и повторить проверку |
