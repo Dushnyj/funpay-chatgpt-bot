@@ -1047,6 +1047,7 @@ async def test_scheduled_validation_enqueues_only_due_active_accounts(
     assert [(job.account_id, job.priority, job.job_type) for job in jobs] == [
         (due.id, "scheduled", "full_validation")
     ]
+    assert lifecycle._capacity_reconcile_dirty is True
 
 
 async def test_startup_recovers_worker_job_and_terminalizes_device_auth(

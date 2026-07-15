@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -199,11 +201,17 @@ async def test_patch_account_status(auth_client: AsyncClient, session: AsyncSess
         "tier_id": tier_id,
     })
     acc_id = resp.json()["id"]
-    resp = await auth_client.patch(
-        f"/api/accounts/{acc_id}", json={"status": "maintenance"}
-    )
+    lifecycle = MagicMock()
+    app.state.lifecycle = lifecycle
+    try:
+        resp = await auth_client.patch(
+            f"/api/accounts/{acc_id}", json={"status": "maintenance"}
+        )
+    finally:
+        del app.state.lifecycle
     assert resp.status_code == 200
     assert resp.json()["status"] == "maintenance"
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
 
     resp = await auth_client.patch(
         f"/api/accounts/{acc_id}", json={"status": "active"}
@@ -213,6 +221,70 @@ async def test_patch_account_status(auth_client: AsyncClient, session: AsyncSess
     await session.refresh(account)
     assert account.status == "maintenance"
     assert account.operator_status_override == "maintenance"
+
+
+async def test_capacity_callback_failure_does_not_undo_committed_status(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={"login": "callback-failure", "password": "pass"},
+    )
+    account_id = created.json()["id"]
+    lifecycle = MagicMock()
+    lifecycle.request_capacity_reconcile.side_effect = RuntimeError("offline")
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.patch(
+            f"/api/accounts/{account_id}",
+            json={"status": "maintenance"},
+        )
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 200
+    account = await session.get(Account, account_id)
+    await session.refresh(account)
+    assert account.status == "maintenance"
+
+
+async def test_device_auth_start_requests_capacity_reconcile(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+):
+    account = Account(
+        login="device-auth-capacity@example.com",
+        password_encrypted="pass",
+        totp_secret_encrypted="",
+        status="active",
+    )
+    session.add(account)
+    await session.commit()
+    auth_session = SimpleNamespace(
+        id="device-session",
+        code=SimpleNamespace(
+            verification_url="https://example.com/device",
+            user_code="ABCD-EFGH",
+            interval_seconds=5,
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+    )
+    monkeypatch.setattr(
+        accounts_router.account_device_auth_manager,
+        "start",
+        AsyncMock(return_value=auth_session),
+    )
+    lifecycle = MagicMock()
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.post(f"/api/accounts/{account.id}/device-auth")
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 201
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
 
 
 async def test_failed_account_can_be_requeued_with_visible_job(
@@ -236,7 +308,12 @@ async def test_failed_account_can_be_requeued_with_visible_job(
     job.error = '{"stage":"login","code":"cloudflare_challenge","detail":"blocked"}'
     await session.commit()
 
-    response = await auth_client.post(f"/api/accounts/{account.id}/recheck")
+    lifecycle = MagicMock()
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.post(f"/api/accounts/{account.id}/recheck")
+    finally:
+        del app.state.lifecycle
     assert response.status_code == 202
     payload = response.json()
     assert payload["status"] == "pending_validation"
@@ -244,6 +321,7 @@ async def test_failed_account_can_be_requeued_with_visible_job(
     assert payload["validation_job"]["priority"] == "manual"
     await session.refresh(account)
     assert account.operator_status_override is None
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
 
 
 async def test_recheck_rejects_live_validation_without_mutating_account(

@@ -630,6 +630,57 @@ async def test_pauses_lot_when_no_capacity(session: AsyncSession):
     assert gateway.saved_offers[100].active is False
 
 
+@pytest.mark.parametrize("limits_state", ["stale", "missing", "expired"])
+async def test_pauses_lot_when_account_limits_are_unusable(
+    session: AsyncSession,
+    limits_state: str,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    account = await _add_account_with_limits(session, tier.id)
+    limits = await session.get(AccountLimits, account.id)
+    assert limits is not None
+    if limits_state == "stale":
+        limits.measured_at = (
+            datetime.now(timezone.utc) - timedelta(hours=1, seconds=1)
+        )
+    elif limits_state == "missing":
+        limits.measured_at = None
+    else:
+        limits.refresh_status = "expired"
+    matrix = PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    )
+    session.add(matrix)
+    await session.flush()
+    lot = Lot(
+        config_key=matrix.config_key,
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="T",
+        title_en="T",
+        status="active",
+        auto_created=True,
+        funpay_id="101",
+    )
+    session.add(lot)
+    await session.flush()
+
+    gateway = FakeChatGateway()
+    actions = await LotAutoManager(funpay_node_id=55).run(session, gateway)
+
+    assert any(action.action == "pause" for action in actions)
+    await session.refresh(lot)
+    assert lot.status == "paused"
+    assert lot.paused_reason == "auto_no_account"
+    assert gateway.saved_offers[101].active is False
+
+
 async def test_activates_lot_when_capacity_returns(session: AsyncSession):
     tier, duration, scope = await _seed_catalog(session)
     await _add_account_with_limits(session, tier.id)

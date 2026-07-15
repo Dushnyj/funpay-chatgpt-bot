@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.capacity import notify_capacity_changed
 from app.api.deps import get_current_user, get_db_session
 from app.check_job_queue import ActiveJobConflict, CheckJobQueue
 from app.config import get_settings
@@ -240,6 +241,7 @@ async def microsoft_email_oauth_callback(
     except Exception:
         await session.rollback()
         return _accounts_redirect("failed", "storage_failed")
+    notify_capacity_changed(request)
     return _accounts_redirect("connected")
 
 

@@ -2,6 +2,7 @@ import base64
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -222,11 +223,16 @@ async def test_callback_verifies_identity_encrypts_refresh_and_exposes_status(
     )
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as public:
-        callback = await public.post(
-            "/api/email-oauth/microsoft/callback",
-            data={"state": state, "code": "authorization-code"},
-        )
+    lifecycle = MagicMock()
+    app.state.lifecycle = lifecycle
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as public:
+            callback = await public.post(
+                "/api/email-oauth/microsoft/callback",
+                data={"state": state, "code": "authorization-code"},
+            )
+    finally:
+        del app.state.lifecycle
 
     assert callback.status_code == 303
     assert callback.headers["location"] == "/accounts?email_oauth=connected"
@@ -256,6 +262,7 @@ async def test_callback_verifies_identity_encrypts_refresh_and_exposes_status(
     ).scalar_one()
     assert job.job_type == "full_validation"
     assert job.priority == "manual"
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
 
     account_response = await auth_client.get(f"/api/accounts/{account.id}")
     payload = account_response.json()

@@ -673,7 +673,8 @@ class AppLifecycle:
                 )
                 .with_for_update(of=Account, skip_locked=True)
             )
-            for account_id in result.scalars().all():
+            due_account_ids = result.scalars().all()
+            for account_id in due_account_ids:
                 await self._jobs.enqueue(
                     session,
                     account_id=account_id,
@@ -681,6 +682,8 @@ class AppLifecycle:
                     job_type="full_validation",
                 )
             await session.commit()
+        if due_account_ids:
+            self.request_capacity_reconcile()
 
     async def _task_lot_auto(self) -> None:
         """Пересчёт capacity и sync лотов."""

@@ -4,12 +4,13 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.capacity import notify_capacity_changed
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import (
     AccountCreate,
@@ -297,6 +298,7 @@ async def get_account(account_id: int, session: AsyncSession = Depends(get_db_se
 @router.post("/{account_id}/recheck", response_model=AccountOut, status_code=202)
 async def recheck_account(
     account_id: int,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     # Serialize manual state changes with allocation and credential repair.
@@ -338,6 +340,7 @@ async def recheck_account(
         )
     )
     await session.commit()
+    notify_capacity_changed(request)
     await session.refresh(account)
     await session.refresh(job)
     email_oauth = await session.get(EmailOAuthCredential, account.id)
@@ -361,6 +364,7 @@ async def recheck_account(
 )
 async def start_device_auth(
     account_id: int,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     # This is only a fast preflight. The manager releases the transaction for
@@ -398,6 +402,7 @@ async def start_device_auth(
             status_code=503,
             detail="OpenAI device authorization is temporarily unavailable",
         ) from exc
+    notify_capacity_changed(request)
     assert auth_session.code is not None
     return DeviceAuthStartOut(
         session_id=auth_session.id,
@@ -459,7 +464,12 @@ async def get_device_auth_status(
 
 
 @router.patch("/{account_id}", response_model=AccountOut)
-async def update_account(account_id: int, req: AccountUpdate, session: AsyncSession = Depends(get_db_session)):
+async def update_account(
+    account_id: int,
+    req: AccountUpdate,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
     account = (
         await session.execute(
             select(Account).where(Account.id == account_id).with_for_update()
@@ -482,6 +492,8 @@ async def update_account(account_id: int, req: AccountUpdate, session: AsyncSess
     if "status" in changes:
         account.operator_status_override = changes["status"]
     await session.commit()
+    if "status" in changes:
+        notify_capacity_changed(request)
     await session.refresh(account)
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
@@ -506,6 +518,7 @@ async def update_account(account_id: int, req: AccountUpdate, session: AsyncSess
 async def update_account_credentials(
     account_id: int,
     req: AccountCredentialsUpdate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     """Replace write-only credentials and force a fresh validation pass."""
@@ -630,6 +643,7 @@ async def update_account_credentials(
         await session.rollback()
         raise HTTPException(status_code=409, detail="Login already exists")
 
+    notify_capacity_changed(request)
     await session.refresh(account)
     await session.refresh(job)
     active_rentals_count = await _active_rental_count(session, account.id)
@@ -646,7 +660,11 @@ async def update_account_credentials(
 
 
 @router.delete("/{account_id}", status_code=204)
-async def delete_account(account_id: int, session: AsyncSession = Depends(get_db_session)):
+async def delete_account(
+    account_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
     account = (
         await session.execute(
             select(Account).where(Account.id == account_id).with_for_update()
@@ -667,6 +685,7 @@ async def delete_account(account_id: int, session: AsyncSession = Depends(get_db
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Account is referenced by history")
+    notify_capacity_changed(request)
 
 
 class TotpExportResponse(BaseModel):
