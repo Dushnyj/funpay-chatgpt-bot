@@ -32,6 +32,7 @@ from app.services.subscription_eligibility import (
 
 
 logger = logging.getLogger(__name__)
+_AUTO_PUBLISH_PENDING = "auto_publish_pending"
 
 
 class ProvenanceMarkerSyncError(RuntimeError):
@@ -102,8 +103,13 @@ class LotAutoManager:
                         session, gateway, matrix, None, exc,
                     )
                     continue
-                await self._sync.sync_lot(session, gateway, lot.id, active=True)
+                # Persist the random ownership token before crossing the
+                # network boundary. The remote offer is created inactive,
+                # then its exact ID binding is committed before activation.
+                # A crash at any point therefore leaves a recoverable local
+                # identity and never an unbound offer available for sale.
                 await session.commit()
+                await self._publish_pending_lot(session, gateway, lot)
                 actions.append(LotAction(lot.id, "create"))
                 continue
 
@@ -125,6 +131,10 @@ class LotAutoManager:
             )
 
             if has_capacity and automatically_paused:
+                if lot.paused_reason == _AUTO_PUBLISH_PENDING:
+                    await self._publish_pending_lot(session, gateway, lot)
+                    actions.append(LotAction(lot.id, "activate"))
+                    continue
                 if changed or refresh_stock:
                     await self._sync.sync_lot(session, gateway, lot.id, active=True)
                 else:
@@ -156,12 +166,36 @@ class LotAutoManager:
                 # A manual pause is never undone by automation.  Keep the
                 # remote content current while preserving the inactive state.
                 if changed:
-                    await self._sync.sync_lot(session, gateway, lot.id, active=False)
+                    if lot.funpay_id:
+                        await self._sync.sync_lot(
+                            session,
+                            gateway,
+                            lot.id,
+                            active=False,
+                        )
                     await session.commit()
                 actions.append(LotAction(lot.id, "update" if changed else "none"))
 
         await session.flush()
         return actions
+
+    async def _publish_pending_lot(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        lot: Lot,
+    ) -> None:
+        """Bind one inactive remote offer durably, then make it sellable."""
+
+        await self._sync.sync_lot(session, gateway, lot.id, active=False)
+        lot.status = "paused"
+        lot.paused_reason = _AUTO_PUBLISH_PENDING
+        # This is the safety boundary: after it, every remotely activatable
+        # offer has a durable exact local ID/token binding.
+        await session.commit()
+        await self._sync.activate_lot(session, gateway, lot.id)
+        lot.paused_reason = None
+        await session.commit()
 
     async def sync_missing_provenance_markers(
         self,
@@ -415,8 +449,8 @@ class LotAutoManager:
             title_en=title_en,
             description_ru=description_ru,
             description_en=description_en,
-            status="active",
-            paused_reason=None,
+            status="paused",
+            paused_reason=_AUTO_PUBLISH_PENDING,
             auto_created=True,
         )
         session.add(lot)

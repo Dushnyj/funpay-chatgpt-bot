@@ -7,6 +7,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.gateway import ChatGateway
+from app.integrations.funpay.provenance import (
+    PROVENANCE_MARKER_RE,
+    descriptions_have_exact_provenance,
+    exact_provenance_token,
+)
 from app.integrations.funpay.types import OfferFieldsDTO
 from app.models.catalog import SubscriptionTier
 from app.models.lot import Lot
@@ -14,7 +19,6 @@ from app.services.funpay_offer_mapping import funpay_offer_plan_fields
 
 
 _PROVENANCE_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
-_PROVENANCE_MARKER_RE = re.compile(r"\[FPBOT:([0-9a-f]{32})\]")
 _FUNPAY_DESCRIPTION_MAX_LENGTH = 4000
 _PAYMENT_MESSAGE_RU = (
     "Заказ принят. Бот отправит данные для входа в чат заказа. "
@@ -43,7 +47,7 @@ def description_with_provenance_marker(
     marker = provenance_marker(token)
     # Operator text may have been copied back from FunPay. Remove every old
     # canonical marker before appending the authoritative current one.
-    clean = _PROVENANCE_MARKER_RE.sub("", description or "").strip()
+    clean = PROVENANCE_MARKER_RE.sub("", description or "").strip()
     separator = "\n\n" if clean else ""
     available = _FUNPAY_DESCRIPTION_MAX_LENGTH - len(separator) - len(marker)
     clean = clean[: max(0, available)].rstrip()
@@ -54,8 +58,7 @@ def description_with_provenance_marker(
 def extract_provenance_token(full_description: str | None) -> str | None:
     """Extract one exact canonical marker; duplicates fail closed."""
 
-    matches = _PROVENANCE_MARKER_RE.findall(full_description or "")
-    return matches[0] if len(matches) == 1 else None
+    return exact_provenance_token((full_description,))
 
 
 def build_offer_fields(
@@ -169,18 +172,16 @@ class LotSyncService:
             int(value) for value in used_result.scalars()
             if value is not None and str(value).isdigit()
         }
-        titles = {
-            _normalize_title(lot.title_ru),
-            _normalize_title(lot.title_en),
-        }
-        titles.discard("")
         candidates = [
             offer for offer in remote
             if offer.offer_id not in used_ids
-            and _normalize_title(offer.title) in titles
-            and offer.price is not None
-            and math.isclose(offer.price, float(lot.price), abs_tol=0.01)
+            and _offer_preview_matches_lot(offer, lot)
         ]
+        # FunPay appends form attributes to preview titles (for example
+        # ``, Без подписки``). Prefix+price bounds full-form reads so a
+        # recovery does not inspect the seller's whole catalog. The exact
+        # immutable marker below remains the sole adoption authority, so
+        # manual lookalikes are never adopted.
         matches = []
         for offer in candidates:
             try:
@@ -191,16 +192,28 @@ class LotSyncService:
                 raise RuntimeError(
                     "Unable to verify provenance of an unclaimed FunPay offer"
                 ) from exc
-            if _descriptions_have_exact_provenance(
+            if descriptions_have_exact_provenance(
                 (desc_ru, desc_en), lot.provenance_token,
             ):
                 matches.append(offer)
-        if len(matches) == 1:
-            return matches[0].offer_id
-        if len(matches) > 1:
-            raise RuntimeError(
-                "More than one unclaimed FunPay offer carries the local lot marker"
-            )
+        if matches:
+            # A process from an older release could retry after a successful
+            # remote save and create more than one offer with the same token.
+            # Every match is bot-owned; keep the oldest deterministic ID and
+            # fail closed unless all duplicates are made unavailable.
+            matches.sort(key=lambda offer: offer.offer_id)
+            canonical, *duplicates = matches
+            for duplicate in duplicates:
+                changed = await gateway.set_offer_active(
+                    duplicate.offer_id,
+                    active=False,
+                )
+                if not changed:
+                    raise RuntimeError(
+                        "Unable to pause a duplicate FunPay offer carrying "
+                        "the local lot marker"
+                    )
+            return canonical.offer_id
         return 0
 
     async def pause_lot(
@@ -252,26 +265,19 @@ def _normalize_title(value: str | None) -> str:
     return " ".join((value or "").casefold().split())
 
 
-def _descriptions_have_exact_provenance(
-    descriptions: tuple[str | None, str | None],
-    token: str,
-) -> bool:
-    """Accept one canonical marker per localized description, and no other."""
-
-    markers_by_description = [
-        _PROVENANCE_MARKER_RE.findall(description or "")
-        for description in descriptions
-    ]
-    markers = [
-        marker
-        for description_markers in markers_by_description
-        for marker in description_markers
-    ]
-    return (
-        bool(markers)
-        and all(
-            len(description_markers) <= 1
-            for description_markers in markers_by_description
-        )
-        and all(marker == token for marker in markers)
+def _offer_preview_matches_lot(offer, lot: Lot) -> bool:
+    preview_title = _normalize_title(offer.title)
+    requested_titles = {
+        _normalize_title(lot.title_ru),
+        _normalize_title(lot.title_en),
+    }
+    requested_titles.discard("")
+    title_matches = any(
+        preview_title.startswith(title)
+        for title in requested_titles
     )
+    price_matches = (
+        offer.price is not None
+        and math.isclose(offer.price, float(lot.price), abs_tol=0.01)
+    )
+    return title_matches and price_matches

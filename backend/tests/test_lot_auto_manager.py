@@ -5,7 +5,9 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.integrations.funpay.exceptions import FunPayOfferResolutionError
 from app.integrations.funpay.gateway import FakeChatGateway
+from app.integrations.funpay.types import OfferInfo
 from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
@@ -122,6 +124,19 @@ async def _add_account_with_limits(
     ))
     await session.flush()
     return acc
+
+
+def _expose_saved_offer(gateway: FakeChatGateway) -> int:
+    offer_id, fields = next(iter(gateway.saved_offers.items()))
+    gateway.set_my_offers(55, [OfferInfo(
+        offer_id=offer_id,
+        subcategory_id=55,
+        title=f"{fields.title_ru}, С подпиской",
+        price=fields.price,
+        active=fields.active,
+        auto_delivery=fields.auto_delivery,
+    )])
+    return offer_id
 
 
 async def test_creates_lot_when_capacity_available(session: AsyncSession):
@@ -303,8 +318,156 @@ async def test_successful_first_create_is_durable_when_second_remote_call_fails(
     await session.rollback()
 
     lots = list((await session.execute(select(Lot))).scalars())
-    assert len(lots) == 1
-    assert lots[0].funpay_id is not None
+    assert len(lots) == 2
+    bound = [lot for lot in lots if lot.funpay_id is not None]
+    pending = [lot for lot in lots if lot.funpay_id is None]
+    assert len(bound) == 1
+    assert bound[0].status == "active"
+    assert len(pending) == 1
+    assert pending[0].status == "paused"
+    assert pending[0].paused_reason == "auto_publish_pending"
+
+
+async def test_remote_save_resolution_failure_recovers_same_inactive_offer(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.commit()
+
+    class AcceptedButUnresolvedGateway(FakeChatGateway):
+        fail_resolution = True
+
+        async def save_offer_fields(self, fields):
+            offer_id = await super().save_offer_fields(fields)
+            if fields.offer_id == 0 and self.fail_resolution:
+                raise FunPayOfferResolutionError("preview not visible")
+            return offer_id
+
+    gateway = AcceptedButUnresolvedGateway()
+    manager = LotAutoManager(55)
+
+    with pytest.raises(FunPayOfferResolutionError, match="preview not visible"):
+        await manager.run(session, gateway)
+
+    pending = (await session.execute(select(Lot))).scalar_one()
+    token = pending.provenance_token
+    assert pending.funpay_id is None
+    assert pending.status == "paused"
+    assert pending.paused_reason == "auto_publish_pending"
+    offer_id = _expose_saved_offer(gateway)
+    assert gateway.saved_offers[offer_id].active is False
+    assert token in gateway.saved_offers[offer_id].desc_ru
+
+    gateway.fail_resolution = False
+    actions = await manager.run(session, gateway)
+
+    await session.refresh(pending)
+    assert [(action.lot_id, action.action) for action in actions] == [
+        (pending.id, "activate")
+    ]
+    assert pending.funpay_id == str(offer_id)
+    assert pending.provenance_token == token
+    assert pending.status == "active"
+    assert set(gateway.saved_offers) == {offer_id}
+    assert gateway.saved_offers[offer_id].active is True
+
+
+async def test_binding_commit_failure_recovers_without_second_remote_create(
+    session: AsyncSession,
+    monkeypatch,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.commit()
+    gateway = FakeChatGateway()
+    manager = LotAutoManager(55)
+    real_commit = session.commit
+    commit_count = 0
+
+    async def fail_binding_commit():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            await session.rollback()
+            raise RuntimeError("binding commit interrupted")
+        await real_commit()
+
+    monkeypatch.setattr(session, "commit", fail_binding_commit)
+    with pytest.raises(RuntimeError, match="binding commit interrupted"):
+        await manager.run(session, gateway)
+
+    pending = (await session.execute(select(Lot))).scalar_one()
+    token = pending.provenance_token
+    assert pending.funpay_id is None
+    offer_id = _expose_saved_offer(gateway)
+    assert gateway.saved_offers[offer_id].active is False
+
+    monkeypatch.setattr(session, "commit", real_commit)
+    await manager.run(session, gateway)
+
+    await session.refresh(pending)
+    assert pending.funpay_id == str(offer_id)
+    assert pending.provenance_token == token
+    assert pending.status == "active"
+    assert set(gateway.saved_offers) == {offer_id}
+
+
+async def test_activation_failure_keeps_durable_inactive_binding_for_retry(
+    session: AsyncSession,
+):
+    tier, duration, scope = await _seed_catalog(session)
+    await _add_account_with_limits(session, tier.id)
+    session.add(PriceMatrix(
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+    ))
+    await session.commit()
+
+    class ActivationFailureGateway(FakeChatGateway):
+        fail_activation = True
+
+        async def set_offer_active(self, offer_id: int, active: bool) -> bool:
+            if active and self.fail_activation:
+                raise RuntimeError("activation interrupted")
+            return await super().set_offer_active(offer_id, active)
+
+    gateway = ActivationFailureGateway()
+    manager = LotAutoManager(55)
+
+    with pytest.raises(RuntimeError, match="activation interrupted"):
+        await manager.run(session, gateway)
+
+    pending = (await session.execute(select(Lot))).scalar_one()
+    offer_id = int(pending.funpay_id or 0)
+    assert offer_id > 0
+    assert pending.status == "paused"
+    assert pending.paused_reason == "auto_publish_pending"
+    assert pending.provenance_marker_synced is True
+    assert gateway.saved_offers[offer_id].active is False
+
+    gateway.fail_activation = False
+    await manager.run(session, gateway)
+
+    await session.refresh(pending)
+    assert pending.funpay_id == str(offer_id)
+    assert pending.status == "active"
+    assert gateway.saved_offers[offer_id].active is True
+    assert set(gateway.saved_offers) == {offer_id}
 
 
 async def test_template_render_error_does_not_block_other_lot_and_is_audited(

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import math
+import asyncio
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from app.integrations.funpay.exceptions import FunPayApiError, FunPayOfferResolutionError
+from app.integrations.funpay.provenance import (
+    descriptions_have_exact_provenance,
+    exact_provenance_token,
+)
 from app.integrations.funpay.types import (
     BuyerProfileInfo,
     OrderInfo,
@@ -93,6 +98,7 @@ class FakeChatGateway:
         self.bumped: list[tuple[int, int]] = []
         self._my_offers: dict[int, list[OfferInfo]] = {}
         self._category_ids: dict[int, int] = {}
+        self.offer_description_calls: list[int] = []
 
     def set_order(self, order: OrderInfo) -> None:
         self._orders[order.order_id] = order
@@ -231,6 +237,9 @@ class FakeChatGateway:
 
     async def set_offer_active(self, offer_id: int, active: bool) -> bool:
         self.activity_changes.append((offer_id, active))
+        existing = self.saved_offers.get(offer_id)
+        if existing is not None:
+            self.saved_offers[offer_id] = replace(existing, active=active)
         return True
 
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
@@ -240,6 +249,7 @@ class FakeChatGateway:
         self,
         offer_id: int,
     ) -> tuple[str | None, str | None]:
+        self.offer_description_calls.append(offer_id)
         fields = self.saved_offers.get(offer_id)
         if fields is None:
             return None, None
@@ -256,6 +266,9 @@ class FakeChatGateway:
 from funpayparsers.types.enums import OrderStatus as _FPOrderStatus
 
 from app.integrations.funpay.types import SaleStatus
+
+
+_CREATE_OFFER_RESOLUTION_DELAYS = (0.0, 0.25, 0.75, 1.5)
 
 
 def _map_order_status(fp_status: _FPOrderStatus) -> SaleStatus:
@@ -481,8 +494,22 @@ class FunPayChatGateway:
         if fields.offer_id > 0:
             return fields.offer_id
 
-        after = await self.get_my_offers(fields.subcategory_id)
-        return _resolve_created_offer_id(before, after, fields)
+        for delay in _CREATE_OFFER_RESOLUTION_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            after = await self.get_my_offers(fields.subcategory_id)
+            resolved = await _resolve_created_offer_id(
+                before,
+                after,
+                fields,
+                self.get_offer_descriptions,
+            )
+            if resolved is not None:
+                return resolved
+        raise FunPayOfferResolutionError(
+            "FunPay accepted a new offer but its exact bot marker was not "
+            "visible in the seller offer list"
+        )
 
     async def set_offer_active(self, offer_id: int, active: bool) -> bool:
         fp_fields = await self._bot.get_offer_fields(offer_id=offer_id)
@@ -524,19 +551,30 @@ class FunPayChatGateway:
         return bool(response)
 
 
-def _resolve_created_offer_id(
+async def _resolve_created_offer_id(
     before: Iterable[OfferInfo],
     after: Iterable[OfferInfo],
     requested: OfferFieldsDTO,
-) -> int:
+    get_descriptions: Callable[
+        [int],
+        Awaitable[tuple[str | None, str | None]],
+    ],
+) -> int | None:
     """Resolve the ID created by FunPayBotEngine 0.7.
 
-    ``Bot.save_offer_fields`` returns only a boolean.  The reliable signal is
-    the set difference between ``get_my_offers_page`` snapshots.  A strict
-    title/price match is used only when the snapshot contains several new
-    offers; ambiguity is an error rather than silently persisting ``0`` or the
-    wrong offer id.
+    ``Bot.save_offer_fields`` returns only a boolean and FunPay decorates the
+    preview title with form attributes. Snapshot difference bounds the
+    candidates; only the exact immutable marker in the full descriptions can
+    identify the created bot offer. Concurrent manual offers are never
+    adopted, even if their title and price are identical.
     """
+    requested_token = exact_provenance_token(
+        (requested.desc_ru, requested.desc_en)
+    )
+    if requested_token is None:
+        raise FunPayOfferResolutionError(
+            "A new bot offer requires one exact provenance marker"
+        )
     before_ids = {item.offer_id for item in before}
     new_items = [item for item in after if item.offer_id not in before_ids]
     requested_titles = {
@@ -544,22 +582,38 @@ def _resolve_created_offer_id(
         _normalize_offer_title(requested.title_en),
     }
     requested_titles.discard("")
-    matching = [
-        item
-        for item in new_items
-        if _normalize_offer_title(item.title) in requested_titles
-        and _same_price(item.price, requested.price)
-    ]
+    # Real previews append values such as ``, Без подписки``. Prefix
+    # similarity only prioritizes network reads and never proves ownership.
+    new_items.sort(key=lambda item: not any(
+        _normalize_offer_title(item.title).startswith(title)
+        for title in requested_titles
+    ))
+    matching: list[OfferInfo] = []
+    description_failed = False
+    for item in new_items:
+        try:
+            descriptions = await get_descriptions(item.offer_id)
+        except Exception:
+            description_failed = True
+            continue
+        if descriptions_have_exact_provenance(
+            descriptions,
+            requested_token,
+        ):
+            matching.append(item)
+    # Do not bind while any new candidate is uninspectable: it could be a
+    # second copy of the same bot offer. A bounded outer retry handles normal
+    # eventual consistency and transient form reads.
+    if description_failed:
+        return None
     if len(matching) == 1:
         return matching[0].offer_id
-    raise FunPayOfferResolutionError(
-        "FunPay accepted a new offer but its id could not be resolved uniquely"
-    )
+    if len(matching) > 1:
+        raise FunPayOfferResolutionError(
+            "More than one new FunPay offer carries the requested bot marker"
+        )
+    return None
 
 
 def _normalize_offer_title(value: str | None) -> str:
     return " ".join((value or "").casefold().split())
-
-
-def _same_price(left: float | None, right: float | None) -> bool:
-    return left is not None and right is not None and math.isclose(left, right, abs_tol=0.01)

@@ -16,13 +16,14 @@ from app.integrations.funpay.types import (
 
 
 def _offer_fields(**overrides) -> OfferFieldsDTO:
+    marker = "[FPBOT:0123456789abcdef0123456789abcdef]"
     values = {
         "offer_id": 0,
         "subcategory_id": 55,
         "title_ru": "Target",
         "title_en": "Target",
-        "desc_ru": "",
-        "desc_en": "",
+        "desc_ru": f"Описание\n\n{marker}",
+        "desc_en": f"Description\n\n{marker}",
         "payment_msg_ru": "Заказ принят.",
         "payment_msg_en": "Order accepted.",
         "subscription": OfferSubscriptionOption.WITH_SUBSCRIPTION,
@@ -189,7 +190,7 @@ async def test_engine_07_create_resolves_new_offer_id_from_snapshots():
             SimpleNamespace(offers={10: _preview(10, "Old", 10)}),
             SimpleNamespace(offers={
                 10: _preview(10, "Old", 10),
-                42: _preview(42, "Target", 599),
+                42: _preview(42, "Target, С подпиской", 599),
             }),
         ]),
         get_offer_fields=AsyncMock(return_value=_engine_offer_fields()),
@@ -199,17 +200,18 @@ async def test_engine_07_create_resolves_new_offer_id_from_snapshots():
 
     assert await FunPayChatGateway(bot).save_offer_fields(fields) == 42
     bot.save_offer_fields.assert_awaited_once()
-    bot.get_offer_fields.assert_awaited_once_with(
+    bot.get_offer_fields.assert_any_await(
         subcategory_type=SubcategoryType.OFFERS,
         subcategory_id=55,
     )
+    bot.get_offer_fields.assert_any_await(offer_id=42)
     submitted = bot.save_offer_fields.await_args.args[0].fields_dict
     assert submitted["fields[subscription]"] == "С подпиской"
     assert submitted["fields[type]"] == "Plus"
     assert submitted["fields[summary][ru]"] == "Target"
     assert submitted["fields[summary][en]"] == "Target"
-    assert submitted["fields[desc][ru]"] == ""
-    assert submitted["fields[desc][en]"] == ""
+    assert submitted["fields[desc][ru]"] == fields.desc_ru
+    assert submitted["fields[desc][en]"] == fields.desc_en
     assert submitted["fields[payment_msg][ru]"] == "Заказ принят."
     assert submitted["fields[payment_msg][en]"] == "Order accepted."
     assert submitted["price"] == "599"
@@ -259,25 +261,95 @@ async def test_engine_07_create_rejects_ambiguous_offer_id():
         await FunPayChatGateway(bot).save_offer_fields(fields)
 
 
-async def test_engine_07_create_rejects_unrelated_sole_delta():
+async def test_engine_07_create_never_adopts_manual_lookalike(
+    monkeypatch,
+):
+    import app.integrations.funpay.gateway as gateway_module
+
+    monkeypatch.setattr(
+        gateway_module,
+        "_CREATE_OFFER_RESOLUTION_DELAYS",
+        (0.0, 0.0, 0.0, 0.0),
+    )
     fields = _offer_fields(
         title_ru="Нужный лот",
         title_en="Expected lot",
         price=199,
     )
+    create_fields = _engine_offer_fields()
+
+    async def get_fields(*, offer_id=None, **_kwargs):
+        if offer_id is None:
+            return create_fields
+        return SimpleNamespace(
+            desc_ru="Ручной лот продавца",
+            desc_en="Seller's manual offer",
+        )
+
+    before = SimpleNamespace(offers={})
+    after = SimpleNamespace(offers={
+        77: _preview(77, "Нужный лот, Plus", 199),
+    })
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(
+            side_effect=[before, after, after, after, after],
+        ),
+        get_offer_fields=AsyncMock(side_effect=get_fields),
+        save_offer_fields=AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(FunPayOfferResolutionError):
+        await FunPayChatGateway(bot).save_offer_fields(fields)
+
+
+async def test_engine_07_chooses_marker_over_concurrent_manual_lookalike():
+    fields = _offer_fields()
+    create_fields = _engine_offer_fields()
+
+    async def get_fields(*, offer_id=None, **_kwargs):
+        if offer_id is None:
+            return create_fields
+        if offer_id == 41:
+            return SimpleNamespace(desc_ru="Manual", desc_en="Manual")
+        return SimpleNamespace(desc_ru=fields.desc_ru, desc_en=fields.desc_en)
+
     bot = SimpleNamespace(
         get_my_offers_page=AsyncMock(side_effect=[
             SimpleNamespace(offers={}),
             SimpleNamespace(offers={
-                77: _preview(77, "Unrelated concurrent offer", 1),
+                41: _preview(41, "Target, Plus", 599),
+                42: _preview(42, "Target, Plus", 599),
+            }),
+        ]),
+        get_offer_fields=AsyncMock(side_effect=get_fields),
+        save_offer_fields=AsyncMock(return_value=True),
+    )
+
+    assert await FunPayChatGateway(bot).save_offer_fields(fields) == 42
+
+
+async def test_engine_07_retries_eventually_consistent_offer_list(monkeypatch):
+    import app.integrations.funpay.gateway as gateway_module
+
+    monkeypatch.setattr(
+        gateway_module,
+        "_CREATE_OFFER_RESOLUTION_DELAYS",
+        (0.0, 0.0),
+    )
+    fields = _offer_fields()
+    bot = SimpleNamespace(
+        get_my_offers_page=AsyncMock(side_effect=[
+            SimpleNamespace(offers={}),
+            SimpleNamespace(offers={}),
+            SimpleNamespace(offers={
+                42: _preview(42, "Target, Plus", 599),
             }),
         ]),
         get_offer_fields=AsyncMock(return_value=_engine_offer_fields()),
         save_offer_fields=AsyncMock(return_value=True),
     )
 
-    with pytest.raises(FunPayOfferResolutionError):
-        await FunPayChatGateway(bot).save_offer_fields(fields)
+    assert await FunPayChatGateway(bot).save_offer_fields(fields) == 42
 
 
 async def test_engine_07_false_save_result_is_an_api_error():

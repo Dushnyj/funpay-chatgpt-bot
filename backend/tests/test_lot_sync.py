@@ -178,6 +178,13 @@ async def test_sync_never_adopts_manual_title_price_lookalike(
         price=float(lot.price),
         active=True,
         auto_delivery=False,
+    ), OfferInfo(
+        offer_id=778,
+        subcategory_id=55,
+        title="Unrelated seller offer",
+        price=float(lot.price),
+        active=True,
+        auto_delivery=False,
     )])
     gateway.set_offer_descriptions(
         777,
@@ -195,6 +202,7 @@ async def test_sync_never_adopts_manual_title_price_lookalike(
     assert gateway.saved_offers[funpay_id].desc_ru.endswith(
         provenance_marker(lot.provenance_token)
     )
+    assert gateway.offer_description_calls == [777]
 
 
 async def test_sync_rejects_ambiguous_or_mismatched_recovery_marker(
