@@ -108,21 +108,31 @@ class AccountDeviceAuthManager:
             await session.commit()
         code = await request_device_code()
         now = datetime.now(timezone.utc)
-        account = (
-            await session.execute(
-                select(Account)
-                .where(Account.id == account_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        if account is None:
-            await session.rollback()
-            raise KeyError(account_id)
-        if await account_is_busy(session, account_id):
-            await session.rollback()
-            raise AccountBusyError(account_id)
+        # poll() already serializes Device Auth under the process lock before
+        # it mutates the database. Keep the same lock order here so a retry
+        # cannot hold the account row while a background poll waits to commit.
         async with self._lock:
+            account = (
+                await session.execute(
+                    select(Account)
+                    .where(Account.id == account_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if account is None:
+                await session.rollback()
+                raise KeyError(account_id)
+            if await account_is_busy(session, account_id):
+                await session.rollback()
+                raise AccountBusyError(account_id)
+
+            # A second operator click means "issue a fresh browser code". A
+            # running Device Auth job is owned by this manager, so it can be
+            # superseded safely under the same lock. Other running validation
+            # types remain protected by enqueue_exclusive() and still return a
+            # conflict instead of being raced.
+            await self._supersede_pending_sessions(session, account.id, now)
             job = await self._queue.enqueue_exclusive(
                 session,
                 account.id,
@@ -130,11 +140,6 @@ class AccountDeviceAuthManager:
                 job_type="device_auth",
                 superseded_by="device_auth",
             )
-            for existing in self._sessions.values():
-                if existing.account_id == account.id and existing.status == "pending":
-                    existing.status = "expired"
-                    existing.code = None
-                    self._cancel_background_task(existing.id)
             account.operator_status_override = None
             account.status = "pending_validation"
             session.add(AuditLog(
@@ -156,6 +161,51 @@ class AccountDeviceAuthManager:
             self._sessions[auth_session.id] = auth_session
             self._start_background_task(auth_session)
             return auth_session
+
+    async def _supersede_pending_sessions(
+        self,
+        db: AsyncSession,
+        account_id: int,
+        now: datetime,
+    ) -> None:
+        """Retire manager-owned Device Auth attempts before issuing a new code.
+
+        The manager lock must be held by the caller. Persisting the old job in
+        the same account-row transaction keeps the durable queue and the
+        in-memory code lifecycle in sync.
+        """
+
+        for existing in self._sessions.values():
+            if existing.account_id != account_id or existing.status != "pending":
+                continue
+
+            job = await db.get(AccountCheckJob, existing.job_id)
+            if (
+                job is not None
+                and job.job_type == "device_auth"
+                and job.status in {"pending", "running"}
+            ):
+                job.status = "done"
+                job.result = "superseded:device_auth"
+                job.error = None
+                job.finished_at = now
+                db.add(
+                    AuditLog(
+                        event_type="account_device_auth_restarted",
+                        account_id=account_id,
+                        metadata_={"actor": "admin", "job_id": job.id},
+                    )
+                )
+
+            existing.status = "expired"
+            existing.error_code = "device_auth_restarted"
+            existing.error_detail = (
+                "Предыдущий код отменён: начата новая проверка через браузер."
+            )
+            existing.code = None
+            self._cancel_background_task(existing.id)
+
+        await db.flush()
 
     async def poll(
         self,

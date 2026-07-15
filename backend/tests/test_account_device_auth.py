@@ -3,13 +3,15 @@ import base64
 import json
 from datetime import datetime, timezone
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.integrations.openai.device_auth import DeviceAuthorization, DeviceCode
 from app.integrations.openai.oauth import RefreshedTokens
 from app.models.account import Account, AccountCheckJob
-from app.check_job_queue import CheckJobQueue
+from app.models.audit import AuditLog
+from app.check_job_queue import ActiveJobConflict, CheckJobQueue
 from app.services.account_device_auth import AccountDeviceAuthManager
 
 
@@ -227,6 +229,88 @@ async def test_device_auth_supersedes_pending_full_validation_and_previous_devic
     assert first_job.status == "done"
     assert first_job.result == "superseded:device_auth"
     assert second_job.status == "pending"
+
+
+async def test_device_auth_restart_supersedes_running_manager_owned_job(
+    session: AsyncSession,
+    monkeypatch,
+):
+    account = await _account(session)
+    manager = AccountDeviceAuthManager()
+    counter = 0
+
+    async def fake_request():
+        nonlocal counter
+        counter += 1
+        return DeviceCode(f"device-{counter}", f"CODE-{counter}", 1)
+
+    async def fake_poll(*_args):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.account_device_auth.request_device_code", fake_request
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.poll_device_authorization", fake_poll
+    )
+
+    first = await manager.start(session, account)
+    first.next_poll_at = datetime.now(timezone.utc)
+    await manager.poll(session, account, first.id)
+    first_job = await session.get(AccountCheckJob, first.job_id)
+    assert first_job is not None and first_job.status == "running"
+
+    second = await manager.start(session, account)
+    second_job = await session.get(AccountCheckJob, second.job_id)
+
+    await session.refresh(first_job)
+    assert first.status == "expired"
+    assert first.error_code == "device_auth_restarted"
+    assert first.code is None
+    assert first_job.status == "done"
+    assert first_job.result == "superseded:device_auth"
+    assert second_job is not None and second_job.status == "pending"
+    restart_audit = (
+        await session.execute(
+            select(AuditLog).where(
+                AuditLog.event_type == "account_device_auth_restarted"
+            )
+        )
+    ).scalar_one()
+    assert restart_audit.account_id == account.id
+    assert restart_audit.metadata_ == {"actor": "admin", "job_id": first_job.id}
+
+
+async def test_device_auth_restart_does_not_supersede_another_running_job_type(
+    session: AsyncSession,
+    monkeypatch,
+):
+    account = await _account(session)
+    queue = CheckJobQueue()
+    validation_job = await queue.enqueue(
+        session,
+        account.id,
+        priority="manual",
+        job_type="full_validation",
+    )
+    await queue.mark_running(session, validation_job)
+    await session.commit()
+    manager = AccountDeviceAuthManager()
+
+    async def fake_request():
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    monkeypatch.setattr(
+        "app.services.account_device_auth.request_device_code", fake_request
+    )
+
+    with pytest.raises(ActiveJobConflict) as conflict:
+        await manager.start(session, account)
+
+    assert conflict.value.job_id == validation_job.id
+    assert conflict.value.job_type == "full_validation"
+    await session.refresh(validation_job)
+    assert validation_job.status == "running"
 
 
 async def test_superseded_device_auth_session_cannot_poll(
