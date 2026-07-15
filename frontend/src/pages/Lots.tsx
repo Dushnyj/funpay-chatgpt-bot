@@ -176,7 +176,7 @@ export default function Lots() {
                 const threshold = scope === 'any'
                   ? 'Без гарантии остатка лимита'
                   : scope === 'codex'
-                    ? `Codex: остаток в наблюдаемом окне ≥ ${lot.min_limit_pct ?? '—'}%`
+                    ? `Codex: длинный лимит ≥ ${lot.min_limit_pct ?? '—'}%`
                     : 'Устаревшее условие недоступно'
                 const canToggle = lot.status === 'active' || (lot.status === 'paused' && availability.available)
                 const activationBlockReason = availability.reasons.join('; ')
@@ -290,14 +290,14 @@ function ManualLotDialog({
         <div className="modal__header"><div><span className="eyebrow">Ручная витрина</span><h2 id="manual-lot-title">Новый лот</h2><p>Лот сохранится отдельно от автоматической матрицы цен.</p></div><button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button></div>
         <form className="form-stack" onSubmit={submit}>
           {error && <div className="form-alert form-alert--error" role="alert"><Icon name="warning" /><span>{error}</span></div>}
-          <div className="form-alert form-alert--info"><Icon name="activity" /><span>ANY выдаёт доступ без обещания остатка. CODEX гарантирует минимальный остаток единого измеримого лимита по фактическим окнам OpenAI.</span></div>
+          <div className="form-alert form-alert--info"><Icon name="activity" /><span>ANY выдаёт доступ без обещания остатка. CODEX гарантирует минимум длинного окна: 30 дней для Free, 7 дней для платных тарифов.</span></div>
           <div className="form-grid form-grid--3">
             <label className="field"><span className="field__label">Тариф</span><select data-autofocus value={form.tierId} onChange={(event) => setForm((current) => ({ ...current, tierId: event.target.value }))} required disabled={availableTiers.length === 0}>{availableTiers.length === 0 && <option value="">Нет тарифов, разрешённых к продаже</option>}{availableTiers.map((tier) => <option key={tier.id} value={tier.id}>{tier.name}</option>)}</select></label>
             <label className="field"><span className="field__label">Срок</span><select value={form.durationId} onChange={(event) => setForm((current) => ({ ...current, durationId: event.target.value }))} required disabled={availableDurations.length === 0}>{availableDurations.length === 0 && <option value="">Нет включённых сроков</option>}{availableDurations.map((duration) => <option key={duration.id} value={duration.id}>{formatDurationMinutes(duration.minutes)}</option>)}</select></label>
             <label className="field"><span className="field__label">Условие лимита</span><select value={form.scopeId} onChange={(event) => setForm((current) => ({ ...current, scopeId: event.target.value }))} required disabled={availableScopes.length === 0}>{availableScopes.length === 0 && <option value="">Нет включённых типов лимита</option>}{availableScopes.map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}</select></label>
           </div>
           <div className="form-grid form-grid--3">
-            {selectedScope === 'codex' ? <label className="field"><span className="field__label">Минимальный остаток CODEX</span><div className="number-with-suffix"><input type="number" min="0" max="100" value={form.minLimit} onChange={(event) => setForm((current) => ({ ...current, minLimit: event.target.value }))} required /><span>%</span></div><span className="field__hint">Остаток в наблюдаемом окне OpenAI.</span></label> : <div className="builder-condition-note"><Icon name="check" /><span><strong>Без гарантии остатка</strong><small>Для ANY порог лимита не задаётся.</small></span></div>}
+            {selectedScope === 'codex' ? <label className="field"><span className="field__label">Минимальный остаток CODEX</span><div className="number-with-suffix"><input type="number" min="0" max="100" value={form.minLimit} onChange={(event) => setForm((current) => ({ ...current, minLimit: event.target.value }))} required /><span>%</span></div><span className="field__hint">Длинное окно: 30 дней для Free, 7 дней для платных.</span></label> : <div className="builder-condition-note"><Icon name="check" /><span><strong>Без гарантии остатка</strong><small>Для ANY порог лимита не задаётся.</small></span></div>}
             <label className="field"><span className="field__label">Цена</span><div className="number-with-suffix"><input type="number" min="1" step="1" value={form.price} onChange={(event) => setForm((current) => ({ ...current, price: event.target.value }))} required /><span>₽</span></div></label>
             <label className="field"><span className="field__label">FunPay Node ID</span><input type="number" min="1" value={form.nodeId} onChange={(event) => setForm((current) => ({ ...current, nodeId: event.target.value }))} placeholder="Из настроек" /><span className="field__hint">Можно оставить пустым, если категория задана в настройках.</span></label>
           </div>

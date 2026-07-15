@@ -119,9 +119,16 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
         ),
         70,
         None,
+        False,
     ),
     SubscriptionPlanDefinition(
-        "edu", "Edu", "ChatGPT Edu", _aliases("edu", "education"), 80, None
+        "edu",
+        "Edu",
+        "ChatGPT Edu",
+        _aliases("edu", "education"),
+        80,
+        None,
+        False,
     ),
     SubscriptionPlanDefinition(
         "teachers",
@@ -130,6 +137,7 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
         _aliases("teacher", "teachers"),
         90,
         None,
+        False,
     ),
     SubscriptionPlanDefinition(
         "healthcare",
@@ -138,6 +146,7 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
         _aliases("healthcare", "health care"),
         100,
         None,
+        False,
     ),
     SubscriptionPlanDefinition(
         "clinicians",
@@ -146,6 +155,7 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
         _aliases("clinician", "clinicians"),
         110,
         None,
+        False,
     ),
     SubscriptionPlanDefinition(
         "gov",
@@ -154,6 +164,7 @@ SYSTEM_SUBSCRIPTION_PLANS: tuple[SubscriptionPlanDefinition, ...] = (
         _aliases("gov", "government"),
         120,
         None,
+        False,
     ),
 )
 

@@ -105,7 +105,7 @@ PRE_PREMIUM_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
 }
 
 
-DEFAULT_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
+PRE_REFINED_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
     "default": DefaultLotTemplate(
         key="default",
         name="Основной шаблон лота",
@@ -130,6 +130,60 @@ DEFAULT_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
             "successful Codex allowance reading.\n\n"
             "Sign-in details will arrive in FunPay chat. Sign-in code: !code. "
             "Help: !help."
+        ),
+    )
+}
+
+
+DEFAULT_LOT_TEMPLATES: dict[str, DefaultLotTemplate] = {
+    "default": DefaultLotTemplate(
+        key="default",
+        name="Основной шаблон лота",
+        title_ru="🧊 ChatGPT {plan} · {duration} · {condition} · АВТОВЫДАЧА",
+        title_en="🧊 ChatGPT {plan} · {duration} · {condition} · AUTO DELIVERY",
+        description_ru=(
+            "🧊━━━━━━━━━━━━━━━━━━━━🧊\n"
+            "🛰️ ДОСТУП К CHATGPT {plan}\n"
+            "🧊━━━━━━━━━━━━━━━━━━━━🧊\n\n"
+            "🔹 СРОК И УСЛОВИЯ\n"
+            "• Доступ: {duration}\n"
+            "• Выдача: {condition}\n"
+            "• Формат: автоматическая выдача в чате FunPay\n\n"
+            "📊 ЛИМИТ CODEX\n"
+            "• Проверяемое окно: {long_window_days} дн.\n"
+            "• 30 дней только на Free, 7 дней на платных тарифах.\n"
+            "• Перед выдачей бот проверяет актуальный остаток лимита.\n\n"
+            "🛡️ ПРАВИЛА ДОСТУПА\n"
+            "• Не меняйте пароль и настройки безопасности.\n"
+            "• Не завершайте чужие сеансы и не удаляйте чужие данные.\n"
+            "• При проблеме сначала используйте !помощь, затем !замена.\n\n"
+            "🔑 КОМАНДЫ\n"
+            "• !код — коды для входа\n"
+            "• !подписка — срок доступа и лимит Codex\n"
+            "• !помощь — инструкция\n"
+            "• !продавец — связь с продавцом"
+        ),
+        description_en=(
+            "🧊━━━━━━━━━━━━━━━━━━━━🧊\n"
+            "🛰️ CHATGPT {plan} ACCESS\n"
+            "🧊━━━━━━━━━━━━━━━━━━━━🧊\n\n"
+            "🔹 PERIOD AND TERMS\n"
+            "• Access: {duration}\n"
+            "• Delivery: {condition}\n"
+            "• Format: automatic delivery in FunPay chat\n\n"
+            "📊 CODEX ALLOWANCE\n"
+            "• Verified window: {long_window_days} days\n"
+            "• Free — 30 days; paid plans — 7 days.\n"
+            "• The bot checks the current allowance before delivery.\n\n"
+            "🛡️ ACCESS RULES\n"
+            "• Do not change the password or security settings.\n"
+            "• Do not end other sessions or delete other users' data.\n"
+            "• If there is a problem, use !help first, then !replace.\n\n"
+            "🔑 COMMANDS\n"
+            "• !code — sign-in codes\n"
+            "• !sub — access time and Codex allowance\n"
+            "• !help — instructions\n"
+            "• !seller — contact the seller"
         ),
     )
 }

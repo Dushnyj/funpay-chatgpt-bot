@@ -28,6 +28,9 @@ class TierOut(_Base):
     is_active: bool
     system_managed: bool = True
     is_sellable: bool = False
+    # Read-only technical capability of FunPay's current ChatGPT offer form.
+    # Canonical plans can still be recognized when this capability is false.
+    funpay_supported: bool = False
     sort_order: int = 0
     usage_multiplier: float | None = None
 

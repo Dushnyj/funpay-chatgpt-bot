@@ -41,36 +41,61 @@ export interface CompactUsageWindow {
   resetsAt: string | null
 }
 
+export interface ExpectedCodexUsageSnapshot {
+  planWindowStatus: string | null
+  expectedWindowSeconds: number | null
+  primaryRemainingPct: number | null
+  primaryWindowSeconds: number | null
+  primaryResetsAt: string | null
+  secondaryRemainingPct: number | null
+  secondaryWindowSeconds: number | null
+  secondaryResetsAt: string | null
+}
+
+const SUPPORTED_LONG_WINDOWS = new Set([7 * 86_400, 30 * 86_400])
+
 /**
- * Возвращает единый измеримый лимит Codex. Точные provider-окна
- * primary/secondary имеют приоритет над legacy-полями 5h/weekly, чтобы UI не
- * подписывал 30-дневное окно Free как недельное и не смешивал Codex с Chat.
+ * Возвращает единственный проверенный длинный лимит Codex: 30 дней для Free
+ * или 7 дней для платного тарифа. Позиции provider primary/secondary и legacy
+ * поля 5h/weekly не имеют самостоятельного продуктового смысла.
  */
 export function compactCodexUsage(limits: AccountLimits | null | undefined): CompactUsageWindow[] {
   if (!limits) return []
-  const exactCodex = [
-    usageWindow(
-      'codex-primary',
-      limits.codex_primary_window_seconds,
-      limits.codex_primary_remaining_pct,
-      limits.codex_primary_resets_at,
-    ),
-    usageWindow(
-      'codex-secondary',
-      limits.codex_secondary_window_seconds,
-      limits.codex_secondary_remaining_pct,
-      limits.codex_secondary_resets_at,
-    ),
-  ].filter(isUsageWindow)
+  const selected = selectExpectedCodexUsage({
+    planWindowStatus: limits.plan_window_status,
+    expectedWindowSeconds: limits.expected_long_window_seconds,
+    primaryRemainingPct: limits.codex_primary_remaining_pct,
+    primaryWindowSeconds: limits.codex_primary_window_seconds,
+    primaryResetsAt: limits.codex_primary_resets_at,
+    secondaryRemainingPct: limits.codex_secondary_remaining_pct,
+    secondaryWindowSeconds: limits.codex_secondary_window_seconds,
+    secondaryResetsAt: limits.codex_secondary_resets_at,
+  })
+  return selected ? [selected] : []
+}
 
-  const codex = exactCodex.length > 0
-    ? exactCodex
-    : [
-        usageWindow('codex-5h', 5 * 3_600, limits.codex_5h_remaining_pct, null),
-        usageWindow('codex-7d', 7 * 86_400, limits.codex_weekly_remaining_pct, null),
-      ].filter(isUsageWindow)
-
-  return codex.sort((left, right) => left.windowSeconds - right.windowSeconds || left.key.localeCompare(right.key))
+export function selectExpectedCodexUsage(
+  snapshot: ExpectedCodexUsageSnapshot,
+): CompactUsageWindow | null {
+  const expected = snapshot.expectedWindowSeconds
+  if (snapshot.planWindowStatus !== 'ok' || expected === null || !SUPPORTED_LONG_WINDOWS.has(expected)) {
+    return null
+  }
+  const matching = [
+    {
+      remainingPct: snapshot.primaryRemainingPct,
+      windowSeconds: snapshot.primaryWindowSeconds,
+      resetsAt: snapshot.primaryResetsAt,
+    },
+    {
+      remainingPct: snapshot.secondaryRemainingPct,
+      windowSeconds: snapshot.secondaryWindowSeconds,
+      resetsAt: snapshot.secondaryResetsAt,
+    },
+  ].filter((window) => window.windowSeconds === expected)
+  if (matching.length !== 1) return null
+  const match = matching[0]
+  return usageWindow('codex-long', match.windowSeconds, match.remainingPct, match.resetsAt)
 }
 
 export function formatUsageWindow(seconds: number) {
@@ -107,10 +132,13 @@ function usageWindow(
   remainingPct: number | null,
   resetsAt: string | null,
 ): CompactUsageWindow | null {
-  if (windowSeconds == null || remainingPct == null) return null
+  if (
+    windowSeconds == null
+    || windowSeconds <= 0
+    || remainingPct == null
+    || !Number.isFinite(remainingPct)
+    || remainingPct < 0
+    || remainingPct > 100
+  ) return null
   return { key, windowSeconds, remainingPct, resetsAt }
-}
-
-function isUsageWindow(value: CompactUsageWindow | null): value is CompactUsageWindow {
-  return value !== null
 }

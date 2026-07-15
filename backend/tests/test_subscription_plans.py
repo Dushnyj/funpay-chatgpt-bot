@@ -44,6 +44,12 @@ def test_catalog_contains_every_supported_plan_and_pro_multipliers():
     assert by_code["pro_20x"].usage_multiplier == 20.0
     assert by_code["free"].usage_multiplier is None
     assert by_code["go"].usage_multiplier is None
+    assert {code for code, plan in by_code.items() if plan.is_sellable} == {
+        "free", "go", "plus", "pro_5x", "pro_20x", "business",
+    }
+    assert {code for code, plan in by_code.items() if not plan.is_sellable} == {
+        "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
+    }
 
 
 def test_agreeing_aliases_resolve_with_auditable_evidence():
@@ -76,6 +82,16 @@ def test_conflicting_or_unknown_signal_is_never_sellable():
     assert unknown.code is None
     assert unknown.reason == "unknown_signal"
     assert unknown.is_sellable is False
+
+
+def test_recognized_plan_without_funpay_form_option_is_not_sellable():
+    enterprise = resolve_subscription_plan(
+        (PlanSignal("enterprise", "accounts_check", 0.98),)
+    )
+
+    assert enterprise.code == "enterprise"
+    assert enterprise.reason == "resolved"
+    assert enterprise.is_sellable is False
 
 
 def test_free_contract_is_exactly_thirty_day_long_window():

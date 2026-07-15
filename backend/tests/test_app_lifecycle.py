@@ -1388,7 +1388,165 @@ async def test_public_lot_methods_require_connected_funpay():
     with pytest.raises(FunPayUnavailableError):
         await lifecycle.set_lot_active(1, True)
     with pytest.raises(FunPayUnavailableError):
+        await lifecycle.delete_lot(1)
+    with pytest.raises(FunPayUnavailableError):
         await lifecycle.reconcile_lots()
+
+
+async def test_forced_reconcile_republishes_payment_template_for_bound_lots(
+    session,
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+    from app.integrations.funpay.gateway import FakeChatGateway
+    from app.models.catalog import Duration, LimitScope, SubscriptionTier
+    from app.models.lot import Lot
+    from app.models.message import MessageTemplate
+
+    ru_template = MessageTemplate(
+        key="payment_received",
+        lang="ru",
+        content="Старое сообщение об оплате",
+    )
+    en_template = MessageTemplate(
+        key="payment_received",
+        lang="en",
+        content="Old payment message",
+    )
+    tier = SubscriptionTier(
+        code="plus",
+        name="refresh-tier",
+        is_active=True,
+        is_sellable=True,
+    )
+    duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=1)
+    disabled_duration = Duration(
+        minutes=6 * 24 * 60,
+        is_enabled=False,
+        sort_order=2,
+    )
+    scope = LimitScope(code="any", name="Any refresh", is_enabled=True)
+    session.add_all([
+        ru_template,
+        en_template,
+        tier,
+        duration,
+        disabled_duration,
+        scope,
+    ])
+    await session.flush()
+
+    lots = [
+        Lot(
+            config_key="refresh-auto-active",
+            funpay_id="801",
+            provenance_marker_synced=True,
+            funpay_node_id=55,
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            price=100,
+            title_ru="Auto active",
+            title_en="Auto active",
+            status="active",
+            auto_created=True,
+        ),
+        Lot(
+            config_key="refresh-auto-paused",
+            funpay_id="802",
+            provenance_marker_synced=True,
+            funpay_node_id=55,
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            price=100,
+            title_ru="Auto paused",
+            title_en="Auto paused",
+            status="paused",
+            paused_reason="manual",
+            auto_created=True,
+        ),
+        Lot(
+            config_key="refresh-manual-active",
+            funpay_id="803",
+            provenance_marker_synced=True,
+            funpay_node_id=55,
+            tier_id=tier.id,
+            duration_id=duration.id,
+            limit_scope_id=scope.id,
+            price=100,
+            title_ru="Manual active",
+            title_en="Manual active",
+            status="active",
+            auto_created=False,
+        ),
+        Lot(
+            config_key="refresh-invalid-active",
+            funpay_id="804",
+            provenance_marker_synced=True,
+            funpay_node_id=55,
+            tier_id=tier.id,
+            duration_id=disabled_duration.id,
+            limit_scope_id=scope.id,
+            price=100,
+            title_ru="Invalid active",
+            title_en="Invalid active",
+            status="active",
+            auto_created=False,
+        ),
+    ]
+    session.add_all(lots)
+    await session.commit()
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class TrackingGateway(FakeChatGateway):
+        def __init__(self):
+            super().__init__()
+            self.saved_offer_ids: list[int] = []
+
+        async def save_offer_fields(self, fields):
+            self.saved_offer_ids.append(fields.offer_id)
+            return await super().save_offer_fields(fields)
+
+    monkeypatch.setattr(lifecycle_module, "async_session_factory", lambda: Context())
+    lifecycle = AppLifecycle("", 0)
+    gateway = TrackingGateway()
+    lifecycle._gateway = gateway
+
+    await lifecycle.reconcile_lots(refresh_published=True)
+    assert set(gateway.saved_offers) == {801, 802, 803, 804}
+    assert all(item > 0 for item in gateway.saved_offer_ids)
+    assert gateway.saved_offers[801].active is True
+    assert gateway.saved_offers[802].active is False
+    assert gateway.saved_offers[803].active is True
+    # Catalog-invalid offers are made safe before their content is refreshed.
+    assert gateway.saved_offers[804].active is False
+
+    ru_template.content = "Новое точное сообщение об оплате"
+    en_template.content = "New precise payment message"
+    await session.commit()
+    gateway.saved_offer_ids.clear()
+
+    await lifecycle.reconcile_lots(refresh_published=True)
+
+    assert set(gateway.saved_offers) == {801, 802, 803, 804}
+    assert gateway.deleted_offers == []
+    assert gateway.saved_offer_ids == [801, 802, 803, 804]
+    assert all(
+        fields.payment_msg_ru == "Новое точное сообщение об оплате"
+        and fields.payment_msg_en == "New precise payment message"
+        for fields in gateway.saved_offers.values()
+    )
+    assert lots[0].status == "active"
+    assert lots[1].status == "paused"
+    assert lots[2].status == "active"
+    assert lots[3].status == "paused"
 
 
 async def test_sync_manual_lot_uses_runtime_gateway_and_separate_session(

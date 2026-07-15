@@ -29,6 +29,7 @@ import type {
 import {
   compareDurationsByMinutes,
   formatDurationMinutes,
+  tierSaleControl,
   validateDurationInput,
   type DurationInputMode,
 } from '../utils/catalogEditor'
@@ -100,9 +101,10 @@ function TiersTab() {
         <TableShell><table className="data-table tier-catalog-table"><thead><tr><th>Тариф</th><th>Описание</th><th>Коэффициент</th><th>Активность</th><th>Продажа</th></tr></thead><tbody>{tiers.map((tier) => {
           const tierName = displayTierName(tier)
           const pending = updatingTier?.id === tier.id
+          const saleControl = tierSaleControl(tier)
           return (
             <tr key={tier.id}>
-              <td data-label="Тариф"><div className="identity-cell"><span className="identity-avatar identity-avatar--violet">{tierName.slice(0, 1).toUpperCase()}</span><span><strong>{tierName}</strong><small title={`Системный код: ${tier.code ?? `system-${tier.id}`}`}>Системный тариф</small></span></div></td>
+              <td data-label="Тариф"><div className="identity-cell"><span className="identity-avatar identity-avatar--violet">{tierName.slice(0, 1).toUpperCase()}</span><span><strong>{tierName}</strong><small title={`Системный код: ${tier.code ?? `system-${tier.id}`}`}>{tier.funpay_supported ? 'Системный тариф' : 'Распознаётся · не публикуется'}</small></span></div></td>
               <td data-label="Описание">{displayTierDescription(tier)}</td>
               <td data-label="Коэффициент">{tier.usage_multiplier == null ? '—' : `×${tier.usage_multiplier}`}</td>
               <td data-label="Активность">
@@ -122,16 +124,16 @@ function TiersTab() {
                 </label>
               </td>
               <td data-label="Продажа">
-                <label className="switch-control">
+                <label className="switch-control" title={tier.funpay_supported ? undefined : 'В форме FunPay нет отдельного типа для этого тарифа'}>
                   <input
                     type="checkbox"
                     aria-label={`Продажа тарифа ${tierName}`}
-                    checked={tier.is_sellable ?? tier.is_active}
-                    onChange={() => updateTierState(tier, 'sellable', { is_sellable: !(tier.is_sellable ?? tier.is_active) })}
-                    disabled={pending || !tier.is_active}
+                    checked={saleControl.checked}
+                    onChange={() => updateTierState(tier, 'sellable', { is_sellable: !saleControl.checked })}
+                    disabled={pending || saleControl.disabled}
                   />
                   <span aria-hidden="true" />
-                  <strong>{(tier.is_sellable ?? tier.is_active) ? 'Разрешена' : 'Запрещена'}</strong>
+                  <strong>{saleControl.label}</strong>
                 </label>
               </td>
             </tr>

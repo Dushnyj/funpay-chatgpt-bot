@@ -130,6 +130,8 @@ def test_usage_variables_render_observed_free_30_day_window():
     limits = AccountLimits(
         account_id=1,
         refresh_token_encrypted="token",
+        plan_window_status="ok",
+        expected_long_window_seconds=30 * 86_400,
         codex_primary_remaining_pct=95,
         codex_primary_window_seconds=30 * 86_400,
         codex_primary_resets_at=datetime(2026, 8, 12, 10, 30, tzinfo=timezone.utc),
@@ -141,7 +143,7 @@ def test_usage_variables_render_observed_free_30_day_window():
     assert values["codex_primary_window"] == "30 дн."
     assert values["codex_primary_reset"] == "12.08.2026 10:30 UTC"
     assert values["codex_usage_summary"] == (
-        "Основное окно: 95% · 30 дн.; сброс 12.08.2026 10:30 UTC"
+        "30 дн. — 95%, сброс 12.08.2026 10:30 UTC"
     )
 
 
@@ -149,6 +151,8 @@ def test_usage_variables_render_observed_paid_7_day_window():
     limits = AccountLimits(
         account_id=1,
         refresh_token_encrypted="token",
+        plan_window_status="ok",
+        expected_long_window_seconds=7 * 86_400,
         codex_primary_remaining_pct=73,
         codex_primary_window_seconds=7 * 86_400,
         codex_primary_resets_at=datetime(2026, 7, 20, 9, 0, tzinfo=timezone.utc),
@@ -160,14 +164,16 @@ def test_usage_variables_render_observed_paid_7_day_window():
     assert values["codex_primary_window"] == "7 days"
     assert values["codex_primary_reset"] == "2026-07-20 09:00 UTC"
     assert values["codex_usage_summary"] == (
-        "Primary window: 73% · 7 days; resets 2026-07-20 09:00 UTC"
+        "7 days — 73%, resets 2026-07-20 09:00 UTC"
     )
 
 
-def test_usage_summary_includes_secondary_window_only_when_observed():
+def test_usage_summary_selects_expected_long_window_by_duration():
     limits = AccountLimits(
         account_id=1,
         refresh_token_encrypted="token",
+        plan_window_status="ok",
+        expected_long_window_seconds=7 * 86_400,
         codex_primary_remaining_pct=84,
         codex_primary_window_seconds=5 * 3_600,
         codex_primary_resets_at=datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc),
@@ -178,16 +184,61 @@ def test_usage_summary_includes_secondary_window_only_when_observed():
 
     summary = usage_template_variables(limits, lang="ru")["codex_usage_summary"]
 
-    assert summary.splitlines() == [
-        "Основное окно: 84% · 5 ч; сброс 14.07.2026 12:00 UTC",
-        "Дополнительное окно: 61% · 7 дн.; сброс 20.07.2026 09:00 UTC",
-    ]
+    assert summary == "7 дн. — 61%, сброс 20.07.2026 09:00 UTC"
+    assert "84%" not in summary
+    assert "5 ч" not in summary
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("mismatch", 7 * 86_400),
+        ("unknown", 7 * 86_400),
+        ("ok", 30 * 86_400),
+        ("ok", None),
+    ],
+)
+def test_usage_summary_fails_closed_without_verified_expected_window(
+    status,
+    expected,
+):
+    limits = AccountLimits(
+        account_id=1,
+        refresh_token_encrypted="token",
+        plan_window_status=status,
+        expected_long_window_seconds=expected,
+        codex_primary_remaining_pct=84,
+        codex_primary_window_seconds=7 * 86_400,
+    )
+
+    assert usage_template_variables(limits, lang="ru")["codex_usage_summary"] == (
+        "Данные пока недоступны."
+    )
+
+
+def test_usage_summary_fails_closed_on_ambiguous_duplicate_long_window():
+    limits = AccountLimits(
+        account_id=1,
+        refresh_token_encrypted="token",
+        plan_window_status="ok",
+        expected_long_window_seconds=7 * 86_400,
+        codex_primary_remaining_pct=84,
+        codex_primary_window_seconds=7 * 86_400,
+        codex_secondary_remaining_pct=61,
+        codex_secondary_window_seconds=7 * 86_400,
+    )
+
+    assert usage_template_variables(limits, lang="en")["codex_usage_summary"] == (
+        "Data is currently unavailable."
+    )
 
 
 def test_default_message_catalog_is_localized_and_contract_safe():
     assert set(DEFAULT_MESSAGE_TEMPLATES) == set(TEMPLATE_FIELDS_BY_KEY)
 
-    banned_decoration = set("✅❌⚠⏳🔑📧📊📱🔄📢📖🙏⏰┌┐└┘─│╔╗╚╝║═")
+    # Marketplace copy may use a restrained icon vocabulary, but the legacy
+    # pseudo-table frames were fragile on mobile and must not return.
+    banned_decoration = set("┌┐└┘─│╔╗╚╝║═")
     for key, translations in DEFAULT_MESSAGE_TEMPLATES.items():
         assert set(translations) == {"ru", "en"}
         ru_fields = validate_template_content(key, "ru", translations["ru"])
@@ -195,6 +246,8 @@ def test_default_message_catalog_is_localized_and_contract_safe():
         assert ru_fields == en_fields, key
         assert not banned_decoration.intersection(translations["ru"]), key
         assert not banned_decoration.intersection(translations["en"]), key
+        assert len(translations["ru"]) <= 4_000, key
+        assert len(translations["en"]) <= 4_000, key
 
 
 def test_default_usage_copy_describes_one_shared_codex_allowance():

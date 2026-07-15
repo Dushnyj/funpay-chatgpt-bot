@@ -93,14 +93,10 @@ async def validate_offer_configurations(
             raise OfferConfigurationError(
                 f"Price row {index}: any scope cannot promise a minimum limit"
             )
-        if (
-            scope.code == "any"
-            and tier.code == "free"
-            and item.max_5h_pct is not None
-        ):
+        if item.max_5h_pct is not None:
             raise OfferConfigurationError(
-                f"Price row {index}: Free has no observed 5-hour window; "
-                "clear max_5h_pct"
+                f"Price row {index}: the 5-hour condition is legacy-only; "
+                "clear max_5h_pct and use the verified long Codex window"
             )
         if scope.code == "codex":
             if item.min_limit_pct is None:

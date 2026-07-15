@@ -12,6 +12,7 @@ class _Lifecycle:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.synced: list[tuple[int, bool]] = []
+        self.deleted: list[int] = []
 
     async def sync_manual_lot(self, lot_id: int, active: bool = True):
         lot = await self.session.get(Lot, lot_id)
@@ -31,6 +32,13 @@ class _Lifecycle:
 
     async def reconcile_lots(self):
         return []
+
+    async def delete_lot(self, lot_id: int):
+        lot = await self.session.get(Lot, lot_id)
+        lot.status = "deleted"
+        lot.paused_reason = "manual_deleted"
+        await self.session.commit()
+        self.deleted.append(lot_id)
 
 
 @pytest.fixture
@@ -213,7 +221,45 @@ async def test_delete_lot(auth_client: AsyncClient, session: AsyncSession):
     assert resp.status_code == 204
     lot = await session.get(Lot, lot_id)
     assert lot.status == "deleted"
-    assert lifecycle.synced[-1] == (lot_id, False)
+    assert lifecycle.deleted == [lot_id]
+    assert lifecycle.synced == [(lot_id, True)]
+
+
+async def test_delete_lot_keeps_local_state_when_remote_delete_fails(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    class _RejectingLifecycle(_Lifecycle):
+        async def delete_lot(self, lot_id: int):
+            raise RuntimeError("remote deletion was not verified")
+
+    tier, duration, scope = await _seed_catalog(session)
+    tier.is_sellable = True
+    lot = Lot(
+        funpay_node_id=55,
+        tier_id=tier.id,
+        duration_id=duration.id,
+        limit_scope_id=scope.id,
+        price=599,
+        title_ru="Т",
+        title_en="T",
+        status="active",
+        auto_created=False,
+        funpay_id="700",
+    )
+    session.add(lot)
+    await session.commit()
+    lifecycle = _RejectingLifecycle(session)
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.delete(f"/api/lots/{lot.id}")
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 502
+    await session.refresh(lot)
+    assert lot.status == "active"
+    assert lifecycle.deleted == []
 
 
 async def test_pause_and_reactivate_lot_are_synchronized(

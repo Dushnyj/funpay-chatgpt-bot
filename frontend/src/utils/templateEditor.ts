@@ -6,10 +6,21 @@ export const DEPRECATED_LIMIT_TEMPLATE_FIELDS: ReadonlySet<string> = new Set([
   'chat_weekly',
   'codex_5h',
   'codex_weekly',
+  'codex_primary_limit',
+  'codex_primary_window',
+  'codex_primary_reset',
+  'codex_secondary_limit',
+  'codex_secondary_window',
+  'codex_secondary_reset',
 ])
+export const DEPRECATED_LOT_LIMIT_TEMPLATE_FIELDS: ReadonlySet<string> = new Set(['short_limit'])
 export const DEPRECATED_MESSAGE_TEMPLATE_FIELDS: ReadonlySet<string> = new Set([
   ...DEPRECATED_DURATION_TEMPLATE_FIELDS,
   ...DEPRECATED_LIMIT_TEMPLATE_FIELDS,
+])
+export const DEPRECATED_LOT_TEMPLATE_FIELDS: ReadonlySet<string> = new Set([
+  ...DEPRECATED_DURATION_TEMPLATE_FIELDS,
+  ...DEPRECATED_LOT_LIMIT_TEMPLATE_FIELDS,
 ])
 
 export function classifyTemplateFields(

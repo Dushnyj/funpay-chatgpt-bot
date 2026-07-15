@@ -13,6 +13,7 @@ from app.models.rental import Rental
 
 
 SUPPORTED_TEMPLATE_LANGS = frozenset({"ru", "en"})
+_SUPPORTED_LONG_WINDOWS = frozenset({7 * 86_400, 30 * 86_400})
 
 _USAGE_FIELDS = frozenset(
     {
@@ -42,6 +43,7 @@ _DEPRECATED_CHAT_TEMPLATE_FIELDS = frozenset({"chat_5h", "chat_weekly"})
 _USAGE_TEMPLATE_KEYS = frozenset({"welcome", "subscription", "replace_success"})
 
 TEMPLATE_FIELDS_BY_KEY: dict[str, frozenset[str]] = {
+    "payment_received": frozenset(),
     "welcome": frozenset(
         {
             "login",
@@ -264,6 +266,12 @@ def usage_template_variables(
             limits.codex_secondary_resets_at if limits else None, lang
         ),
         "codex_usage_summary": _format_usage_summary(
+            plan_window_status=(
+                limits.plan_window_status if limits else None
+            ),
+            expected_window=(
+                limits.expected_long_window_seconds if limits else None
+            ),
             primary_remaining=(
                 limits.codex_primary_remaining_pct if limits else None
             ),
@@ -320,6 +328,8 @@ def issued_usage_template_variables(
             rental.issued_codex_secondary_resets_at, lang
         ),
         "codex_usage_summary": _format_usage_summary(
+            plan_window_status=rental.issued_plan_window_status,
+            expected_window=rental.issued_expected_long_window_seconds,
             primary_remaining=rental.issued_codex_primary_pct,
             primary_window=rental.issued_codex_primary_window_seconds,
             primary_reset=rental.issued_codex_primary_resets_at,
@@ -378,6 +388,8 @@ def _format_reset(value: datetime | None, lang: str) -> str:
 
 def _format_usage_summary(
     *,
+    plan_window_status: str | None,
+    expected_window: int | None,
     primary_remaining: int | None,
     primary_window: int | None,
     primary_reset: datetime | None,
@@ -386,40 +398,54 @@ def _format_usage_summary(
     secondary_reset: datetime | None,
     lang: str,
 ) -> str:
-    """Render only the OpenAI usage windows that were actually observed."""
+    """Render the one verified plan-specific long Codex observation."""
 
-    windows = (
-        (
-            "Основное окно" if lang != "en" else "Primary window",
-            primary_remaining,
-            primary_window,
-            primary_reset,
-        ),
-        (
-            "Дополнительное окно" if lang != "en" else "Secondary window",
-            secondary_remaining,
-            secondary_window,
-            secondary_reset,
+    selected = _select_long_usage_window(
+        plan_window_status=plan_window_status,
+        expected_window=expected_window,
+        observations=(
+            (primary_remaining, primary_window, primary_reset),
+            (secondary_remaining, secondary_window, secondary_reset),
         ),
     )
-    lines: list[str] = []
-    for label, remaining, window, reset in windows:
-        if remaining is None and not window and reset is None:
-            continue
-        limit_text = _exact_percentage(remaining)
-        window_text = _format_window(window, lang)
-        reset_text = _format_reset(reset, lang)
-        reset_label = "resets" if lang == "en" else "сброс"
-        lines.append(
-            f"{label}: {limit_text} · {window_text}; {reset_label} {reset_text}"
+    if selected is None:
+        return (
+            "Data is currently unavailable."
+            if lang == "en"
+            else "Данные пока недоступны."
         )
-    if lines:
-        return "\n".join(lines)
-    return (
-        "Data is currently unavailable."
-        if lang == "en"
-        else "Данные пока недоступны."
-    )
+
+    remaining, window, reset = selected
+    summary = f"{_format_window(window, lang)} — {_exact_percentage(remaining)}"
+    if reset is None:
+        return summary
+    reset_label = "resets" if lang == "en" else "сброс"
+    return f"{summary}, {reset_label} {_format_reset(reset, lang)}"
+
+
+def _select_long_usage_window(
+    *,
+    plan_window_status: str | None,
+    expected_window: int | None,
+    observations: tuple[
+        tuple[int | None, int | None, datetime | None],
+        tuple[int | None, int | None, datetime | None],
+    ],
+) -> tuple[int, int, datetime | None] | None:
+    """Select one exact 7/30-day observation, failing closed on ambiguity."""
+
+    if (
+        plan_window_status != "ok"
+        or expected_window not in _SUPPORTED_LONG_WINDOWS
+    ):
+        return None
+    matching = [item for item in observations if item[1] == expected_window]
+    if len(matching) != 1:
+        return None
+    remaining, window, reset = matching[0]
+    if remaining is None or not 0 <= remaining <= 100 or window is None:
+        return None
+    return remaining, window, reset
 
 
 async def _find_template(session: AsyncSession, key: str, lang: str) -> MessageTemplate:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account, AccountCheckJob, AccountLimits
@@ -13,8 +13,7 @@ from app.services.account_occupancy import account_is_busy
 from app.services.delivery_policy import DELIVERY_ALLOCATION_HEADROOM
 from app.services.limit_eligibility import (
     apply_limit_scope_filters,
-    observed_codex_primary,
-    observed_codex_secondary,
+    observed_codex_long,
 )
 from app.services.subscription_eligibility import (
     trusted_paid_subscription_expiry,
@@ -54,8 +53,8 @@ class AccountPool:
 
     base_filter: status=active, tier, подписка >= duration, лимиты свежие, refresh ok,
                  активных аренд < эффективного лимита.
-    scope=any: optional ceilings apply to measured agentic windows. FIFO by expiry.
-    scope=codex: every observed agentic window must meet the guarantee.
+    scope=any: optional ceiling applies to the verified long Codex window.
+    scope=codex: the verified long Codex window must meet the guarantee.
     """
 
     async def acquire(
@@ -159,12 +158,7 @@ class AccountPool:
         if criteria.scope == "any":
             stmt = stmt.order_by(Account.subscription_expires_at.asc())
         else:  # codex (unknown scopes were made unsellable above)
-            stmt = stmt.order_by(
-                _lower_optional_limit(
-                    observed_codex_primary(),
-                    observed_codex_secondary(),
-                ).desc()
-            )
+            stmt = stmt.order_by(observed_codex_long().desc())
 
         # The row lock is held by the caller's transaction until it creates the
         # Rental and commits. Concurrent workers skip the selected account
@@ -211,15 +205,6 @@ class AccountPool:
             default_max_active_rentals,
             exclude_account_id=exclude_account_id,
         )
-
-
-def _lower_optional_limit(primary, secondary):
-    """Minimum of observed Codex windows, allowing absent secondary data."""
-    return case(
-        (secondary.is_(None), primary),
-        (primary <= secondary, primary),
-        else_=secondary,
-    )
 
 
 async def _has_fresh_allocation_conflict(

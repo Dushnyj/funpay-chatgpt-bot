@@ -7,11 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.integrations.funpay.exceptions import FunPayOfferResolutionError
 from app.integrations.funpay.gateway import FakeChatGateway
+from app.integrations.funpay.provenance import public_provenance_code
 from app.integrations.funpay.types import OfferInfo
 from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.audit import AuditLog
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.lot import Lot, LotTemplate, PriceMatrix
+from app.models.message import MessageTemplate
 from app.models.rental import Order, Rental
 from app.services.lot_auto_manager import (
     LotAutoManager,
@@ -72,6 +74,18 @@ async def test_marker_startup_barrier_isolates_lot_failures(
 
 
 async def _seed_catalog(session: AsyncSession):
+    session.add_all([
+        MessageTemplate(
+            key="payment_received",
+            lang="ru",
+            content="✅ Оплата получена. Данные придут в этот чат.",
+        ),
+        MessageTemplate(
+            key="payment_received",
+            lang="en",
+            content="✅ Payment received. Access details will arrive here.",
+        ),
+    ])
     tier = SubscriptionTier(
         code="plus", name="Plus", is_active=True, is_sellable=True,
     )
@@ -90,7 +104,7 @@ async def _add_account_with_limits(
     n: int = 1,
     *,
     expires_in_days: int | None = 30,
-    codex_primary: int | None = None,
+    codex_primary: int | None = 50,
     codex_window_seconds: int | None = None,
 ):
     tier = await session.get(SubscriptionTier, tier_id)
@@ -110,17 +124,22 @@ async def _add_account_with_limits(
     )
     session.add(acc)
     await session.flush()
+    expected_long_window = (
+        30 * 24 * 60 * 60 if tier.code == "free" else 7 * 24 * 60 * 60
+    )
     session.add(AccountLimits(
         account_id=acc.id, refresh_token_encrypted="enc",
         codex_5h_remaining_pct=60, codex_weekly_remaining_pct=50,
         codex_primary_remaining_pct=codex_primary,
-        codex_primary_window_seconds=codex_window_seconds,
+        codex_primary_window_seconds=(
+            codex_window_seconds
+            if codex_window_seconds is not None
+            else expected_long_window
+        ),
         measured_at=datetime.now(timezone.utc), refresh_status="ok",
         plan_type=tier.code or "plus",
         plan_window_status="ok",
-        expected_long_window_seconds=(
-            30 * 24 * 60 * 60 if tier.code == "free" else 7 * 24 * 60 * 60
-        ),
+        expected_long_window_seconds=expected_long_window,
     ))
     await session.flush()
     return acc
@@ -363,7 +382,7 @@ async def test_remote_save_resolution_failure_recovers_same_inactive_offer(
     assert pending.paused_reason == "auto_publish_pending"
     offer_id = _expose_saved_offer(gateway)
     assert gateway.saved_offers[offer_id].active is False
-    assert token in gateway.saved_offers[offer_id].desc_ru
+    assert public_provenance_code(token) in gateway.saved_offers[offer_id].desc_ru
 
     gateway.fail_resolution = False
     actions = await manager.run(session, gateway)
@@ -1115,7 +1134,7 @@ async def test_codex_capacity_uses_exact_plan_window(
     lot = (await session.execute(select(Lot))).scalar_one()
     assert f"Codex ≥ {matrix.min_limit_pct}%" in lot.title_ru
     assert "30 дней только на Free, 7 дней на платных" in lot.description_ru
-    assert "последнюю успешную проверку остатка лимита Codex" in (
+    assert "Перед выдачей бот проверяет актуальный остаток лимита" in (
         lot.description_ru
     )
 
@@ -1134,12 +1153,12 @@ async def test_codex_capacity_uses_exact_plan_window(
     [
         ("free", 80, 30 * 24 * 60 * 60, None, None, None, 90, True),
         ("free", 80, 30 * 24 * 60 * 60, None, None, None, 70, False),
-        ("free", 80, 30 * 24 * 60 * 60, None, None, 30, 90, False),
+        ("free", 80, 30 * 24 * 60 * 60, None, None, 30, 90, True),
         ("plus", 20, 5 * 60 * 60, 80, 7 * 24 * 60 * 60, 30, 90, True),
-        ("plus", 20, 5 * 60 * 60, 80, 7 * 24 * 60 * 60, 10, 90, False),
+        ("plus", 20, 5 * 60 * 60, 80, 7 * 24 * 60 * 60, 10, 90, True),
     ],
 )
-async def test_any_capacity_ceilings_follow_short_and_long_semantics(
+async def test_any_capacity_uses_only_verified_long_window(
     session: AsyncSession,
     tier_code: str,
     primary_pct: int,
@@ -1184,3 +1203,8 @@ async def test_any_capacity_ceilings_follow_short_and_long_semantics(
     actions = await LotAutoManager(55).run(session, FakeChatGateway())
 
     assert any(action.action == "create" for action in actions) is has_capacity
+    if has_capacity and max_5h is not None:
+        lot = (await session.execute(select(Lot))).scalar_one()
+        assert lot.max_5h_pct is None
+        assert f"≤ {max_5h}%" not in lot.title_ru
+        assert f"≤ {max_5h}%" not in lot.description_ru

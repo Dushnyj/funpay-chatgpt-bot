@@ -20,8 +20,22 @@ from app.api.schemas import (
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.lot import Lot, PriceMatrix
 from app.models.rental import Order, Rental
+from app.services.funpay_offer_mapping import SUPPORTED_FUNPAY_TIER_CODES
 
 router = APIRouter(prefix="/api", tags=["catalog"], dependencies=[Depends(get_current_user)])
+
+
+def _tier_out(tier: SubscriptionTier) -> TierOut:
+    funpay_supported = (tier.code or "") in SUPPORTED_FUNPAY_TIER_CODES
+    result = TierOut.model_validate(tier)
+    return result.model_copy(
+        update={
+            "funpay_supported": funpay_supported,
+            # Never advertise an impossible sale state if a stale or manually
+            # edited database row has not been normalized yet.
+            "is_sellable": result.is_sellable if funpay_supported else False,
+        }
+    )
 
 
 @router.get("/tiers", response_model=list[TierOut])
@@ -29,7 +43,7 @@ async def list_tiers(session: AsyncSession = Depends(get_db_session)):
     result = await session.execute(
         select(SubscriptionTier).order_by(SubscriptionTier.sort_order, SubscriptionTier.id)
     )
-    return result.scalars().all()
+    return [_tier_out(tier) for tier in result.scalars().all()]
 
 
 @router.post("/tiers", response_model=TierOut, status_code=201)
@@ -51,6 +65,15 @@ async def update_tier(
     if tier is None:
         raise HTTPException(status_code=404, detail="Tier not found")
     changes = req.model_dump(exclude_unset=True)
+    funpay_supported = (tier.code or "") in SUPPORTED_FUNPAY_TIER_CODES
+    if changes.get("is_sellable") is True and not funpay_supported:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The tier is recognized, but cannot be represented by "
+                "FunPay's ChatGPT offer form"
+            ),
+        )
     if changes.get("is_sellable") is True and not changes.get(
         "is_active", tier.is_active
     ):
@@ -59,6 +82,10 @@ async def update_tier(
             detail="An inactive tier cannot be enabled for sale",
         )
     if changes.get("is_active") is False:
+        changes["is_sellable"] = False
+    if not funpay_supported:
+        # Defence in depth for databases that have not applied the data
+        # normalization migration or were edited outside the application.
         changes["is_sellable"] = False
     for field, value in changes.items():
         setattr(tier, field, value)
@@ -77,7 +104,7 @@ async def update_tier(
                 status_code=502,
                 detail="Tier saved, but FunPay reconciliation failed",
             ) from exc
-    return tier
+    return _tier_out(tier)
 
 
 @router.delete("/tiers/{tier_id}", status_code=204)

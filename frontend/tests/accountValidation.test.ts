@@ -107,7 +107,7 @@ test('compact usage keeps the exact 30-day Free window instead of relabelling it
   })
 
   assert.deepEqual(usage, [{
-    key: 'codex-primary',
+    key: 'codex-long',
     windowSeconds: 30 * 86_400,
     remainingPct: 95,
     resetsAt: '2026-08-12T10:30:00Z',
@@ -115,7 +115,7 @@ test('compact usage keeps the exact 30-day Free window instead of relabelling it
   assert.equal(formatUsageWindow(usage[0].windowSeconds), '30 дней')
 })
 
-test('compact usage shows every exact provider window for paid Codex', () => {
+test('compact usage selects only the paid seven-day window by duration', () => {
   const usage = compactCodexUsage({
     account_id: 2,
     plan_window_status: 'ok',
@@ -133,12 +133,11 @@ test('compact usage shows every exact provider window for paid Codex', () => {
   })
 
   assert.deepEqual(usage.map((item) => [formatUsageWindow(item.windowSeconds), item.remainingPct]), [
-    ['5 ч', 79],
     ['7 дней', 66],
   ])
 })
 
-test('compact usage falls back to legacy Codex windows when exact provider windows are absent', () => {
+test('compact usage never falls back to legacy Codex aliases', () => {
   const usage = compactCodexUsage({
     account_id: 3,
     plan_window_status: 'ok',
@@ -155,10 +154,47 @@ test('compact usage falls back to legacy Codex windows when exact provider windo
     measured_at: '2026-07-13T10:30:00Z',
   })
 
-  assert.deepEqual(usage.map((item) => [formatUsageWindow(item.windowSeconds), item.remainingPct]), [
-    ['5 ч', 88],
-    ['7 дней', 71],
-  ])
+  assert.deepEqual(usage, [])
+})
+
+test('compact usage fails closed on a mismatched plan contract', () => {
+  const usage = compactCodexUsage({
+    account_id: 4,
+    plan_window_status: 'mismatch',
+    expected_long_window_seconds: 7 * 86_400,
+    codex_5h_remaining_pct: null,
+    codex_weekly_remaining_pct: 71,
+    codex_primary_remaining_pct: 71,
+    codex_primary_window_seconds: 7 * 86_400,
+    codex_primary_resets_at: '2026-07-20T10:30:00Z',
+    codex_secondary_remaining_pct: null,
+    codex_secondary_window_seconds: null,
+    codex_secondary_resets_at: null,
+    refresh_status: 'ok',
+    measured_at: '2026-07-13T10:30:00Z',
+  })
+
+  assert.deepEqual(usage, [])
+})
+
+test('compact usage fails closed when both provider positions claim the long window', () => {
+  const usage = compactCodexUsage({
+    account_id: 5,
+    plan_window_status: 'ok',
+    expected_long_window_seconds: 7 * 86_400,
+    codex_5h_remaining_pct: null,
+    codex_weekly_remaining_pct: 71,
+    codex_primary_remaining_pct: 71,
+    codex_primary_window_seconds: 7 * 86_400,
+    codex_primary_resets_at: '2026-07-20T10:30:00Z',
+    codex_secondary_remaining_pct: 70,
+    codex_secondary_window_seconds: 7 * 86_400,
+    codex_secondary_resets_at: '2026-07-20T10:30:00Z',
+    refresh_status: 'ok',
+    measured_at: '2026-07-13T10:30:00Z',
+  })
+
+  assert.deepEqual(usage, [])
 })
 
 test('rental capacity always uses the safe single-renter maximum', () => {

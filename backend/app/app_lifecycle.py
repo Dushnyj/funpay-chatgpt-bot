@@ -693,7 +693,12 @@ class AppLifecycle:
             # guard above and lock acquisition.
             return
 
-    async def reconcile_lots(self, *, refresh_stock: bool = False) -> list:
+    async def reconcile_lots(
+        self,
+        *,
+        refresh_stock: bool = False,
+        refresh_published: bool = False,
+    ) -> list:
         """Immediately reconcile local price/capacity state with FunPay."""
         async with self._funpay_lock:
             gateway = self._require_gateway()
@@ -708,6 +713,7 @@ class AppLifecycle:
                     session,
                     gateway,
                     refresh_stock=refresh_stock,
+                    refresh_published=refresh_published,
                 )
                 await session.commit()
                 return actions
@@ -748,6 +754,19 @@ class AppLifecycle:
                     lot = await session.get(Lot, lot_id)
                     if lot is not None:
                         lot.paused_reason = "manual"
+                await session.commit()
+
+    async def delete_lot(self, lot_id: int) -> None:
+        """Permanently delete a published bot-owned offer from FunPay."""
+
+        async with self._funpay_lock:
+            gateway = self._require_gateway()
+            async with async_session_factory() as session:
+                await self._lot_sync.delete_lot(
+                    session,
+                    gateway,
+                    lot_id,
+                )
                 await session.commit()
 
     def _require_gateway(self):

@@ -1,5 +1,17 @@
 type OrderedDuration = { id: number; minutes: number }
 
+type TierSaleInput = {
+  is_active: boolean
+  is_sellable?: boolean
+  funpay_supported: boolean
+}
+
+export type TierSaleControl = {
+  checked: boolean
+  disabled: boolean
+  label: string
+}
+
 export type DurationInputMode = 'minutes' | 'hours' | 'days'
 
 export type DurationMinutesValidation = {
@@ -8,6 +20,22 @@ export type DurationMinutesValidation = {
 }
 
 const MAX_DURATION_MINUTES = 30 * 24 * 60
+
+export function tierSaleControl(tier: TierSaleInput): TierSaleControl {
+  if (!tier.funpay_supported) {
+    return {
+      checked: false,
+      disabled: true,
+      label: 'Не поддерживается FunPay',
+    }
+  }
+  const checked = tier.is_sellable === true
+  return {
+    checked,
+    disabled: !tier.is_active,
+    label: checked ? 'Разрешена' : 'Запрещена',
+  }
+}
 
 export function compareDurationsByMinutes(left: OrderedDuration, right: OrderedDuration) {
   return left.minutes - right.minutes || left.id - right.id

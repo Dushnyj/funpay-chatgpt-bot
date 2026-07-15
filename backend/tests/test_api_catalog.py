@@ -13,6 +13,7 @@ from app.models.account import Account
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.lot import Lot, PriceMatrix
 from app.models.rental import Order, Rental
+from app.services.seed_data import seed_catalog
 
 
 @pytest.fixture
@@ -49,6 +50,7 @@ async def test_list_tier_returns_system_metadata(auth_client: AsyncClient, sessi
     assert resp.status_code == 200
     assert resp.json()[0]["code"] == "pro_5x"
     assert resp.json()[0]["usage_multiplier"] == 5.0
+    assert resp.json()[0]["funpay_supported"] is True
 
 
 async def test_update_tier(auth_client: AsyncClient, session: AsyncSession):
@@ -68,6 +70,71 @@ async def test_update_tier(auth_client: AsyncClient, session: AsyncSession):
         json={"is_sellable": True},
     )
     assert resp.status_code == 422
+
+
+async def test_supported_active_tier_can_be_enabled_for_sale(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier = SubscriptionTier(
+        name="Plus",
+        code="plus",
+        is_active=True,
+        is_sellable=False,
+    )
+    session.add(tier)
+    await session.commit()
+
+    response = await auth_client.patch(
+        f"/api/tiers/{tier.id}",
+        json={"is_sellable": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["funpay_supported"] is True
+    assert response.json()["is_sellable"] is True
+
+
+async def test_unsupported_tier_is_recognized_but_cannot_be_enabled_for_sale(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    tier = SubscriptionTier(
+        name="Enterprise / usage-based",
+        code="enterprise",
+        is_active=True,
+        is_sellable=True,
+        system_managed=True,
+    )
+    session.add(tier)
+    await session.commit()
+
+    listed = await auth_client.get("/api/tiers")
+    item = next(row for row in listed.json() if row["id"] == tier.id)
+    assert item["funpay_supported"] is False
+    assert item["is_sellable"] is False
+
+    response = await auth_client.patch(
+        f"/api/tiers/{tier.id}",
+        json={"is_sellable": True},
+    )
+    assert response.status_code == 422
+    assert "recognized" in response.json()["detail"]
+
+
+async def test_fresh_catalog_keeps_recognized_unsupported_tiers_non_sellable(
+    session: AsyncSession,
+):
+    await seed_catalog(session)
+
+    tiers = (await session.execute(select(SubscriptionTier))).scalars().all()
+    by_code = {tier.code: tier for tier in tiers}
+    for code in (
+        "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
+    ):
+        assert by_code[code].is_active is True
+        assert by_code[code].is_sellable is False
+    assert by_code["plus"].is_sellable is True
 
 
 async def test_delete_tier(auth_client: AsyncClient, session: AsyncSession):

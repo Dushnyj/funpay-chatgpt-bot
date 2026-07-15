@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -53,6 +53,7 @@ async def list_templates(session: AsyncSession = Depends(get_db_session)):
 @router.put("", response_model=TemplateUpdateResponse)
 async def update_templates(
     req: TemplateUpdate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     seen: set[tuple[str, str]] = set()
@@ -90,6 +91,11 @@ async def update_templates(
         else:
             tpl.content = item.content
     await session.commit()
+    if any(item.key == "payment_received" for item in req.items):
+        await _reconcile_lots(
+            request,
+            "Message templates saved",
+        )
     return TemplateUpdateResponse(updated=len(req.items))
 
 
@@ -100,6 +106,7 @@ async def update_templates(
 async def reset_message_template(
     key: str,
     lang: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     default = DEFAULT_MESSAGE_TEMPLATES.get(key, {}).get(lang)
@@ -119,6 +126,8 @@ async def reset_message_template(
     else:
         template.content = default
     await session.commit()
+    if key == "payment_received":
+        await _reconcile_lots(request, "Message template reset")
     return _message_template_out(template)
 
 
@@ -145,6 +154,7 @@ async def list_lot_templates(session: AsyncSession = Depends(get_db_session)):
 @router.post("/lot", response_model=LotTemplateOut, status_code=201)
 async def create_lot_template(
     req: LotTemplateCreate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
@@ -204,6 +214,7 @@ async def create_lot_template(
             detail="Lot template key or active target already exists",
         ) from exc
     await session.refresh(row)
+    await _reconcile_lots(request, "Lot template created")
     return _lot_template_out(row)
 
 
@@ -211,6 +222,7 @@ async def create_lot_template(
 async def update_lot_template(
     key: str,
     req: LotTemplateUpdate,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     row = await _get_lot_template(session, key)
@@ -241,12 +253,14 @@ async def update_lot_template(
             status_code=409,
             detail="Another active lot template already exists for this target",
         ) from exc
+    await _reconcile_lots(request, "Lot template saved")
     return _lot_template_out(row)
 
 
 @router.post("/lot/{key}/reset", response_model=LotTemplateOut)
 async def reset_lot_template(
     key: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     row = await _get_lot_template(session, key)
@@ -262,12 +276,14 @@ async def reset_lot_template(
     row.description_template_en = default.description_en
     row.is_enabled = True
     await session.commit()
+    await _reconcile_lots(request, "Lot template reset")
     return _lot_template_out(row)
 
 
 @router.delete("/lot/{key}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_lot_template(
     key: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> Response:
     row = await _get_lot_template(session, key)
@@ -278,6 +294,7 @@ async def delete_lot_template(
         )
     await session.delete(row)
     await session.commit()
+    await _reconcile_lots(request, "Lot template deleted")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -367,3 +384,20 @@ async def _validate_lot_template_targets(
                 status_code=422,
                 detail="Limit scope is disabled or unavailable",
             )
+
+
+async def _reconcile_lots(request: Request, saved_message: str) -> None:
+    """Publish template changes immediately after their database commit."""
+
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is None:
+        return
+    try:
+        # Template content is part of the remote FunPay offer form. Force a
+        # full refresh even when price/capacity fields did not change.
+        await lifecycle.reconcile_lots(refresh_published=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{saved_message}, but FunPay reconciliation failed",
+        ) from exc

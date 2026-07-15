@@ -10,6 +10,7 @@ export interface Tier {
   is_active: boolean
   system_managed?: boolean
   is_sellable?: boolean
+  funpay_supported: boolean
   sort_order?: number
   usage_multiplier?: number | null
 }

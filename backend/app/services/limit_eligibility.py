@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from sqlalchemy import case, or_
+from sqlalchemy import and_, case, not_
 
 from app.models.account import AccountLimits
 
 
 _FIVE_HOURS_SECONDS = 5 * 60 * 60
+_SEVEN_DAYS_SECONDS = 7 * 24 * 60 * 60
+_THIRTY_DAYS_SECONDS = 30 * 24 * 60 * 60
 
 
 def observed_codex_primary():
@@ -47,20 +49,56 @@ def observed_codex_short():
 
 
 def observed_codex_long():
-    """Verified plan-specific long window: Free 30d, every paid plan 7d."""
+    """Return the one verified plan-specific long Codex observation.
 
+    ``primary`` and ``secondary`` are provider positions, not product limits.
+    A sellable observation must match the duration expected for the resolved
+    plan (30 days for Free, 7 days for paid plans), carry a valid percentage,
+    and be unambiguous. Legacy weekly/5h aliases deliberately do not qualify.
+    """
+
+    expected = AccountLimits.expected_long_window_seconds
+    contract_verified = and_(
+        AccountLimits.plan_window_status == "ok",
+        expected.is_not(None),
+        expected.in_((_SEVEN_DAYS_SECONDS, _THIRTY_DAYS_SECONDS)),
+    )
+    primary_matches = case(
+        (
+            and_(
+                contract_verified,
+                AccountLimits.codex_primary_window_seconds.is_not(None),
+                AccountLimits.codex_primary_window_seconds == expected,
+                AccountLimits.codex_primary_remaining_pct.is_not(None),
+                AccountLimits.codex_primary_remaining_pct.between(0, 100),
+            ),
+            True,
+        ),
+        else_=False,
+    )
+    secondary_matches = case(
+        (
+            and_(
+                contract_verified,
+                AccountLimits.codex_secondary_window_seconds.is_not(None),
+                AccountLimits.codex_secondary_window_seconds == expected,
+                AccountLimits.codex_secondary_remaining_pct.is_not(None),
+                AccountLimits.codex_secondary_remaining_pct.between(0, 100),
+            ),
+            True,
+        ),
+        else_=False,
+    )
     return case(
         (
-            AccountLimits.codex_primary_window_seconds
-            == AccountLimits.expected_long_window_seconds,
+            and_(primary_matches, not_(secondary_matches)),
             AccountLimits.codex_primary_remaining_pct,
         ),
         (
-            AccountLimits.codex_secondary_window_seconds
-            == AccountLimits.expected_long_window_seconds,
+            and_(secondary_matches, not_(primary_matches)),
             AccountLimits.codex_secondary_remaining_pct,
         ),
-        else_=AccountLimits.codex_weekly_remaining_pct,
+        else_=None,
     )
 
 
@@ -74,28 +112,18 @@ def apply_limit_scope_filters(
 ):
     """Apply one shared set of allocation and lot-capacity predicates.
 
-    OpenAI names the observed Codex windows ``primary`` and ``secondary``.
-    Their duration is data, not a fixed product contract: for example, the
-    currently observed Free window is 30 days while paid plans use 7 days.
-    The legacy 5h/week columns are used only as a migration fallback for rows
-    that have not yet been measured with the exact-window implementation.
+    Only the verified plan-specific long observation participates in sales:
+    30 days for Free and 7 days for paid plans. The positional provider names
+    and legacy 5h/weekly fields remain storage/API compatibility details.
     """
 
-    codex_primary = observed_codex_primary()
-    codex_secondary = observed_codex_secondary()
-    codex_short = observed_codex_short()
     codex_long = observed_codex_long()
 
     if scope == "any":
-        # ``any`` makes no minimum guarantee. Optional ceilings let the seller
-        # reserve high-capacity accounts, but only observed windows may be used.
-        if max_short_pct is not None:
-            statement = statement.where(
-                # An explicitly configured short-window ceiling is a real
-                # eligibility condition. Plans without an observed 5-hour
-                # window (notably Free) must not satisfy it through NULL.
-                codex_short <= max_short_pct,
-            )
+        # ``max_short_pct`` is accepted only for legacy request compatibility.
+        # It cannot influence new allocations because the product exposes and
+        # sells one long Codex allowance.
+        statement = statement.where(codex_long.is_not(None))
         if max_long_pct is not None:
             statement = statement.where(
                 codex_long <= max_long_pct,
@@ -103,15 +131,9 @@ def apply_limit_scope_filters(
         return statement
 
     if scope == "codex":
-        if min_limit_pct is not None:
-            statement = statement.where(
-                codex_primary >= min_limit_pct,
-                or_(
-                    codex_secondary.is_(None),
-                    codex_secondary >= min_limit_pct,
-                ),
-            )
-        return statement
+        if min_limit_pct is None:
+            return statement.where(False)
+        return statement.where(codex_long >= min_limit_pct)
 
     # Unknown catalog data must never make an account sellable.
     return statement.where(False)

@@ -91,17 +91,18 @@ def test_default_lot_copy_is_localized_compact_and_contract_safe():
 
     assert title_ru_fields == title_en_fields
     assert description_ru_fields == description_en_fields
+    assert template.title_ru.startswith("🧊 ChatGPT")
+    assert "АВТОВЫДАЧА" in template.title_ru
+    assert "🔹 СРОК И УСЛОВИЯ" in template.description_ru
+    assert "📊 ЛИМИТ CODEX" in template.description_ru
+    assert "🛡️ ПРАВИЛА ДОСТУПА" in template.description_ru
+    assert "🔑 КОМАНДЫ" in template.description_ru
     assert "30 дней только на Free, 7 дней на платных тарифах" in (
         template.description_ru
     )
-    assert "последнюю успешную проверку остатка лимита Codex" in (
-        template.description_ru
-    )
-    assert "Данные для входа придут в чат FunPay" in template.description_ru
-    assert not set("✅❌⚠⏳🔑📧📊📱🔄📢📖🙏⏰┌┐└┘─│╔╗╚╝║═").intersection(
-        template.title_ru + template.title_en
-        + template.description_ru + template.description_en
-    )
+    assert "проверяет актуальный остаток лимита" in template.description_ru
+    assert "автоматическая выдача в чате FunPay" in template.description_ru
+    assert "[FPBOT:" not in template.description_ru
     validate_lot_template_values(
         title_ru=template.title_ru,
         title_en=template.title_en,

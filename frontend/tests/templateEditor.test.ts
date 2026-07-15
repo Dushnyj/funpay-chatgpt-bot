@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   classifyTemplateFields,
   DEPRECATED_DURATION_TEMPLATE_FIELDS,
+  DEPRECATED_LOT_TEMPLATE_FIELDS,
   DEPRECATED_MESSAGE_TEMPLATE_FIELDS,
   extractTemplateFields,
   insertTemplateField,
@@ -26,18 +27,26 @@ test('renders known samples and leaves unsupported placeholders visible', () => 
 test('classifies supported legacy fields as deprecated instead of unknown', () => {
   assert.deepEqual(
     classifyTemplateFields(
-      ['chat_5h', 'chat_weekly', 'days', 'unknown'],
+      ['chat_5h', 'codex_primary_limit', 'codex_secondary_limit', 'days', 'unknown'],
       ['days'],
       DEPRECATED_MESSAGE_TEMPLATE_FIELDS,
     ),
     {
-      deprecated: ['chat_5h', 'chat_weekly', 'days'],
+      deprecated: ['chat_5h', 'codex_primary_limit', 'codex_secondary_limit', 'days'],
       unknown: ['unknown'],
     },
   )
   assert.deepEqual(
     classifyTemplateFields(['days', 'chat_5h'], [], DEPRECATED_DURATION_TEMPLATE_FIELDS),
     { deprecated: ['days'], unknown: ['chat_5h'] },
+  )
+  assert.deepEqual(
+    classifyTemplateFields(
+      ['short_limit', 'long_limit'],
+      ['short_limit', 'long_limit'],
+      DEPRECATED_LOT_TEMPLATE_FIELDS,
+    ),
+    { deprecated: ['short_limit'], unknown: [] },
   )
 })
 

@@ -57,6 +57,11 @@ async def _seed_rental(session: AsyncSession, chat_id: int = 100) -> Rental:
         refresh_token_encrypted="enc",
         codex_5h_remaining_pct=60,
         codex_weekly_remaining_pct=50,
+        codex_primary_remaining_pct=50,
+        codex_primary_window_seconds=7 * 24 * 60 * 60,
+        plan_type="plus",
+        plan_window_status="ok",
+        expected_long_window_seconds=7 * 24 * 60 * 60,
         measured_at=datetime.now(timezone.utc),
         refresh_status="ok",
     ))
@@ -297,7 +302,7 @@ async def test_code_handler_live_refund_revokes_before_disclosure(
     assert rental.status == "refunded"
     assert sale.status == "refunded"
     assert len(gateway.sent_messages) == 1
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_live_identity_mismatch_fails_closed(
@@ -378,7 +383,7 @@ async def test_code_handler_denies_commands_until_initial_delivery(
         await CodeHandler(totp_min_validity_s=0)(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "Выдача аккаунта ещё не завершена" in gateway.sent_messages[0][1]
+    assert "АВТОВЫДАЧА ЕЩЁ ВЫПОЛНЯЕТСЯ" in gateway.sent_messages[0][1]
     assert rental.status == "active"
 
 
@@ -414,7 +419,7 @@ async def test_code_handler_denies_refund_pending_rental(session: AsyncSession):
         )
 
     generate.assert_not_called()
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_uses_exact_order_when_chat_has_two_active_rentals(
@@ -499,7 +504,7 @@ async def test_orderless_direct_chat_keeps_multiple_rentals_ambiguous(
         )
 
     generate.assert_not_called()
-    assert "несколько активных заказов" in gateway.sent_messages[0][1]
+    assert "В ЧАТЕ НЕСКОЛЬКО АКТИВНЫХ ЗАКАЗОВ" in gateway.sent_messages[0][1]
 
 
 async def test_order_qualified_code_selects_exact_rental_in_generic_chat(
@@ -612,7 +617,7 @@ async def test_order_reference_cannot_fall_back_or_disclose_foreign_rental(
     generate.assert_not_called()
     assert len(gateway.sent_messages) == 1
     assert "HHHGNZ4N" not in gateway.sent_messages[0][1]
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_rechecks_account_status_after_mailbox_work(
@@ -640,7 +645,7 @@ async def test_code_handler_rechecks_account_status_after_mailbox_work(
         await handler(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "временно недоступен" in gateway.sent_messages[0][1]
+    assert "АККАУНТ ВРЕМЕННО НЕДОСТУПЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_secret_send_has_bounded_timeout(
@@ -711,7 +716,7 @@ async def test_code_timeout_claim_blocks_same_otp_and_points_to_safe_retry(
     retry_text = retry_gateway.sent_messages[0][1]
     assert "123456" not in retry_text
     assert "654321" not in retry_text
-    assert "Доставка предыдущего кода не подтвердилась" in retry_text
+    assert "ДОСТАВКА КОДА НЕ ПОДТВЕРДИЛАСЬ" in retry_text
     assert "!код" in retry_text
 
     logs = list((await session.execute(
@@ -767,7 +772,7 @@ async def test_code_claim_survives_process_crash_boundary_and_fails_closed(
     generate.assert_called_once()
     retry_text = retry_gateway.sent_messages[0][1]
     assert "123456" not in retry_text
-    assert "Доставка предыдущего кода не подтвердилась" in retry_text
+    assert "ДОСТАВКА КОДА НЕ ПОДТВЕРДИЛАСЬ" in retry_text
 
     claim = await session.scalar(
         select(AuditLog).where(
@@ -843,7 +848,7 @@ async def test_code_handler_refuses_to_guess_between_two_active_rentals(
         await CodeHandler(totp_min_validity_s=0)(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "несколько активных заказов" in gateway.sent_messages[0][1]
+    assert "В ЧАТЕ НЕСКОЛЬКО АКТИВНЫХ ЗАКАЗОВ" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_rechecks_expiry_after_totp_boundary_wait(
@@ -871,7 +876,7 @@ async def test_code_handler_rechecks_expiry_after_totp_boundary_wait(
     generate.assert_not_called()
     await session.refresh(rental)
     assert rental.status == "expiry_pending"
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_refund_during_totp_wait_wins(
@@ -899,7 +904,7 @@ async def test_code_handler_refund_during_totp_wait_wins(
         await CodeHandler(totp_min_validity_s=12)(_ctx(gateway, session))
 
     generate.assert_not_called()
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_releases_locks_before_slow_denial(
@@ -1092,7 +1097,7 @@ async def test_code_handler_rejects_stale_or_duplicate_email_code(
         await handler(_ctx(gateway, session))
     assert "555555" in gateway.sent_messages[-1][1]
     assert "444444" not in gateway.sent_messages[-1][1]
-    assert "Нового кода из письма пока нет" in gateway.sent_messages[-1][1]
+    assert "НОВОГО КОДА В ПОЧТЕ ПОКА НЕТ" in gateway.sent_messages[-1][1]
     provider.preflight.assert_not_awaited()
 
 
@@ -1126,7 +1131,7 @@ async def test_code_handler_mail_failure_still_returns_totp(
 
     text = gateway.sent_messages[0][1]
     assert "Код подтверждения: 777777" in text
-    assert "получить код из почты не удалось" in text
+    assert "Бот не смог получить код автоматически" in text
     assert "safe mailbox error" not in text
 
 
@@ -1346,6 +1351,8 @@ async def _add_replacement_candidate(
         refresh_token_encrypted="enc",
         codex_5h_remaining_pct=90,
         codex_weekly_remaining_pct=80,
+        codex_primary_remaining_pct=80,
+        codex_primary_window_seconds=7 * 24 * 60 * 60,
         measured_at=datetime.now(timezone.utc),
         refresh_status="ok",
         plan_type="plus",
@@ -1402,7 +1409,7 @@ async def test_replace_handler_live_refund_revokes_before_replacement(
     assert rental.replacement_count == 0
     assert sale.status == "refunded"
     assert len(gateway.sent_messages) == 1
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_replace_kick_starts_after_durable_claim_without_transaction(
@@ -1819,7 +1826,7 @@ async def test_subscription_handler_expires_due_rental_synchronously(
 
     await session.refresh(rental)
     assert rental.status == "expiry_pending"
-    assert "Действующий доступ" in gateway.sent_messages[0][1]
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in gateway.sent_messages[0][1]
 
 
 async def test_code_handler_expires_due_rental_before_generating_secret(
@@ -1862,7 +1869,8 @@ async def test_replace_handler_declines_healthy_account(session: AsyncSession):
     await session.refresh(rental)
     assert rental.replacement_count == 0
     assert kick.calls == []
-    assert "Проверка завершена: аккаунт доступен" in gateway.sent_messages[0][1]
+    assert "ПРОВЕРКА ЗАВЕРШЕНА" in gateway.sent_messages[0][1]
+    assert "Аккаунт доступен и отвечает" in gateway.sent_messages[0][1]
 
 
 async def test_replace_handler_without_active_order_reports_missing_access(
@@ -1885,7 +1893,7 @@ async def test_replace_handler_without_active_order_reports_missing_access(
     )
 
     validator.assert_not_awaited()
-    assert "Действующий доступ по этому заказу не найден" in (
+    assert "ДЕЙСТВУЮЩИЙ ДОСТУП НЕ НАЙДЕН" in (
         gateway.sent_messages[0][1]
     )
 
@@ -1954,6 +1962,8 @@ async def test_failed_replacement_delivery_retries_same_account_without_extensio
         refresh_token_encrypted="enc",
         codex_5h_remaining_pct=90,
         codex_weekly_remaining_pct=80,
+        codex_primary_remaining_pct=80,
+        codex_primary_window_seconds=7 * 24 * 60 * 60,
         measured_at=datetime.now(timezone.utc),
         refresh_status="ok",
         plan_type="plus",

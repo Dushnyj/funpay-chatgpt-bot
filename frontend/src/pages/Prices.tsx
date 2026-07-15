@@ -7,6 +7,7 @@ import { EmptyState, ErrorState, LoadingState, PageHeader, TableShell } from '..
 import type { PriceMatrixItem, Tier } from '../types/api'
 import { compareDurationsByMinutes, formatDurationMinutes } from '../utils/catalogEditor'
 import { formatCurrency } from '../utils/format'
+import { normalizePriceRule, priceRuleSignature, priceRuleToWire } from '../utils/priceRules'
 import {
   compareOfferScopes,
   isAvailableOfferScope,
@@ -68,7 +69,6 @@ export default function Prices() {
   }).length
 
   const tierName = (id: number) => tiers.find((tier) => tier.id === id)?.name ?? `Тариф #${id}`
-  const tierCode = (id: number) => tiers.find((tier) => tier.id === id)?.code?.toLowerCase() ?? 'unknown'
   const durationLabel = (id: number) => {
     const duration = durations.find((candidate) => candidate.id === id)
     return duration ? formatDurationMinutes(duration.minutes) : 'неизвестный срок'
@@ -79,14 +79,11 @@ export default function Prices() {
 
   useEffect(() => {
     if (!dirty && pricesQuery.data && tiersQuery.data && scopesQuery.data) {
-      setDraft(pricesQuery.data.map((item) => normalizeRule(
+      setDraft(pricesQuery.data.map((item) => normalizePriceRule(
         { ...item, draftId: nextDraftId() },
         scopesQuery.data.find(
           (scope) => scope.id === item.limit_scope_id,
         )?.code.toLowerCase() ?? 'unknown',
-        tiersQuery.data.find(
-          (tier) => tier.id === item.tier_id,
-        )?.code?.toLowerCase() ?? 'unknown',
       )))
     }
   }, [pricesQuery.data, tiersQuery.data, scopesQuery.data, dirty])
@@ -124,10 +121,9 @@ export default function Prices() {
     setDraft((items) => items.map((item) => {
       if (item.draftId !== draftId) return item
       const next = { ...item, ...patch }
-      return normalizeRule(
+      return normalizePriceRule(
         next,
         scopeCode(next.limit_scope_id),
-        tierCode(next.tier_id),
       )
     }))
     markChanged()
@@ -155,19 +151,18 @@ export default function Prices() {
       return
     }
 
-    const candidate = normalizeRule({
+    const candidate = normalizePriceRule({
       draftId: nextDraftId(),
       tier_id: resolvedBuilderTier,
       duration_id: resolvedBuilderDuration,
       limit_scope_id: targetScope,
       min_limit_pct: targetScopeCode === 'any' ? undefined : minLimit,
       price,
-    }, targetScopeCode, tierCode(resolvedBuilderTier))
-    if (draft.some((item) => ruleSignature(
+    }, targetScopeCode)
+    if (draft.some((item) => priceRuleSignature(
       item,
       scopeCode(item.limit_scope_id),
-      tierCode(item.tier_id),
-    ) === ruleSignature(candidate, targetScopeCode, tierCode(candidate.tier_id)))) {
+    ) === priceRuleSignature(candidate, targetScopeCode))) {
       setError('Такое правило уже есть. Измените тариф, срок или условие по лимиту.')
       return
     }
@@ -178,10 +173,9 @@ export default function Prices() {
   }
 
   const duplicateRule = (item: DraftRule) => {
-    setDraft((items) => [...items, normalizeRule(
+    setDraft((items) => [...items, normalizePriceRule(
       { ...item, draftId: nextDraftId() },
       scopeCode(item.limit_scope_id),
-      tierCode(item.tier_id),
     )])
     markChanged()
     setNotice('Копия добавлена. Измените у неё тариф, срок или условие перед сохранением.')
@@ -194,10 +188,9 @@ export default function Prices() {
   }
 
   const discard = () => {
-    setDraft((pricesQuery.data ?? []).map((item) => normalizeRule(
+    setDraft((pricesQuery.data ?? []).map((item) => normalizePriceRule(
       { ...item, draftId: nextDraftId() },
       scopeCode(item.limit_scope_id),
-      tierCode(item.tier_id),
     )))
     setDirty(false)
     setError('')
@@ -208,26 +201,24 @@ export default function Prices() {
   const save = async () => {
     setError('')
     setNotice('')
-    const normalized = draft.map((item) => normalizeRule(
+    const normalized = draft.map((item) => normalizePriceRule(
       item,
       scopeCode(item.limit_scope_id),
-      tierCode(item.tier_id),
     ))
     const invalid = normalized.some((item) => {
       const code = scopeCode(item.limit_scope_id)
       return item.price <= 0
         || !isSupportedOfferScopeCode(code)
-        || (code === 'any' && [item.max_5h_pct, item.max_weekly_pct].some((value) => value != null && (value < 0 || value > 100)))
+        || (code === 'any' && item.max_weekly_pct != null && (item.max_weekly_pct < 0 || item.max_weekly_pct > 100))
         || (code !== 'any' && (item.min_limit_pct == null || item.min_limit_pct < 0 || item.min_limit_pct > 100))
     })
     if (invalid) {
       setError('Проверьте цену и условие: поддерживаются только типы ANY и CODEX. ANY продаётся без гарантии, CODEX требует минимум 0–100%.')
       return
     }
-    const signatures = normalized.map((item) => ruleSignature(
+    const signatures = normalized.map((item) => priceRuleSignature(
       item,
       scopeCode(item.limit_scope_id),
-      tierCode(item.tier_id),
     ))
     if (new Set(signatures).size !== signatures.length) {
       setError('В матрице есть одинаковые правила. Измените или удалите дубликат перед сохранением.')
@@ -235,7 +226,10 @@ export default function Prices() {
     }
 
     try {
-      await updatePrices.mutateAsync(normalized.map(toWireRule))
+      await updatePrices.mutateAsync(normalized.map((item) => priceRuleToWire(
+        item,
+        scopeCode(item.limit_scope_id),
+      )))
       setDraft(normalized)
       setDirty(false)
       setSaved(true)
@@ -266,7 +260,7 @@ export default function Prices() {
 
       <section className="panel price-rule-builder" aria-labelledby="price-builder-title">
         <div className="price-rule-builder__head">
-          <div><span className="eyebrow">Конструктор</span><h2 id="price-builder-title">Добавить ценовое правило</h2><p>ANY не обещает остаток лимита. Для CODEX задаётся минимальный остаток единого измеримого лимита во всех фактических окнах OpenAI.</p></div>
+          <div><span className="eyebrow">Конструктор</span><h2 id="price-builder-title">Добавить ценовое правило</h2><p>ANY не обещает остаток лимита. Для CODEX задаётся минимум единственного проверенного длинного окна: 30 дней для Free, 7 дней для платных тарифов.</p></div>
         </div>
         <div className="price-rule-builder__fields">
           <label className="field"><span className="field__label">Тариф</span><select value={String(resolvedBuilderTier || '')} onChange={(event) => setBuilder((current) => ({ ...current, tierId: event.target.value }))} disabled={sellableTiers.length === 0}>{sellableTiers.length === 0 && <option value="">Нет тарифов, разрешённых к продаже</option>}{sellableTiers.map((tier) => <option value={tier.id} key={tier.id}>{tier.name}</option>)}</select></label>
@@ -283,7 +277,7 @@ export default function Prices() {
         </div>
       </section>
 
-      <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для обычного доступа используйте ANY без обещания остатка. Для измеримой гарантии используйте CODEX: подбор учитывает все фактические окна OpenAI, включая короткое и длинное.</span></div>
+      <div className="form-alert form-alert--info"><Icon name="activity" /><span>Для обычного доступа используйте ANY без обещания остатка. CODEX проверяет только длинный лимит тарифа: 30 дней для Free или 7 дней для платных тарифов.</span></div>
       {unavailableTierRules > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Правил для тарифов с выключенной продажей: {unavailableTierRules}. Они остаются видимыми и сохраняются в матрице, но новые правила и автоматические лоты для таких тарифов не создаются. Правило можно перевести на доступный тариф или удалить.</span></div>}
       {unavailableDurationRules > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Правил для выключенных сроков: {unavailableDurationRules}. Они сохранены, но соответствующие автоматические лоты приостановлены. Выберите включённый срок или удалите правило.</span></div>}
       {unavailableScopeRules > 0 && <div className="form-alert form-alert--warning"><Icon name="warning" /><span>Правил с недоступным типом лимита: {unavailableScopeRules}. Они остаются в матрице, но не участвуют в создании новых лотов. Переведите правило на включённый ANY/CODEX или удалите его.</span></div>}
@@ -300,7 +294,6 @@ export default function Prices() {
             const currentTier = tiers.find((tier) => tier.id === item.tier_id)
             const currentDuration = durations.find((duration) => duration.id === item.duration_id)
             const currentScope = scopes.find((candidate) => candidate.id === item.limit_scope_id)
-            const currentTierIsFree = currentTier?.code?.toLowerCase() === 'free'
             const currentTierIsSellable = isTierSellable(currentTier)
             const rowTierOptions = currentTier && !sellableTiers.some((tier) => tier.id === currentTier.id)
               ? [currentTier, ...sellableTiers]
@@ -318,7 +311,7 @@ export default function Prices() {
               <td><label className="sr-only" htmlFor={`${item.draftId}-tier`}>Тариф</label><select id={`${item.draftId}-tier`} className="table-select" value={item.tier_id} onChange={(event) => updateItem(item.draftId, { tier_id: Number(event.target.value) })}>{!currentTier && <option value={item.tier_id}>Тариф #{item.tier_id} · нет в каталоге</option>}{rowTierOptions.map((tier) => <option key={tier.id} value={tier.id} disabled={!isTierSellable(tier)}>{tier.name}{isTierSellable(tier) ? '' : ' · продажа выключена'}</option>)}</select>{!currentTierIsSellable && <small className="table-subline text-warning">Правило сохранено, публикация приостановлена</small>}</td>
               <td><label className="sr-only" htmlFor={`${item.draftId}-duration`}>Срок</label><select id={`${item.draftId}-duration`} className="table-select table-select--compact" value={item.duration_id} onChange={(event) => updateItem(item.draftId, { duration_id: Number(event.target.value) })}>{!currentDuration && <option value={item.duration_id}>Срок #{item.duration_id} · нет в каталоге</option>}{rowDurationOptions.map((duration) => <option key={duration.id} value={duration.id} disabled={!duration.is_enabled}>{formatDurationMinutes(duration.minutes)}{duration.is_enabled ? '' : ' · выключен'}</option>)}</select>{currentDuration?.is_enabled !== true && <small className="table-subline text-warning">Публикация приостановлена</small>}</td>
               <td><label className="sr-only" htmlFor={`${item.draftId}-scope`}>Тип лимита</label><select id={`${item.draftId}-scope`} className={`table-select scope-select scope-select--${scope}`} value={item.limit_scope_id} onChange={(event) => updateItem(item.draftId, { limit_scope_id: Number(event.target.value) })}>{!currentScope && <option value={item.limit_scope_id}>Тип #{item.limit_scope_id} · нет в каталоге</option>}{rowScopeOptions.map((candidate) => <option key={candidate.id} value={candidate.id} disabled={!isAvailableOfferScope(candidate)}>{offerScopeDisplayCode(candidate)}{offerScopeUnavailableReason(candidate) ? ` · ${offerScopeUnavailableReason(candidate)}` : ''}</option>)}</select><small className={`table-subline ${currentScopeIsEnabled ? '' : 'text-warning'}`}>{currentScopeIsEnabled ? scopeName(item.limit_scope_id) : `${scopeUnavailableReason}. Правило сохранено, публикация приостановлена`}</small></td>
-              <td>{!currentScopeIsEnabled ? <div className="limit-condition limit-condition--unavailable"><Icon name="warning" size={15} /><span><strong>Тип лимита недоступен</strong>{scopeUnavailableReason}. Переведите правило на ANY/CODEX или удалите.</span></div> : scope === 'any' ? <div className="limit-condition limit-condition--ceilings"><span><strong className="no-guarantee"><Icon name="check" size={14} />Без гарантии</strong>Необязательный внутренний максимум остатка</span>{currentTierIsFree ? <span className="table-subline">У Free нет короткого 5-часового окна</span> : <PercentInput value={item.max_5h_pct} label="Максимум короткого 5-часового окна" onChange={(value) => updateItem(item.draftId, { max_5h_pct: value })} />}<PercentInput value={item.max_weekly_pct} label="Максимум длинного окна (7 или 30 дней)" onChange={(value) => updateItem(item.draftId, { max_weekly_pct: value })} /></div> : <div className="limit-condition"><span>Остаток в наблюдаемом окне не ниже</span><PercentInput value={item.min_limit_pct} label={`Минимальный остаток ${scope.toUpperCase()}`} onChange={(value) => updateItem(item.draftId, { min_limit_pct: value })} /></div>}</td>
+              <td>{!currentScopeIsEnabled ? <div className="limit-condition limit-condition--unavailable"><Icon name="warning" size={15} /><span><strong>Тип лимита недоступен</strong>{scopeUnavailableReason}. Переведите правило на ANY/CODEX или удалите.</span></div> : scope === 'any' ? <div className="limit-condition limit-condition--ceilings"><span><strong className="no-guarantee"><Icon name="check" size={14} />Без гарантии</strong>Необязательный внутренний максимум длинного лимита Codex</span><PercentInput value={item.max_weekly_pct} label="Максимум длинного окна (7 или 30 дней)" onChange={(value) => updateItem(item.draftId, { max_weekly_pct: value })} /></div> : <div className="limit-condition"><span>Длинный лимит Codex не ниже</span><PercentInput value={item.min_limit_pct} label="Минимальный остаток длинного лимита Codex" onChange={(value) => updateItem(item.draftId, { min_limit_pct: value })} /></div>}</td>
               <td><label className="money-input"><input type="number" min="1" step="1" value={item.price} onChange={(event) => updateItem(item.draftId, { price: Number(event.target.value) })} aria-label={`Цена ${tierName(item.tier_id)}, срок ${durationLabel(item.duration_id)}`} /><span>₽</span></label></td>
               <td><div className="row-actions row-actions--compact"><button className="icon-button" type="button" onClick={() => duplicateRule(item)} disabled={!currentTierIsSellable || !currentScopeIsEnabled} title={currentTierIsSellable && currentScopeIsEnabled ? 'Дублировать правило' : 'Недоступное правило нельзя дублировать'} aria-label={`Дублировать правило ${tierName(item.tier_id)}`}><Icon name="copy" /></button><button className="icon-button icon-button--danger" type="button" onClick={() => removeRule(item.draftId)} title="Удалить правило" aria-label={`Удалить правило ${tierName(item.tier_id)}`}><Icon name="trash" /></button></div></td>
             </tr>
@@ -332,30 +325,6 @@ export default function Prices() {
 
 function isTierSellable(tier: Tier | undefined) {
   return tier?.is_active === true && tier.is_sellable !== false
-}
-
-function normalizeRule<T extends PriceMatrixItem>(
-  item: T,
-  scope: string,
-  tierCode: string,
-): T {
-  if (scope === 'any') {
-    return {
-      ...item,
-      min_limit_pct: undefined,
-      max_5h_pct: tierCode === 'free' ? undefined : item.max_5h_pct,
-    }
-  }
-  return { ...item, max_5h_pct: undefined, max_weekly_pct: undefined }
-}
-
-function ruleSignature(item: PriceMatrixItem, scope: string, tierCode: string) {
-  const normalized = normalizeRule(item, scope, tierCode)
-  return [normalized.tier_id, normalized.duration_id, normalized.limit_scope_id, normalized.min_limit_pct ?? '', normalized.max_5h_pct ?? '', normalized.max_weekly_pct ?? ''].join(':')
-}
-
-function toWireRule({ draftId: _draftId, ...item }: DraftRule): PriceMatrixItem {
-  return item
 }
 
 function PercentInput({ value, label, onChange }: { value?: number | null; label: string; onChange: (value: number | undefined) => void }) {

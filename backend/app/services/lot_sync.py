@@ -11,40 +11,41 @@ from app.integrations.funpay.provenance import (
     PROVENANCE_MARKER_RE,
     descriptions_have_exact_provenance,
     exact_provenance_token,
+    public_provenance_code,
 )
 from app.integrations.funpay.types import OfferFieldsDTO
 from app.models.catalog import SubscriptionTier
 from app.models.lot import Lot
 from app.services.funpay_offer_mapping import funpay_offer_plan_fields
+from app.services.messages import render_message
 
 
 _PROVENANCE_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 _FUNPAY_DESCRIPTION_MAX_LENGTH = 4000
-_PAYMENT_MESSAGE_RU = (
-    "Заказ принят. Бот отправит данные для входа в чат заказа. "
-    "Код для входа: !код. Помощь: !помощь."
-)
-_PAYMENT_MESSAGE_EN = (
-    "Order accepted. The bot will send sign-in details in the order chat. "
-    "Sign-in code: !code. Help: !help."
-)
 
 
-def provenance_marker(token: str) -> str:
-    """Return the canonical marker for one persisted lot token."""
+def provenance_marker(token: str, *, lang: str = "ru") -> str:
+    """Return a readable localized marker for one persisted lot token."""
 
     if not _PROVENANCE_TOKEN_RE.fullmatch(token):
         raise ValueError("Lot provenance token must be 32 lowercase hex characters")
-    return f"[FPBOT:{token}]"
+    code = public_provenance_code(token)
+    if lang == "ru":
+        return f"🔖 Код автодоставки: {code}"
+    if lang == "en":
+        return f"🔖 Automatic delivery code: {code}"
+    raise ValueError("Lot provenance marker language must be 'ru' or 'en'")
 
 
 def description_with_provenance_marker(
     description: str | None,
     token: str,
+    *,
+    lang: str = "ru",
 ) -> str:
     """Append exactly one stable marker without exceeding FunPay's limit."""
 
-    marker = provenance_marker(token)
+    marker = provenance_marker(token, lang=lang)
     # Operator text may have been copied back from FunPay. Remove every old
     # canonical marker before appending the authoritative current one.
     clean = PROVENANCE_MARKER_RE.sub("", description or "").strip()
@@ -66,6 +67,9 @@ def build_offer_fields(
     tier: SubscriptionTier,
     offer_id: int,
     active: bool,
+    *,
+    payment_msg_ru: str,
+    payment_msg_en: str,
 ) -> OfferFieldsDTO:
     """Сборка OfferFieldsDTO из доменного Lot.
 
@@ -81,13 +85,15 @@ def build_offer_fields(
         desc_ru=description_with_provenance_marker(
             lot.description_ru,
             lot.provenance_token,
+            lang="ru",
         ),
         desc_en=description_with_provenance_marker(
             lot.description_en,
             lot.provenance_token,
+            lang="en",
         ),
-        payment_msg_ru=_PAYMENT_MESSAGE_RU,
-        payment_msg_en=_PAYMENT_MESSAGE_EN,
+        payment_msg_ru=payment_msg_ru,
+        payment_msg_en=payment_msg_en,
         subscription=plan_fields.subscription,
         subscription_type=plan_fields.subscription_type,
         price=float(lot.price),
@@ -132,11 +138,23 @@ class LotSyncService:
         tier = await session.get(SubscriptionTier, lot.tier_id)
         if tier is None:
             raise RuntimeError(f"Subscription tier {lot.tier_id} not found")
+        payment_msg_ru = await render_message(
+            session,
+            "payment_received",
+            "ru",
+        )
+        payment_msg_en = await render_message(
+            session,
+            "payment_received",
+            "en",
+        )
         fields = build_offer_fields(
             lot,
             tier,
             offer_id=offer_id,
             active=active,
+            payment_msg_ru=payment_msg_ru,
+            payment_msg_en=payment_msg_en,
         )
         result_id = await gateway.save_offer_fields(fields)
         if result_id <= 0:
@@ -200,21 +218,53 @@ class LotSyncService:
             # A process from an older release could retry after a successful
             # remote save and create more than one offer with the same token.
             # Every match is bot-owned; keep the oldest deterministic ID and
-            # fail closed unless all duplicates are made unavailable.
+            # fail closed unless every exact-token duplicate is permanently
+            # removed and its absence is verified by the gateway.
             matches.sort(key=lambda offer: offer.offer_id)
             canonical, *duplicates = matches
             for duplicate in duplicates:
-                changed = await gateway.set_offer_active(
+                changed = await gateway.delete_offer(
                     duplicate.offer_id,
-                    active=False,
+                    expected_provenance_token=lot.provenance_token,
                 )
                 if not changed:
                     raise RuntimeError(
-                        "Unable to pause a duplicate FunPay offer carrying "
+                        "Unable to delete a duplicate FunPay offer carrying "
                         "the local lot marker"
                     )
             return canonical.offer_id
         return 0
+
+    async def delete_lot(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        lot_id: int,
+    ) -> None:
+        """Permanently remove one published local lot from FunPay."""
+
+        lot = await self._get_lot(session, lot_id)
+        if not lot.funpay_id:
+            raise LotNotPublishedError(f"Lot {lot_id} has no funpay_id")
+        if (
+            not lot.provenance_marker_synced
+            or not _PROVENANCE_TOKEN_RE.fullmatch(lot.provenance_token)
+        ):
+            raise RuntimeError(
+                "Cannot permanently delete a FunPay offer without an exact "
+                "synced provenance marker"
+            )
+        deleted = await gateway.delete_offer(
+            int(lot.funpay_id),
+            expected_provenance_token=lot.provenance_token,
+        )
+        if not deleted:
+            raise RuntimeError(
+                f"FunPay did not confirm deletion of offer {lot.funpay_id}"
+            )
+        lot.status = "deleted"
+        lot.paused_reason = "manual_deleted"
+        await session.flush()
 
     async def pause_lot(
         self,

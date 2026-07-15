@@ -1,6 +1,7 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
+from unittest.mock import AsyncMock
 
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.main import app
@@ -189,6 +190,105 @@ async def test_reset_message_template_restores_bundled_default(
     assert response.status_code == 200
     assert response.json()["is_custom"] is False
     assert response.json()["content"] == response.json()["default_content"]
+
+
+async def test_payment_message_update_reconciles_published_lots(
+    auth_client: AsyncClient,
+    monkeypatch,
+):
+    lifecycle = type(
+        "Lifecycle",
+        (),
+        {"reconcile_lots": AsyncMock(return_value=[])},
+    )()
+    monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
+
+    response = await auth_client.put(
+        "/api/templates",
+        json={
+            "items": [
+                {
+                    "key": "payment_received",
+                    "lang": "ru",
+                    "content": "Оплата получена. Начинаю выдачу.",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    lifecycle.reconcile_lots.assert_awaited_once_with(refresh_published=True)
+
+
+async def test_unrelated_message_update_does_not_reconcile_lots(
+    auth_client: AsyncClient,
+    monkeypatch,
+):
+    lifecycle = type(
+        "Lifecycle",
+        (),
+        {"reconcile_lots": AsyncMock(return_value=[])},
+    )()
+    monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
+
+    response = await auth_client.put(
+        "/api/templates",
+        json={
+            "items": [
+                {"key": "help", "lang": "ru", "content": "Помощь"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    lifecycle.reconcile_lots.assert_not_awaited()
+
+
+async def test_payment_message_reset_reconciles_published_lots(
+    auth_client: AsyncClient,
+    monkeypatch,
+):
+    lifecycle = type(
+        "Lifecycle",
+        (),
+        {"reconcile_lots": AsyncMock(return_value=[])},
+    )()
+    monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
+
+    response = await auth_client.post(
+        "/api/templates/messages/payment_received/ru/reset"
+    )
+
+    assert response.status_code == 200
+    lifecycle.reconcile_lots.assert_awaited_once_with(refresh_published=True)
+
+
+async def test_lot_template_update_reconciles_published_lots(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+):
+    lifecycle = type(
+        "Lifecycle",
+        (),
+        {"reconcile_lots": AsyncMock(return_value=[])},
+    )()
+    monkeypatch.setattr(app.state, "lifecycle", lifecycle, raising=False)
+    await seed_lot_templates(session)
+
+    response = await auth_client.put(
+        "/api/templates/lot/default",
+        json={
+            "title_ru": "ChatGPT {plan} · {duration} · {condition}",
+            "title_en": "ChatGPT {plan} · {duration} · {condition}",
+            "description_ru": "Автовыдача · {long_window_days} дн.",
+            "description_en": "Auto delivery · {long_window_days} days",
+            "enabled": True,
+        },
+    )
+
+    assert response.status_code == 200
+    lifecycle.reconcile_lots.assert_awaited_once_with(refresh_published=True)
 
 
 async def test_lot_template_crud_validation_and_system_reset(

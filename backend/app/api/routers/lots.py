@@ -177,13 +177,24 @@ async def delete_lot(
         )
     if lot.funpay_id:
         lifecycle = _require_lifecycle(request)
+        delete_remote = getattr(lifecycle, "delete_lot", None)
+        if not callable(delete_remote):
+            raise HTTPException(
+                status_code=503,
+                detail="FunPay runtime cannot permanently delete offers",
+            )
         try:
-            await lifecycle.set_lot_active(lot.id, False)
+            await delete_remote(lot.id)
         except Exception as exc:
-            _raise_remote_error(exc, "FunPay did not confirm that the lot was removed")
-    lot.status = "deleted"
-    lot.paused_reason = "manual_deleted"
-    await session.commit()
+            _raise_remote_error(
+                exc,
+                "FunPay did not confirm that the lot was permanently removed",
+            )
+        await session.refresh(lot)
+    else:
+        lot.status = "deleted"
+        lot.paused_reason = "manual_deleted"
+        await session.commit()
 
 
 def _require_lifecycle(request: Request):

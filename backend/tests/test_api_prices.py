@@ -116,7 +116,7 @@ async def test_guaranteed_scope_requires_minimum_and_rejects_legacy_ceilings(
             "duration_id": duration.id,
             "limit_scope_id": scope.id,
             "min_limit_pct": 50,
-            "max_5h_pct": 80,
+            "max_weekly_pct": 80,
             "price": 599,
         }],
     })
@@ -150,11 +150,11 @@ async def test_chat_guarantee_is_rejected_when_openai_does_not_publish_usage(
     assert "limit scope is disabled or invalid" in response.json()["detail"]
 
 
-async def test_free_price_rejects_nonexistent_five_hour_ceiling(
+async def test_price_rejects_legacy_five_hour_ceiling_for_every_plan(
     auth_client: AsyncClient, session: AsyncSession,
 ):
     tier = SubscriptionTier(
-        code="free", name="Free", is_active=True, is_sellable=True,
+        code="plus", name="Plus", is_active=True, is_sellable=True,
     )
     duration = Duration(minutes=7 * 24 * 60, is_enabled=True, sort_order=10)
     scope = LimitScope(code="any", name="Любой")
@@ -173,7 +173,7 @@ async def test_free_price_rejects_nonexistent_five_hour_ceiling(
     })
 
     assert response.status_code == 422
-    assert "Free has no observed 5-hour window" in response.json()["detail"]
+    assert "5-hour condition is legacy-only" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("catalog_state", ["tier", "duration"])

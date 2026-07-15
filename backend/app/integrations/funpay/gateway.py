@@ -23,6 +23,9 @@ from app.integrations.funpay.types import (
 )
 
 
+_PROVENANCE_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 @runtime_checkable
 class ChatGateway(Protocol):
     """Абстракция над FunPay-соединением. Изолирует домен от funpaybotengine."""
@@ -41,6 +44,15 @@ class ChatGateway(Protocol):
 
     async def set_offer_active(self, offer_id: int, active: bool) -> bool:
         """Активировать/поставить на паузу отдельный лот."""
+        ...
+
+    async def delete_offer(
+        self,
+        offer_id: int,
+        *,
+        expected_provenance_token: str,
+    ) -> bool:
+        """Delete one exact bot-owned offer and verify it disappeared."""
         ...
 
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
@@ -95,6 +107,7 @@ class FakeChatGateway:
         self.profile_calls: list[int] = []
         self.saved_offers: dict[int, OfferFieldsDTO] = {}
         self.activity_changes: list[tuple[int, bool]] = []
+        self.deleted_offers: list[int] = []
         self.bumped: list[tuple[int, int]] = []
         self._my_offers: dict[int, list[OfferInfo]] = {}
         self._category_ids: dict[int, int] = {}
@@ -242,6 +255,39 @@ class FakeChatGateway:
             self.saved_offers[offer_id] = replace(existing, active=active)
         return True
 
+    async def delete_offer(
+        self,
+        offer_id: int,
+        *,
+        expected_provenance_token: str,
+    ) -> bool:
+        if not isinstance(expected_provenance_token, str) or not (
+            _PROVENANCE_TOKEN_RE.fullmatch(expected_provenance_token)
+        ):
+            return False
+        existing = self.saved_offers.get(offer_id)
+        listed = any(
+            any(item.offer_id == offer_id for item in offers)
+            for offers in self._my_offers.values()
+        )
+        if existing is None and not listed:
+            return False
+        if existing is None or not descriptions_have_exact_provenance(
+            (existing.desc_ru, existing.desc_en),
+            expected_provenance_token,
+        ):
+            return False
+        self.saved_offers.pop(offer_id, None)
+        for subcategory_id, offers in tuple(self._my_offers.items()):
+            self._my_offers[subcategory_id] = [
+                item for item in offers if item.offer_id != offer_id
+            ]
+        self.deleted_offers.append(offer_id)
+        return not any(
+            any(item.offer_id == offer_id for item in offers)
+            for offers in self._my_offers.values()
+        )
+
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
         return self._my_offers.get(subcategory_id, [])
 
@@ -269,6 +315,7 @@ from app.integrations.funpay.types import SaleStatus
 
 
 _CREATE_OFFER_RESOLUTION_DELAYS = (0.0, 0.25, 0.75, 1.5)
+_DELETE_OFFER_VERIFICATION_DELAYS = (0.0, 0.25, 0.75, 1.5)
 
 
 def _map_order_status(fp_status: _FPOrderStatus) -> SaleStatus:
@@ -515,6 +562,66 @@ class FunPayChatGateway:
         fp_fields = await self._bot.get_offer_fields(offer_id=offer_id)
         fp_fields.active = active
         return await self._bot.save_offer_fields(fp_fields)
+
+    async def delete_offer(
+        self,
+        offer_id: int,
+        *,
+        expected_provenance_token: str,
+    ) -> bool:
+        """Delete through FunPay's own offer form and verify the postcondition.
+
+        FunPayBotEngine 0.7 has no dedicated delete method. The official form
+        submits the freshly loaded fields to ``lots/offerSave`` with the
+        hidden ``deleted`` field set to ``1``. Reusing that exact form keeps
+        CSRF and ``form_created_at`` handling inside the engine.
+        """
+
+        if not isinstance(expected_provenance_token, str) or not (
+            _PROVENANCE_TOKEN_RE.fullmatch(expected_provenance_token)
+        ):
+            return False
+
+        fp_fields = await self._bot.get_offer_fields(offer_id=offer_id)
+        parsed_offer_id = _positive_int(getattr(fp_fields, "offer_id", None))
+        subcategory_id = _positive_int(
+            getattr(fp_fields, "subcategory_id", None)
+        )
+        if parsed_offer_id != offer_id or subcategory_id is None:
+            return False
+        descriptions = (
+            _clean_optional_text(getattr(fp_fields, "desc_ru", None)),
+            _clean_optional_text(getattr(fp_fields, "desc_en", None)),
+        )
+        if not descriptions_have_exact_provenance(
+            descriptions,
+            expected_provenance_token,
+        ):
+            return False
+        fp_fields.set_field("deleted", "1")
+        if not await self._bot.save_offer_fields(fp_fields):
+            return False
+        for delay in _DELETE_OFFER_VERIFICATION_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            page = await self._bot.get_my_offers_page(
+                subcategory_id=subcategory_id
+            )
+            # The vendor parser returns an empty offer set with node ``0``
+            # for unrelated/login/error HTML. Such a page must never prove
+            # deletion merely because the target ID is absent.
+            if _positive_int(getattr(page, "subcategory_id", None)) != (
+                subcategory_id
+            ):
+                continue
+            visible_ids = {
+                parsed
+                for raw_id in page.offers
+                if (parsed := _positive_int(raw_id)) is not None
+            }
+            if offer_id not in visible_ids:
+                return True
+        return False
 
     async def get_my_offers(self, subcategory_id: int) -> list[OfferInfo]:
         page = await self._bot.get_my_offers_page(subcategory_id=subcategory_id)

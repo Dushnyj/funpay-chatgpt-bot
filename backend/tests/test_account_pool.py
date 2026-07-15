@@ -53,18 +53,21 @@ async def _add_account(
     )
     session.add(acc)
     await session.flush()
+    expected_long_window = (
+        30 * 24 * 60 * 60 if tier.code == "free" else 7 * 24 * 60 * 60
+    )
     limits = AccountLimits(
         account_id=acc.id,
         refresh_token_encrypted="enc",
         codex_5h_remaining_pct=codex_5h,
         codex_weekly_remaining_pct=codex_weekly,
+        codex_primary_remaining_pct=codex_weekly,
+        codex_primary_window_seconds=expected_long_window,
         measured_at=datetime.now(timezone.utc),
         refresh_status=refresh_status,
         plan_type=tier.code or "plus",
         plan_window_status="ok",
-        expected_long_window_seconds=(
-            30 * 24 * 60 * 60 if tier.code == "free" else 7 * 24 * 60 * 60
-        ),
+        expected_long_window_seconds=expected_long_window,
     )
     session.add(limits)
     await session.flush()
@@ -269,10 +272,12 @@ async def test_acquire_filters_out_refresh_expired(session: AsyncSession):
     assert result is None
 
 
-async def test_acquire_scope_any_with_max_5h_threshold(session: AsyncSession):
+async def test_acquire_scope_any_ignores_legacy_five_hour_threshold(
+    session: AsyncSession,
+):
     tier, duration, scope_any = await _seed_tier_ds(session)
-    await _add_account(session, tier, codex_5h=80)
-    acc2 = await _add_account(session, tier, login="acc2", codex_5h=25)
+    first = await _add_account(session, tier, codex_5h=80)
+    await _add_account(session, tier, login="acc2", codex_5h=25)
 
     pool = AccountPool()
     criteria = AccountCriteria(
@@ -281,7 +286,7 @@ async def test_acquire_scope_any_with_max_5h_threshold(session: AsyncSession):
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
     assert result is not None
-    assert result.id == acc2.id
+    assert result.id == first.id
 
 
 async def test_acquire_scope_codex_with_min_limit(session: AsyncSession):
@@ -305,6 +310,55 @@ async def test_acquire_scope_codex_with_min_limit(session: AsyncSession):
     assert result.id == second.id
 
 
+async def test_codex_minimum_uses_secondary_seven_day_not_primary_five_hour(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_primary_remaining_pct = 95
+    limits.codex_primary_window_seconds = 5 * 60 * 60
+    limits.codex_secondary_remaining_pct = 40
+    limits.codex_secondary_window_seconds = 7 * 24 * 60 * 60
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=duration.minutes,
+        scope="codex",
+        min_limit_pct=50,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    assert await AccountPool().acquire(session, criteria, 1) is None
+    limits.codex_secondary_remaining_pct = 60
+    assert await AccountPool().acquire(session, criteria, 1) is not None
+
+
+async def test_codex_minimum_accepts_verified_free_thirty_day_window(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    tier.code = "free"
+    account = await _add_account(session, tier, expires_in_days=None)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_primary_remaining_pct = 64
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_minutes=duration.minutes,
+            scope="codex",
+            min_limit_pct=60,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
+    assert result is not None and result.id == account.id
+
+
 async def test_acquire_scope_codex_accepts_exact_primary_when_secondary_absent(
     session: AsyncSession,
 ):
@@ -312,8 +366,34 @@ async def test_acquire_scope_codex_accepts_exact_primary_when_secondary_absent(
     account = await _add_account(session, tier)
     limits = await session.get(AccountLimits, account.id)
     limits.codex_primary_remaining_pct = 95
-    limits.codex_primary_window_seconds = 2_592_000
+    limits.codex_primary_window_seconds = 7 * 24 * 60 * 60
     limits.codex_secondary_remaining_pct = None
+    limits.codex_secondary_window_seconds = None
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_minutes=duration.minutes,
+            scope="codex",
+            min_limit_pct=90,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
+    assert result is not None and result.id == account.id
+
+
+async def test_exact_primary_survives_nullable_secondary_provider_fragment(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_primary_remaining_pct = 95
+    limits.codex_secondary_remaining_pct = 60
     limits.codex_secondary_window_seconds = None
 
     result = await AccountPool().acquire(
@@ -610,6 +690,58 @@ async def test_acquire_rejects_unverified_plan_window(
     assert result is None
 
 
+async def test_acquire_rejects_legacy_only_limit_row(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_primary_remaining_pct = None
+    limits.codex_primary_window_seconds = None
+    limits.codex_secondary_remaining_pct = None
+    limits.codex_secondary_window_seconds = None
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_minutes=duration.minutes,
+            scope="any",
+            min_limit_pct=None,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
+    assert result is None
+
+
+async def test_acquire_rejects_ambiguous_duplicate_long_window(
+    session: AsyncSession,
+):
+    tier, duration, _ = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    limits = await session.get(AccountLimits, account.id)
+    limits.codex_secondary_remaining_pct = 60
+    limits.codex_secondary_window_seconds = 7 * 24 * 60 * 60
+
+    result = await AccountPool().acquire(
+        session,
+        AccountCriteria(
+            tier_id=tier.id,
+            duration_minutes=duration.minutes,
+            scope="any",
+            min_limit_pct=None,
+            max_5h_pct=None,
+            max_weekly_pct=None,
+        ),
+        default_max_active_rentals=1,
+    )
+
+    assert result is None
+
+
 async def test_any_ceilings_use_free_long_window_not_primary_position(
     session: AsyncSession,
 ):
@@ -633,9 +765,8 @@ async def test_any_ceilings_use_free_long_window_not_primary_position(
         max_5h_pct=30,
         max_weekly_pct=90,
     )
-    # Free has no 5-hour observation, so an explicit short-window condition
-    # must fail closed instead of treating NULL as a match.
-    assert await AccountPool().acquire(session, criteria, 1) is None
+    # The legacy short-window field no longer has product meaning.
+    assert await AccountPool().acquire(session, criteria, 1) is not None
 
     long_only = AccountCriteria(**{**criteria.__dict__, "max_5h_pct": None})
     assert await AccountPool().acquire(session, long_only, 1) is not None
@@ -645,7 +776,7 @@ async def test_any_ceilings_use_free_long_window_not_primary_position(
     assert await AccountPool().acquire(session, long_only, 1) is None
 
 
-async def test_any_ceilings_use_paid_five_hour_and_seven_day_semantics(
+async def test_any_ceiling_uses_only_paid_seven_day_semantics(
     session: AsyncSession,
 ):
     tier, duration, _ = await _seed_tier_ds(session)
@@ -668,5 +799,7 @@ async def test_any_ceilings_use_paid_five_hour_and_seven_day_semantics(
         max_weekly_pct=90,
     )
     assert await AccountPool().acquire(session, allowed, 1) is not None
-    blocked = AccountCriteria(**{**allowed.__dict__, "max_5h_pct": 10})
+    legacy_short = AccountCriteria(**{**allowed.__dict__, "max_5h_pct": 10})
+    assert await AccountPool().acquire(session, legacy_short, 1) is not None
+    blocked = AccountCriteria(**{**allowed.__dict__, "max_weekly_pct": 70})
     assert await AccountPool().acquire(session, blocked, 1) is None

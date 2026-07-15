@@ -700,7 +700,7 @@ async def test_generic_chat_foreign_or_malformed_reference_discloses_nothing(
     assert len(gateway.sent_messages) == 1
     assert "OWNEDSECRETTOTP" not in gateway.sent_messages[0][1]
     assert "XQGVAQ85" not in gateway.sent_messages[0][1]
-    assert "No active access" in gateway.sent_messages[0][1]
+    assert "NO ACTIVE ACCESS FOUND" in gateway.sent_messages[0][1]
     rental = await session.get(Rental, rental_id)
     order = await session.get(Order, order_id)
     assert rental.lang == "ru"
@@ -821,6 +821,8 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
         refresh_token_encrypted="enc",
         codex_5h_remaining_pct=60,
         codex_weekly_remaining_pct=50,
+        codex_primary_remaining_pct=50,
+        codex_primary_window_seconds=7 * 24 * 60 * 60,
         measured_at=datetime.now(timezone.utc),
         refresh_status="ok",
         plan_type="plus",
@@ -879,4 +881,4 @@ async def test_on_new_sale_creates_rental_when_account_available(session: AsyncS
     ).scalar_one()
     assert order.buyer_locale == "en"
     assert persisted_rental.lang == "en"
-    assert "Commands" in gateway.sent_messages[-1][1]
+    assert "BUYER COMMANDS" in gateway.sent_messages[-1][1]

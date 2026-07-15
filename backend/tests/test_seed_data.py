@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.lot import LotTemplate
 from app.models.message import MessageTemplate
-from app.services.lot_templates import DEFAULT_LOT_TEMPLATES
+from app.services.lot_templates import DEFAULT_LOT_TEMPLATES, PRE_REFINED_LOT_TEMPLATES
 from app.services.messages import validate_template_content
 from app.services.seed_data import (
     DEFAULT_DURATIONS,
@@ -17,6 +17,7 @@ from app.services.seed_data import (
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_TIERS,
     PRE_AGENTIC_MESSAGE_TEMPLATES,
+    PRE_REFINED_MESSAGE_TEMPLATES,
     seed_catalog,
     seed_lot_templates,
     seed_message_templates,
@@ -163,6 +164,47 @@ async def test_seed_upgrades_exact_pre_order_qualified_copy(session):
     assert previous.content == DEFAULT_MESSAGE_TEMPLATES["rental_ambiguous"]["ru"]
     assert "{active_orders}" in previous.content
     assert custom.content == "My operator copy"
+
+
+@pytest.mark.asyncio
+async def test_seed_upgrades_exact_pre_refined_copy_without_overwriting_custom(session):
+    previous = MessageTemplate(
+        key="welcome",
+        lang="ru",
+        content=PRE_REFINED_MESSAGE_TEMPLATES["welcome"]["ru"],
+    )
+    custom = MessageTemplate(
+        key="welcome",
+        lang="en",
+        content="Custom {login} / {password}",
+    )
+    previous_lot = PRE_REFINED_LOT_TEMPLATES["default"]
+    lot = LotTemplate(
+        key="default",
+        name=previous_lot.name,
+        title_template_ru=previous_lot.title_ru,
+        title_template_en=previous_lot.title_en,
+        description_template_ru=previous_lot.description_ru,
+        description_template_en=previous_lot.description_en,
+        is_enabled=True,
+        system_managed=True,
+    )
+    session.add_all([previous, custom, lot])
+    await session.commit()
+
+    await seed_message_templates(session)
+    await seed_lot_templates(session)
+    await session.refresh(previous)
+    await session.refresh(custom)
+    await session.refresh(lot)
+
+    assert previous.content == DEFAULT_MESSAGE_TEMPLATES["welcome"]["ru"]
+    assert custom.content == "Custom {login} / {password}"
+    assert lot.title_template_ru == DEFAULT_LOT_TEMPLATES["default"].title_ru
+    assert (
+        lot.description_template_ru
+        == DEFAULT_LOT_TEMPLATES["default"].description_ru
+    )
 
 
 @pytest.mark.asyncio

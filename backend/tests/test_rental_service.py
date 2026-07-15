@@ -161,7 +161,8 @@ async def test_fulfill_order_creates_rental_and_sends_welcome(session: AsyncSess
     assert len(gateway.sent_messages) == 1
     chat_id, text = gateway.sent_messages[0]
     assert chat_id == 100
-    assert "73%" in text
+    assert "61%" in text
+    assert "73%" not in text
     assert "7 дн." in text
     assert "20.07.2026 09:00 UTC" in text
     assert "%%" not in text
@@ -348,8 +349,7 @@ async def test_failed_delivery_is_durable_and_retry_reuses_same_rental(
         limits = await updater.get(AccountLimits, account.id)
         assert limits is not None
         limits.codex_primary_remaining_pct = 1
-        limits.codex_primary_window_seconds = 30 * 24 * 60 * 60
-        limits.codex_primary_resets_at = datetime(
+        limits.codex_secondary_resets_at = datetime(
             2026, 8, 12, 9, 0, tzinfo=timezone.utc
         )
         limits.codex_secondary_remaining_pct = 1
@@ -374,7 +374,7 @@ async def test_failed_delivery_is_durable_and_retry_reuses_same_rental(
     assert "12.08.2026 09:00 UTC" in delivered_text
     assert retried.issued_codex_primary_pct == 1
     assert retried.issued_codex_secondary_pct == 1
-    assert retried.issued_codex_primary_window_seconds == 30 * 24 * 60 * 60
+    assert retried.issued_codex_secondary_window_seconds == 7 * 24 * 60 * 60
     assert retried.credentials_delivered_at is not None
     term = (
         retried.expires_at.replace(tzinfo=timezone.utc)

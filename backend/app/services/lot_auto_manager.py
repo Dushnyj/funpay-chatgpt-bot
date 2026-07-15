@@ -60,15 +60,34 @@ class LotAutoManager:
         gateway: ChatGateway,
         *,
         refresh_stock: bool = False,
+        refresh_published: bool = False,
     ) -> list[LotAction]:
         actions = await self._pause_catalog_invalid_lots(session, gateway)
-        actions.extend(
-            await self.sync_missing_provenance_markers(session, gateway)
+        marker_actions = await self.sync_missing_provenance_markers(
+            session,
+            gateway,
         )
+        actions.extend(marker_actions)
+        # A marker migration is already a complete offer save, so the forced
+        # refresh pass below need not immediately repeat the same request.
+        full_synced_lot_ids = {
+            action.lot_id
+            for action in marker_actions
+            if action.action == "update"
+        }
         if self._funpay_node_id <= 0:
             # Without a configured global node we can still make unsafe offers
-            # unavailable, but must not rewrite/sync otherwise valid auto lots:
-            # _apply_matrix would replace their per-lot node with zero.
+            # unavailable, but must not apply a matrix to otherwise valid auto
+            # lots: _apply_matrix would replace their per-lot node with zero.
+            # A forced refresh remains safe because it reuses every published
+            # lot's own node and exact bound offer id.
+            if refresh_published:
+                refreshed = await self._force_refresh_published_lots(
+                    session,
+                    gateway,
+                    skip_lot_ids=full_synced_lot_ids,
+                )
+                self._merge_forced_refresh_actions(actions, refreshed)
             await session.flush()
             return actions
         matrices = await self._load_price_matrices(session)
@@ -110,6 +129,7 @@ class LotAutoManager:
                 # identity and never an unbound offer available for sale.
                 await session.commit()
                 await self._publish_pending_lot(session, gateway, lot)
+                full_synced_lot_ids.add(lot.id)
                 actions.append(LotAction(lot.id, "create"))
                 continue
 
@@ -133,10 +153,12 @@ class LotAutoManager:
             if has_capacity and automatically_paused:
                 if lot.paused_reason == _AUTO_PUBLISH_PENDING:
                     await self._publish_pending_lot(session, gateway, lot)
+                    full_synced_lot_ids.add(lot.id)
                     actions.append(LotAction(lot.id, "activate"))
                     continue
                 if changed or refresh_stock:
                     await self._sync.sync_lot(session, gateway, lot.id, active=True)
+                    full_synced_lot_ids.add(lot.id)
                 else:
                     await self._sync.activate_lot(session, gateway, lot.id)
                 lot.status = "active"
@@ -146,6 +168,7 @@ class LotAutoManager:
             elif has_capacity and lot.status == "active":
                 if changed or refresh_stock:
                     await self._sync.sync_lot(session, gateway, lot.id, active=True)
+                    full_synced_lot_ids.add(lot.id)
                     await session.commit()
                 actions.append(LotAction(
                     lot.id,
@@ -154,8 +177,9 @@ class LotAutoManager:
             elif not has_capacity and lot.status == "active":
                 # Full sync updates a changed price and deactivates atomically
                 # from the application's perspective.
-                if changed:
+                if changed or refresh_stock:
                     await self._sync.sync_lot(session, gateway, lot.id, active=False)
+                    full_synced_lot_ids.add(lot.id)
                 else:
                     await self._sync.pause_lot(session, gateway, lot.id)
                 lot.status = "paused"
@@ -165,7 +189,7 @@ class LotAutoManager:
             else:
                 # A manual pause is never undone by automation.  Keep the
                 # remote content current while preserving the inactive state.
-                if changed:
+                if changed or refresh_stock:
                     if lot.funpay_id:
                         await self._sync.sync_lot(
                             session,
@@ -173,11 +197,84 @@ class LotAutoManager:
                             lot.id,
                             active=False,
                         )
+                        full_synced_lot_ids.add(lot.id)
                     await session.commit()
-                actions.append(LotAction(lot.id, "update" if changed else "none"))
+                actions.append(LotAction(
+                    lot.id,
+                    "update" if changed or refresh_stock else "none",
+                ))
+
+        if refresh_published:
+            # Matrix reconciliation above covers configured auto lots. This
+            # final pass is deliberately broader: payment-message content is
+            # not stored on Lot, and published manual/orphaned/paused offers
+            # would otherwise never receive an edited payment_received
+            # template. Every save uses the existing offer id and the final
+            # safe local status, so it cannot create an offer or reanimate a
+            # lot paused by catalog/capacity safety checks.
+            refreshed = await self._force_refresh_published_lots(
+                session,
+                gateway,
+                skip_lot_ids=full_synced_lot_ids,
+            )
+            self._merge_forced_refresh_actions(actions, refreshed)
 
         await session.flush()
         return actions
+
+    async def _force_refresh_published_lots(
+        self,
+        session: AsyncSession,
+        gateway: ChatGateway,
+        *,
+        skip_lot_ids: set[int],
+    ) -> list[int]:
+        """Full-sync every bound supported offer without changing its status."""
+
+        result = await session.execute(
+            select(Lot.id, Lot.status)
+            .join(SubscriptionTier, SubscriptionTier.id == Lot.tier_id)
+            .where(
+                Lot.funpay_id.is_not(None),
+                Lot.status.in_(("active", "paused")),
+                SubscriptionTier.code.in_(SUPPORTED_FUNPAY_TIER_CODES),
+            )
+            .order_by(Lot.id)
+        )
+        refreshed: list[int] = []
+        for lot_id, status in result.all():
+            if lot_id in skip_lot_ids:
+                continue
+            await self._sync.sync_lot(
+                session,
+                gateway,
+                lot_id,
+                active=status == "active",
+            )
+            await session.commit()
+            refreshed.append(lot_id)
+        return refreshed
+
+    @staticmethod
+    def _merge_forced_refresh_actions(
+        actions: list[LotAction],
+        refreshed_lot_ids: list[int],
+    ) -> None:
+        """Expose one meaningful action per lot after the final full save."""
+
+        for lot_id in refreshed_lot_ids:
+            existing_index = next(
+                (
+                    index
+                    for index, action in enumerate(actions)
+                    if action.lot_id == lot_id
+                ),
+                None,
+            )
+            if existing_index is None:
+                actions.append(LotAction(lot_id, "update"))
+            elif actions[existing_index].action == "none":
+                actions[existing_index] = LotAction(lot_id, "update")
 
     async def _publish_pending_lot(
         self,
@@ -442,7 +539,9 @@ class LotAutoManager:
             duration_id=matrix.duration_id,
             limit_scope_id=matrix.limit_scope_id,
             min_limit_pct=matrix.min_limit_pct,
-            max_5h_pct=matrix.max_5h_pct,
+            # Kept in the schema for legacy compatibility only. New offers
+            # expose and sell the verified plan-specific long Codex window.
+            max_5h_pct=None,
             max_weekly_pct=matrix.max_weekly_pct,
             price=matrix.price,
             title_ru=title_ru,
@@ -477,6 +576,9 @@ class LotAutoManager:
             lot.title_en != title_en,
             lot.description_ru != description_ru,
             lot.description_en != description_en,
+            lot.min_limit_pct != matrix.min_limit_pct,
+            lot.max_5h_pct is not None,
+            lot.max_weekly_pct != matrix.max_weekly_pct,
         ))
         lot.price = matrix.price
         lot.funpay_node_id = self._funpay_node_id
@@ -484,6 +586,9 @@ class LotAutoManager:
         lot.title_en = title_en
         lot.description_ru = description_ru
         lot.description_en = description_en
+        lot.min_limit_pct = matrix.min_limit_pct
+        lot.max_5h_pct = None
+        lot.max_weekly_pct = matrix.max_weekly_pct
         return changed
 
     async def _render_contents(
@@ -523,8 +628,9 @@ class LotAutoManager:
                 if matrix.min_limit_pct is not None else "—"
             ),
             "short_limit": (
-                f"{matrix.max_5h_pct}%"
-                if matrix.max_5h_pct is not None else "—"
+                # Legacy template compatibility only: the short window is no
+                # longer a sellable or buyer-visible condition.
+                "—"
             ),
             "long_limit": (
                 f"{matrix.max_weekly_pct}%"
@@ -563,22 +669,19 @@ class LotAutoManager:
             if compact:
                 return f"Codex ≥ {minimum}%"
             return (
-                f"остаток во всех наблюдаемых окнах Codex не ниже {minimum}%"
+                f"остаток длинного окна Codex не ниже {minimum}%"
                 if lang == "ru"
-                else f"at least {minimum}% remaining in every observed Codex window"
+                else f"at least {minimum}% remaining in the long Codex window"
             )
-        ceilings = [
-            value for value in (matrix.max_5h_pct, matrix.max_weekly_pct)
-            if value is not None
-        ]
-        if code == "any" and ceilings:
-            compact_values = "/".join(f"≤ {value}%" for value in ceilings)
+        long_ceiling = matrix.max_weekly_pct
+        if code == "any" and long_ceiling is not None:
+            compact_value = f"≤ {long_ceiling}%"
             if compact:
-                return f"Codex {compact_values}"
+                return f"Codex {compact_value}"
             return (
-                f"без минимальной гарантии; остаток Codex {compact_values}"
+                f"без минимальной гарантии; длинный лимит Codex {compact_value}"
                 if lang == "ru"
-                else f"no minimum guarantee; Codex remainder {compact_values}"
+                else f"no minimum guarantee; long Codex allowance {compact_value}"
             )
         if compact:
             return "без гарантии" if lang == "ru" else "no limit guarantee"

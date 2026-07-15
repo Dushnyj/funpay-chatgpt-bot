@@ -7,6 +7,7 @@ import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Duration, Rental } from '../types/api'
 import { formatDurationMinutes } from '../utils/catalogEditor'
+import { selectExpectedCodexUsage } from '../utils/accountValidation'
 import { formatCurrency, formatDateTime } from '../utils/format'
 import { isInitialRentalDeliveryPending, isOccupyingRentalStatus } from '../utils/rentalDisplay'
 
@@ -85,11 +86,19 @@ function purchasedDuration(durationId: number | null, durations: Duration[]) {
 }
 
 function issuedLimitsSnapshot(rental: Rental) {
-  const windows = [
-    formatIssuedWindow(rental.issued_codex_primary_pct, rental.issued_codex_primary_window_seconds, rental.issued_codex_primary_resets_at),
-    formatIssuedWindow(rental.issued_codex_secondary_pct, rental.issued_codex_secondary_window_seconds, rental.issued_codex_secondary_resets_at),
-  ].filter(Boolean)
-  return windows.length > 0 ? `При выдаче: ${windows.join(' · ')}` : 'Снимок лимитов отсутствует'
+  const window = selectExpectedCodexUsage({
+    planWindowStatus: rental.issued_plan_window_status,
+    expectedWindowSeconds: rental.issued_expected_long_window_seconds,
+    primaryRemainingPct: rental.issued_codex_primary_pct,
+    primaryWindowSeconds: rental.issued_codex_primary_window_seconds,
+    primaryResetsAt: rental.issued_codex_primary_resets_at,
+    secondaryRemainingPct: rental.issued_codex_secondary_pct,
+    secondaryWindowSeconds: rental.issued_codex_secondary_window_seconds,
+    secondaryResetsAt: rental.issued_codex_secondary_resets_at,
+  })
+  return window
+    ? `При выдаче: ${formatIssuedWindow(window.remainingPct, window.windowSeconds, window.resetsAt)}`
+    : 'Проверенный длинный лимит не зафиксирован'
 }
 
 function formatIssuedWindow(remaining: number | null, seconds: number | null, resetsAt: string | null) {
@@ -110,16 +119,13 @@ function issuedWindowContract(rental: Rental) {
 }
 
 function formatWindow(seconds: number) {
-  return seconds === 18_000 ? '5 ч' : seconds === 604_800 ? '7 д' : seconds === 2_592_000 ? '30 д' : `${Math.round(seconds / 3_600)} ч`
+  return seconds === 604_800 ? '7 д' : seconds === 2_592_000 ? '30 д' : `${Math.round(seconds / 3_600)} ч`
 }
 
 function purchasedLimitCondition(item: Pick<Rental, 'min_limit_pct' | 'max_5h_pct' | 'max_weekly_pct'>) {
-  if (item.min_limit_pct !== null) return `Условие: не ниже ${item.min_limit_pct}%`
-  const ceilings = [
-    item.max_5h_pct !== null ? `5 ч ≤ ${item.max_5h_pct}%` : '',
-    item.max_weekly_pct !== null ? `длинное ≤ ${item.max_weekly_pct}%` : '',
-  ].filter(Boolean)
-  return ceilings.length > 0 ? `Условие: ${ceilings.join(', ')}` : 'Условие: без гарантии лимита'
+  if (item.min_limit_pct !== null) return `Условие: длинный лимит Codex ≥ ${item.min_limit_pct}%`
+  if (item.max_weekly_pct !== null) return `Условие: длинный лимит Codex ≤ ${item.max_weekly_pct}%`
+  return 'Условие: без гарантии лимита'
 }
 
 function deliveryTone(status: string) {

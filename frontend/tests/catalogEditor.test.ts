@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   compareDurationsByMinutes,
   formatDurationMinutes,
+  tierSaleControl,
   validateDurationInput,
 } from '../src/utils/catalogEditor.ts'
 
@@ -16,6 +17,30 @@ test('durations are ordered by minutes with id as a stable tie breaker', () => {
   ]
 
   assert.deepEqual(durations.sort(compareDurationsByMinutes).map((duration) => duration.id), [2, 3, 4, 9])
+})
+
+test('unsupported recognized tiers cannot be presented as sellable', () => {
+  assert.deepEqual(tierSaleControl({
+    is_active: true,
+    is_sellable: true,
+    funpay_supported: false,
+  }), {
+    checked: false,
+    disabled: true,
+    label: 'Не поддерживается FunPay',
+  })
+})
+
+test('supported operator-disabled tiers remain toggleable while active', () => {
+  assert.deepEqual(tierSaleControl({
+    is_active: true,
+    is_sellable: false,
+    funpay_supported: true,
+  }), {
+    checked: false,
+    disabled: false,
+    label: 'Запрещена',
+  })
 })
 
 test('duration labels use readable Russian units and mixed values', () => {

@@ -884,7 +884,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 )
             }
         )
-    assert version == "20260714_0020"
+    assert version == "20260715_0021"
     assert "funpay_sales" in tables
     assert "funpay_sale_sync_state" in tables
     assert "funpay_sale_candidates" in tables
@@ -900,7 +900,6 @@ async def test_upgrade_database_creates_head_schema_idempotently(
     assert {"profile_attempts", "profile_next_attempt_at"} <= chat_columns
     assert catalog == {
         "free", "go", "plus", "pro_5x", "pro_20x", "business",
-        "enterprise", "edu", "teachers", "healthcare", "clinicians", "gov",
     }
     assert account_columns["tier_id"]["nullable"] is True
     assert {
@@ -1564,7 +1563,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260714_0020"
+    assert version == "20260715_0021"
     await engine.dispose()
 
 
@@ -1655,7 +1654,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 2: 1, 4: 1}
-    assert version == "20260714_0020"
+    assert version == "20260715_0021"
     await engine.dispose()
 
 
