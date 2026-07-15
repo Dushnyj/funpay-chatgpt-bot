@@ -49,6 +49,17 @@ export function useRecheckAccount() {
   })
 }
 
+export function useConfirmBrowserValidation() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => api.post<Account>(`/accounts/${id}/confirm-browser-validation`),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['accounts'] })
+      void qc.invalidateQueries({ queryKey: ['metrics'] })
+    },
+  })
+}
+
 export function useUpdateAccount() {
   const qc = useQueryClient()
   return useMutation({

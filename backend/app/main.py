@@ -51,11 +51,15 @@ async def lifespan(app: FastAPI):
         category_id=0,
     )
     app.state.lifecycle = lifecycle
+    account_device_auth_manager.set_validation_queued_callback(
+        lifecycle.request_validation_check
+    )
     await lifecycle.start()
     try:
         yield
     finally:
         await account_device_auth_manager.shutdown()
+        account_device_auth_manager.set_validation_queued_callback(None)
         try:
             await lifecycle.stop()
         finally:

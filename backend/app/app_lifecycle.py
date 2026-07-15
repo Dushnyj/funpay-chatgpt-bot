@@ -296,6 +296,11 @@ class AppLifecycle:
                 name="capacity-lot-reconcile",
             )
 
+    def request_validation_check(self) -> None:
+        """Wake the serialized validation queue after a durable enqueue."""
+
+        self.scheduler.wake("refresh_recover")
+
     async def _capacity_reconcile_loop(self) -> None:
         """Drain the dirty flag; retain it across transient remote failures."""
 
@@ -814,13 +819,19 @@ class AppLifecycle:
                 )
                 return await worker.process_next(session)
 
-        processed = await asyncio.gather(
-            *(process_one() for _ in range(self._refresh_concurrency))
-        )
-        # Validation/limit jobs can add or remove sellable accounts. Signal
-        # once after the whole worker batch instead of reconciling per row.
-        if any(processed):
+        while True:
+            processed = await asyncio.gather(
+                *(process_one() for _ in range(self._refresh_concurrency))
+            )
+            if not any(processed):
+                break
+            # Publish newly available capacity after each completed batch;
+            # the reconcile worker coalesces repeated dirty signals while a
+            # large browser backlog continues draining.
             self.request_capacity_reconcile()
+            # Keep a large queue cooperative even when a mocked or unusually
+            # fast worker completes without yielding control itself.
+            await asyncio.sleep(0)
 
     async def _recover_interrupted_validation_jobs(self) -> None:
         """At startup, every worker lease belongs to the previous process."""

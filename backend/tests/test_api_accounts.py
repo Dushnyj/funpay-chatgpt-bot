@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -35,6 +36,101 @@ async def _seed_tier(session: AsyncSession) -> int:
     session.add(tier)
     await session.flush()
     return tier.id
+
+
+async def _seed_browser_confirmation_evidence(
+    session: AsyncSession,
+    *,
+    login: str = "manual-browser@example.com",
+    password: str = "stored-password",
+    totp_secret: str = "JBSWY3DPEHPK3PXP",
+    intermediate_full_job: bool = False,
+) -> tuple[Account, AccountLimits, AccountCheckJob, AccountCheckJob]:
+    now = datetime.now(timezone.utc)
+    tier_id = await _seed_tier(session)
+    account = Account(
+        login=login,
+        password_encrypted=password,
+        totp_secret_encrypted=totp_secret,
+        tier_id=tier_id,
+        plan_raw_type="plus",
+        plan_source="id_token",
+        plan_confidence=1.0,
+        plan_detected_at=now - timedelta(minutes=2),
+        status="validation_failed",
+    )
+    session.add(account)
+    await session.flush()
+    limits = AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="refresh-token",
+        access_token_encrypted="access-token",
+        plan_type="plus",
+        plan_window_status="ok",
+        expected_long_window_seconds=7 * 24 * 60 * 60,
+        codex_primary_remaining_pct=79,
+        codex_primary_window_seconds=7 * 24 * 60 * 60,
+        measured_at=now - timedelta(minutes=2),
+        refresh_status="ok",
+    )
+    device_job = AccountCheckJob(
+        account_id=account.id,
+        priority="manual",
+        job_type="device_auth",
+        status="done",
+        result="tokens_connected",
+        created_at=now - timedelta(minutes=5),
+        started_at=now - timedelta(minutes=5),
+        finished_at=now - timedelta(minutes=4),
+    )
+    session.add_all([limits, device_job])
+    await session.flush()
+    if intermediate_full_job:
+        session.add(
+            AccountCheckJob(
+                account_id=account.id,
+                priority="scheduled",
+                job_type="full_validation",
+                status="done",
+                result="ok",
+                created_at=now - timedelta(minutes=3),
+                started_at=now - timedelta(minutes=3),
+                finished_at=now - timedelta(minutes=2, seconds=30),
+            )
+        )
+        await session.flush()
+    validation_job = AccountCheckJob(
+        account_id=account.id,
+        priority="manual",
+        job_type="full_validation",
+        status="failed",
+        created_at=now - timedelta(minutes=4),
+        started_at=now - timedelta(minutes=2),
+        finished_at=now - timedelta(minutes=1),
+        error=json.dumps(
+            {
+                "stage": "login",
+                "code": "cloudflare_challenge",
+                "detail": "Cloudflare blocked the server browser.",
+            }
+        ),
+    )
+    session.add(validation_job)
+    await session.flush()
+    session.add(
+        AuditLog(
+            event_type="account_device_auth_completed",
+            account_id=account.id,
+            timestamp=now - timedelta(minutes=3, seconds=59),
+            metadata_={
+                "actor": "admin",
+                "job_id": device_job.id,
+                "credential_validation_job_id": validation_job.id,
+            },
+        )
+    )
+    await session.commit()
+    return account, limits, device_job, validation_job
 
 
 async def test_list_accounts_empty(auth_client: AsyncClient, session: AsyncSession):
@@ -249,6 +345,31 @@ async def test_capacity_callback_failure_does_not_undo_committed_status(
     assert account.status == "maintenance"
 
 
+async def test_validation_enqueues_wake_scheduler_without_false_http_failure(
+    auth_client: AsyncClient,
+):
+    lifecycle = MagicMock()
+    lifecycle.request_validation_check.side_effect = RuntimeError("offline")
+    app.state.lifecycle = lifecycle
+    try:
+        created = await auth_client.post(
+            "/api/accounts",
+            json={"login": "wake-validation", "password": "password"},
+        )
+        assert created.status_code == 201
+        lifecycle.request_validation_check.assert_called_once_with()
+
+        lifecycle.reset_mock()
+        repaired = await auth_client.patch(
+            f"/api/accounts/{created.json()['id']}/credentials",
+            json={"password": "replacement-password"},
+        )
+        assert repaired.status_code == 202
+        lifecycle.request_validation_check.assert_called_once_with()
+    finally:
+        del app.state.lifecycle
+
+
 async def test_device_auth_start_requests_capacity_reconcile(
     auth_client: AsyncClient,
     session: AsyncSession,
@@ -287,6 +408,211 @@ async def test_device_auth_start_requests_capacity_reconcile(
     lifecycle.request_capacity_reconcile.assert_called_once_with()
 
 
+async def test_manual_browser_confirmation_activates_only_attested_account(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, _limits, device_job, validation_job = (
+        await _seed_browser_confirmation_evidence(session)
+    )
+    lifecycle = MagicMock()
+    lifecycle.request_capacity_reconcile.side_effect = RuntimeError("offline")
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.post(
+            f"/api/accounts/{account.id}/confirm-browser-validation"
+        )
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "active"
+    assert response.json()["validation_job"]["id"] == validation_job.id
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
+    await session.refresh(account)
+    assert account.status == "active"
+    assert account.chatgpt_last_check_at is not None
+    audit = (
+        await session.execute(
+            select(AuditLog).where(
+                AuditLog.event_type == "account_browser_validation_confirmed"
+            )
+        )
+    ).scalar_one()
+    assert audit.account_id == account.id
+    assert audit.metadata_ == {
+        "actor": "admin",
+        "device_auth_job_id": device_job.id,
+        "full_validation_job_id": validation_job.id,
+    }
+
+
+@pytest.mark.parametrize(
+    ("password", "totp_secret"),
+    [
+        ("", "JBSWY3DPEHPK3PXP"),
+        ("stored-password", "not-a-base32-secret!"),
+    ],
+)
+async def test_manual_browser_confirmation_rejects_invalid_stored_credentials(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    password: str,
+    totp_secret: str,
+):
+    account, *_rest = await _seed_browser_confirmation_evidence(
+        session,
+        password=password,
+        totp_secret=totp_secret,
+    )
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert response.status_code == 422
+    await session.refresh(account)
+    assert account.status == "validation_failed"
+
+
+@pytest.mark.parametrize(
+    "invalid_evidence",
+    [
+        "wrong_error",
+        "stale_device",
+        "stale_limits",
+        "window_mismatch",
+        "missing_tier",
+        "operator_override",
+        "unlinked_device_auth",
+    ],
+)
+async def test_manual_browser_confirmation_rejects_incomplete_evidence(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    invalid_evidence: str,
+):
+    account, limits, device_job, validation_job = (
+        await _seed_browser_confirmation_evidence(
+            session,
+            login=f"{invalid_evidence}@example.com",
+        )
+    )
+    if invalid_evidence == "wrong_error":
+        validation_job.error = json.dumps(
+            {"stage": "login", "code": "invalid_credentials", "detail": "bad"}
+        )
+    elif invalid_evidence == "stale_device":
+        device_job.finished_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    elif invalid_evidence == "stale_limits":
+        limits.measured_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    elif invalid_evidence == "window_mismatch":
+        limits.plan_window_status = "mismatch"
+    elif invalid_evidence == "missing_tier":
+        account.tier_id = None
+    elif invalid_evidence == "operator_override":
+        account.operator_status_override = "maintenance"
+    else:
+        completion_audit = (
+            await session.execute(
+                select(AuditLog).where(
+                    AuditLog.account_id == account.id,
+                    AuditLog.event_type == "account_device_auth_completed",
+                )
+            )
+        ).scalar_one()
+        completion_audit.metadata_ = {
+            **completion_audit.metadata_,
+            "credential_validation_job_id": validation_job.id + 1,
+        }
+    await session.commit()
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert response.status_code == 409
+    await session.refresh(account)
+    assert account.status == "validation_failed"
+
+
+async def test_manual_browser_confirmation_rejects_busy_account(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+):
+    account, *_rest = await _seed_browser_confirmation_evidence(session)
+    monkeypatch.setattr(
+        accounts_router,
+        "account_is_busy",
+        AsyncMock(return_value=True),
+    )
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert response.status_code == 409
+    await session.refresh(account)
+    assert account.status == "validation_failed"
+
+
+async def test_manual_browser_confirmation_rejects_intermediate_validation_job(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, *_rest = await _seed_browser_confirmation_evidence(
+        session,
+        intermediate_full_job=True,
+    )
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert response.status_code == 409
+    await session.refresh(account)
+    assert account.status == "validation_failed"
+
+
+async def test_manual_browser_confirmation_rejects_credentials_changed_after_device_auth(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    account, *_rest = await _seed_browser_confirmation_evidence(session)
+
+    changed = await auth_client.patch(
+        f"/api/accounts/{account.id}/credentials",
+        json={"password": "replacement-password"},
+    )
+    assert changed.status_code == 202
+    replacement_job = await session.get(
+        AccountCheckJob,
+        changed.json()["validation_job"]["id"],
+    )
+    now = datetime.now(timezone.utc)
+    replacement_job.status = "failed"
+    replacement_job.started_at = now - timedelta(seconds=20)
+    replacement_job.finished_at = now - timedelta(seconds=10)
+    replacement_job.error = json.dumps(
+        {
+            "stage": "login",
+            "code": "cloudflare_challenge",
+            "detail": "Cloudflare blocked the server browser.",
+        }
+    )
+    account.status = "validation_failed"
+    await session.commit()
+
+    response = await auth_client.post(
+        f"/api/accounts/{account.id}/confirm-browser-validation"
+    )
+
+    assert response.status_code == 409
+    await session.refresh(account)
+    assert account.status == "validation_failed"
+
+
 async def test_failed_account_can_be_requeued_with_visible_job(
     auth_client: AsyncClient,
     session: AsyncSession,
@@ -321,6 +647,7 @@ async def test_failed_account_can_be_requeued_with_visible_job(
     assert payload["validation_job"]["priority"] == "manual"
     await session.refresh(account)
     assert account.operator_status_override is None
+    lifecycle.request_validation_check.assert_called_once_with()
     lifecycle.request_capacity_reconcile.assert_called_once_with()
 
 

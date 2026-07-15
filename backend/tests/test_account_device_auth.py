@@ -63,7 +63,13 @@ async def test_device_auth_success_verifies_identity(
     monkeypatch,
 ):
     account = await _account(session)
-    manager = AccountDeviceAuthManager()
+    validation_wakes = 0
+
+    def validation_queued():
+        nonlocal validation_wakes
+        validation_wakes += 1
+
+    manager = AccountDeviceAuthManager(validation_queued=validation_queued)
 
     async def fake_request():
         return DeviceCode("device", "ABCD-EFGH", 1)
@@ -105,6 +111,7 @@ async def test_device_auth_success_verifies_identity(
     )
     assert len(credential_jobs) == 1
     assert credential_jobs[0].status == "pending"
+    assert validation_wakes == 1
 
 
 async def test_device_auth_rejects_another_openai_account(

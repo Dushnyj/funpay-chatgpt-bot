@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -10,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.capacity import notify_capacity_changed
+from app.api.capacity import notify_capacity_changed, notify_validation_queued
 from app.api.deps import get_current_user, get_db_session
 from app.api.schemas import (
     AccountCreate,
@@ -45,6 +46,7 @@ from app.integrations.openai.device_auth import DeviceAuthError
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depends(get_current_user)])
 _check_job_queue = CheckJobQueue()
+_MANUAL_BROWSER_CONFIRMATION_MAX_AGE = timedelta(minutes=30)
 
 
 class BulkAccountItem(BaseModel):
@@ -89,6 +91,26 @@ def _validation_job_out(job: AccountCheckJob | None) -> ValidationJobOut | None:
         started_at=job.started_at,
         finished_at=job.finished_at,
     )
+
+
+def _job_error_code(job: AccountCheckJob | None) -> str | None:
+    if job is None or not job.error:
+        return None
+    try:
+        payload = json.loads(job.error)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("code"):
+        return None
+    return str(payload["code"])
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _account_out(
@@ -219,7 +241,11 @@ async def list_accounts(session: AsyncSession = Depends(get_db_session)):
 
 
 @router.post("", response_model=AccountOut, status_code=201)
-async def create_account(req: AccountCreate, session: AsyncSession = Depends(get_db_session)):
+async def create_account(
+    req: AccountCreate,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
     account = Account(
         login=req.login,
         password_encrypted=req.password,
@@ -240,13 +266,18 @@ async def create_account(req: AccountCreate, session: AsyncSession = Depends(get
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Login already exists")
+    notify_validation_queued(request)
     await session.refresh(account)
     await session.refresh(job)
     return _account_out(account, job)
 
 
 @router.post("/bulk", response_model=BulkAccountResponse, status_code=201)
-async def bulk_add_accounts(req: BulkAccountRequest, session: AsyncSession = Depends(get_db_session)):
+async def bulk_add_accounts(
+    req: BulkAccountRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
     accounts: list[Account] = []
     for item in req.accounts:
         account = Account(
@@ -270,6 +301,7 @@ async def bulk_add_accounts(req: BulkAccountRequest, session: AsyncSession = Dep
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Duplicate login")
+    notify_validation_queued(request)
     return BulkAccountResponse(created=len(req.accounts))
 
 
@@ -340,6 +372,7 @@ async def recheck_account(
         )
     )
     await session.commit()
+    notify_validation_queued(request)
     notify_capacity_changed(request)
     await session.refresh(account)
     await session.refresh(job)
@@ -460,6 +493,236 @@ async def get_device_auth_status(
             if auth_session.status == "completed"
             else None
         ),
+    )
+
+
+@router.post(
+    "/{account_id}/confirm-browser-validation",
+    response_model=AccountOut,
+)
+async def confirm_browser_validation(
+    account_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Accept an operator-observed login only for the narrow Cloudflare case.
+
+    Device Auth already attests identity, tokens, tier and usage data. This
+    endpoint is the final manual acknowledgement that the stored password and
+    TOTP were exercised successfully in a real browser when the server-side
+    Playwright pass could not get beyond Cloudflare.
+    """
+
+    account = (
+        await session.execute(
+            select(Account).where(Account.id == account_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    # Freshness must be measured after the account lock is acquired. Otherwise
+    # a request waiting behind a long-running credential operation could reuse
+    # evidence that expired while it was blocked.
+    now = datetime.now(timezone.utc)
+    cutoff = now - _MANUAL_BROWSER_CONFIRMATION_MAX_AGE
+    if await account_is_busy(session, account.id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Нельзя подтверждать вход, пока аккаунт занят арендой или "
+                "зарезервирован для замены."
+            ),
+        )
+    if account.operator_status_override is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Сначала снимите ручную приостановку аккаунта.",
+        )
+    if account.status != "validation_failed" or account.validation_rerun_requested:
+        raise HTTPException(
+            status_code=409,
+            detail="Аккаунт не ожидает ручного подтверждения входа.",
+        )
+
+    password = account.password_encrypted
+    totp_secret = account.totp_secret_encrypted or ""
+    if not isinstance(password, str) or not password.strip():
+        raise HTTPException(status_code=422, detail="Сохранённый пароль недоступен.")
+    if not is_valid_base32(totp_secret):
+        raise HTTPException(status_code=422, detail="Сохранённый TOTP setup key некорректен.")
+
+    current_job = (
+        await session.execute(
+            select(AccountCheckJob)
+            .where(AccountCheckJob.account_id == account.id)
+            .order_by(AccountCheckJob.id.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        current_job is None
+        or current_job.job_type != "full_validation"
+        or current_job.status != "failed"
+        or _job_error_code(current_job) != "cloudflare_challenge"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Последняя полная проверка завершилась не только на Cloudflare.",
+        )
+
+    active_job = (
+        await session.execute(
+            select(AccountCheckJob.id)
+            .where(
+                AccountCheckJob.account_id == account.id,
+                AccountCheckJob.status.in_(("pending", "running")),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if active_job is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Новая проверка аккаунта ещё выполняется.",
+        )
+
+    # Do not search backwards for any matching Device Auth job. The failed
+    # validation must be the exact follow-up created by the immediately
+    # preceding successful Device Auth, with no validation or credential
+    # operation in between.
+    device_job = (
+        await session.execute(
+            select(AccountCheckJob)
+            .where(
+                AccountCheckJob.account_id == account.id,
+                AccountCheckJob.id < current_job.id,
+            )
+            .order_by(AccountCheckJob.id.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    device_finished_at = _as_utc(
+        device_job.finished_at if device_job is not None else None
+    )
+    validation_finished_at = _as_utc(current_job.finished_at)
+    if (
+        device_job is None
+        or device_job.job_type != "device_auth"
+        or device_job.status != "done"
+        or device_job.result != "tokens_connected"
+        or device_finished_at is None
+        or device_finished_at < cutoff
+        or validation_finished_at is None
+        or validation_finished_at < device_finished_at
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Нет свежего успешного подтверждения Device Auth.",
+        )
+
+    completion_audits = list(
+        (
+            await session.execute(
+                select(AuditLog)
+                .where(
+                    AuditLog.account_id == account.id,
+                    AuditLog.event_type == "account_device_auth_completed",
+                    AuditLog.timestamp >= cutoff,
+                )
+                .order_by(AuditLog.id.desc())
+            )
+        ).scalars()
+    )
+    completion_audit = next(
+        (
+            audit
+            for audit in completion_audits
+            if isinstance(audit.metadata_, dict)
+            and audit.metadata_.get("job_id") == device_job.id
+            and audit.metadata_.get("credential_validation_job_id")
+            == current_job.id
+        ),
+        None,
+    )
+    credential_change_after_device_auth = False
+    if completion_audit is not None:
+        credential_change_after_device_auth = (
+            await session.execute(
+                select(AuditLog.id)
+                .where(
+                    AuditLog.account_id == account.id,
+                    AuditLog.event_type == "account_credentials_updated",
+                    AuditLog.id > completion_audit.id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none() is not None
+    if completion_audit is None or credential_change_after_device_auth:
+        raise HTTPException(
+            status_code=409,
+            detail="Цепочка Device Auth и проверки учётных данных изменилась.",
+        )
+
+    limits = (
+        await session.execute(
+            select(AccountLimits)
+            .where(AccountLimits.account_id == account.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    measured_at = _as_utc(limits.measured_at if limits is not None else None)
+    plan_detected_at = _as_utc(account.plan_detected_at)
+    if (
+        limits is None
+        or measured_at is None
+        or measured_at < cutoff
+        or limits.refresh_status != "ok"
+        or limits.plan_window_status != "ok"
+        or not limits.plan_type
+        or limits.plan_type == "unknown"
+        or not limits.expected_long_window_seconds
+        or not limits.refresh_token_encrypted
+        or not limits.access_token_encrypted
+        or account.tier_id is None
+        or plan_detected_at is None
+        or plan_detected_at < cutoff
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Нет свежих подтверждённых данных тарифа и лимита.",
+        )
+
+    account.status = "active"
+    account.chatgpt_last_check_at = now
+    account.validation_rerun_requested = False
+    session.add(
+        AuditLog(
+            event_type="account_browser_validation_confirmed",
+            account_id=account.id,
+            metadata_={
+                "actor": "admin",
+                "device_auth_job_id": device_job.id,
+                "full_validation_job_id": current_job.id,
+            },
+        )
+    )
+    await session.commit()
+    notify_capacity_changed(request)
+
+    await session.refresh(account)
+    email_oauth = await session.get(EmailOAuthCredential, account.id)
+    active_rentals_count = await _active_rental_count(session, account.id)
+    replacement_reserved = bool(
+        await replacement_reserved_account_ids(session, [account.id])
+    )
+    return _account_out(
+        account,
+        current_job,
+        email_oauth,
+        active_rentals_count,
+        replacement_reserved,
     )
 
 
@@ -643,6 +906,7 @@ async def update_account_credentials(
         await session.rollback()
         raise HTTPException(status_code=409, detail="Login already exists")
 
+    notify_validation_queued(request)
     notify_capacity_changed(request)
     await session.refresh(account)
     await session.refresh(job)

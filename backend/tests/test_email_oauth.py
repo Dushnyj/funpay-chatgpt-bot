@@ -262,6 +262,7 @@ async def test_callback_verifies_identity_encrypts_refresh_and_exposes_status(
     ).scalar_one()
     assert job.job_type == "full_validation"
     assert job.priority == "manual"
+    lifecycle.request_validation_check.assert_called_once_with()
     lifecycle.request_capacity_reconcile.assert_called_once_with()
 
     account_response = await auth_client.get(f"/api/accounts/{account.id}")

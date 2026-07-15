@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useCreateAccount, useDeleteAccount, useRecheckAccount, useRepairAccountCredentials, useStartDeviceAuth, useUpdateAccount } from '../api/accounts'
+import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useConfirmBrowserValidation, useCreateAccount, useDeleteAccount, useRecheckAccount, useRepairAccountCredentials, useStartDeviceAuth, useUpdateAccount } from '../api/accounts'
 import { useTiers } from '../api/catalog'
 import { api, ApiError } from '../api/client'
 import { useSettings } from '../api/settings'
@@ -15,6 +15,7 @@ export default function Accounts() {
   const settingsQuery = useSettings()
   const deleteAccount = useDeleteAccount()
   const recheckAccount = useRecheckAccount()
+  const confirmBrowserValidation = useConfirmBrowserValidation()
   const startDeviceAuthMutation = useStartDeviceAuth()
   const refetchAccounts = accountsQuery.refetch
   const [showForm, setShowForm] = useState(false)
@@ -30,6 +31,7 @@ export default function Accounts() {
   const [recheckTarget, setRecheckTarget] = useState<number | null>(null)
   const [deviceAuthTarget, setDeviceAuthTarget] = useState<number | null>(null)
   const [deviceAuthModal, setDeviceAuthModal] = useState<{ account: Account; session: DeviceAuthSession } | null>(null)
+  const [browserValidationTarget, setBrowserValidationTarget] = useState<Account | null>(null)
   const [emailOAuthTarget, setEmailOAuthTarget] = useState<number | null>(null)
 
   const accounts = useMemo(() => accountsQuery.data ?? [], [accountsQuery.data])
@@ -47,7 +49,7 @@ export default function Accounts() {
   const completeDeviceAuth = useCallback(async () => {
     setDeviceAuthModal(null)
     setActionError('')
-    setActionSuccess('Вход подтверждён. Аккаунт и его тариф успешно обновлены.')
+    setActionSuccess('Токены OpenAI подтверждены. Проверка сохранённого пароля и одноразового кода запущена.')
     await refetchAccounts()
   }, [refetchAccounts])
 
@@ -117,6 +119,21 @@ export default function Accounts() {
       setActionError(cause instanceof ApiError ? cause.message : 'Не удалось повторно запустить проверку')
     } finally {
       setRecheckTarget(null)
+    }
+  }
+
+  const confirmManualBrowserValidation = async () => {
+    if (!browserValidationTarget) return
+    setActionError('')
+    setActionSuccess('')
+    try {
+      await confirmBrowserValidation.mutateAsync(browserValidationTarget.id)
+      setBrowserValidationTarget(null)
+      setActionSuccess('Ручной вход подтверждён. Аккаунт прошёл проверку и снова доступен для выдачи.')
+      await refetchAccounts()
+    } catch (cause) {
+      setActionError(cause instanceof ApiError ? cause.message : 'Не удалось подтвердить ручной вход')
+      setBrowserValidationTarget(null)
     }
   }
 
@@ -270,6 +287,11 @@ export default function Accounts() {
                             {totpLoading === account.id ? <span className="spinner" /> : <Icon name="key" size={15} />}
                           </button>
                         </span>
+                        {needsManualBrowserConfirmation(account) && (
+                          <button type="button" className="icon-button account-icon-action account-icon-action--success" onClick={() => setBrowserValidationTarget(account)} disabled={accountOccupied} aria-label={`Подтвердить ручной вход для ${account.login}`} title={accountOccupied ? 'Нельзя подтверждать вход во время активной аренды' : 'Подтвердить успешный ручной вход'}>
+                            <Icon name="shield" size={15} />
+                          </button>
+                        )}
                         <span className="action-help" title={accountOccupied ? 'Нельзя менять данные входа, пока аккаунт занят арендой или заменой' : undefined} tabIndex={accountOccupied ? 0 : undefined}>
                           <button type="button" className="icon-button account-icon-action" onClick={() => setCredentialTarget(account)} disabled={accountOccupied} aria-label={`Изменить данные входа ${account.login}`} title={accountOccupied ? 'Данные входа защищены на время аренды или замены' : 'Изменить логин, пароль, TOTP и почту'}>
                             <Icon name="eye" size={15} />
@@ -303,6 +325,23 @@ export default function Accounts() {
           onCompleted={completeDeviceAuth}
         />
       )}
+      {browserValidationTarget && (
+        <ModalOverlay onClose={() => setBrowserValidationTarget(null)}>
+          <div className="modal modal--compact" role="alertdialog" aria-modal="true" aria-labelledby="confirm-browser-validation-title" aria-describedby="confirm-browser-validation-description">
+            <div className="modal__danger-icon"><Icon name="warning" size={22} /></div>
+            <h2 id="confirm-browser-validation-title">Подтвердить ручной вход?</h2>
+            <p id="confirm-browser-validation-description">
+              Подтверждайте только если вы успешно вошли в <strong>{browserValidationTarget.login}</strong> с сохранённым паролем и одноразовым кодом из кнопки «Ключ». После подтверждения аккаунт снова сможет участвовать в выдаче.
+            </p>
+            <div className="modal__actions">
+              <button className="button button--secondary" onClick={() => setBrowserValidationTarget(null)} disabled={confirmBrowserValidation.isPending}>Отмена</button>
+              <button className="button button--primary" onClick={confirmManualBrowserValidation} disabled={confirmBrowserValidation.isPending}>
+                {confirmBrowserValidation.isPending ? <><span className="spinner spinner--light" />Подтверждаем…</> : <><Icon name="check" />Да, вход выполнен</>}
+              </button>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
       {credentialTarget && <RepairCredentialsDialog account={credentialTarget} onClose={() => setCredentialTarget(null)} onSaved={() => { setCredentialTarget(null); setActionError(''); setActionSuccess('Данные входа обновлены. Аккаунт поставлен на обязательную повторную проверку.') }} />}
       {editTarget && <EditAccountDialog account={editTarget} onClose={() => setEditTarget(null)} onSaved={() => { setEditTarget(null); setActionError(''); setActionSuccess('Операторские параметры аккаунта сохранены.') }} />}
       {deleteTarget && (
@@ -325,6 +364,11 @@ export default function Accounts() {
 function isDeviceAuthEligible(account: Account) {
   const state = validationState(account)
   return state === 'validation_failed' || state === 'detecting' || state === 'pending'
+}
+
+function needsManualBrowserConfirmation(account: Account) {
+  return validationState(account) === 'validation_failed'
+    && account.validation_job?.error_code === 'cloudflare_challenge'
 }
 
 function normalizeVerificationUrl(value: string) {
@@ -927,11 +971,11 @@ function DeviceAuthDialog({
     : result.error_detail ?? humanizeDeviceAuthError(result.error_code ?? '')
 
   return (
-    <ModalOverlay onClose={onClose} canClose={result.status !== 'pending'} closeOnBackdrop={result.status !== 'pending'}>
+    <ModalOverlay onClose={onClose}>
       <div className="modal device-auth-dialog" role="dialog" aria-modal="true" aria-labelledby="device-auth-title" aria-describedby="device-auth-description">
         <div className="modal__header">
           <div><span className="eyebrow">Проверка с вашим участием</span><h2 id="device-auth-title">Подтвердите вход в браузере</h2><p id="device-auth-description">Страница входа открыта в новой вкладке. Аккаунт обновится автоматически после подтверждения.</p></div>
-          {result.status !== 'pending' && <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>}
+          <button className="icon-button" onClick={onClose} aria-label="Закрыть"><Icon name="close" /></button>
         </div>
 
         <div className="form-alert form-alert--info"><Icon name="shield" /><span><strong>Первый вход:</strong> в ChatGPT откройте «Настройки → Безопасность и вход» и включите «Авторизация кода устройства для Codex». Если OpenAI уже показал красное предупреждение, после включения закройте это окно и запустите «Через браузер» заново — старый код использовать нельзя.</span></div>
@@ -955,7 +999,7 @@ function DeviceAuthDialog({
 
         <div className="modal__actions">
           {result.status === 'pending'
-            ? <span className="device-auth-keep-open">Не закрывайте окно до завершения проверки</span>
+            ? <span className="device-auth-keep-open">Окно можно закрыть — проверка продолжится в фоне</span>
             : <button className="button button--secondary" onClick={onClose}>Закрыть</button>}
           <a className="button button--primary" href={modal.session.verification_url} target="_blank" rel="noreferrer"><Icon name="external" />Открыть страницу входа</a>
         </div>

@@ -60,6 +60,19 @@ class Scheduler:
         if loop is not None:
             loop.cancel()
 
+    def wake(self, name: str) -> bool:
+        """Run a registered task after its current callback finishes.
+
+        Queue producers use this to avoid waiting for the full periodic delay.
+        Repeated calls coalesce through the task's existing ``Event``.
+        """
+
+        wakeup = self._wakeups.get(name)
+        if not self._running or wakeup is None or name not in self._tasks:
+            return False
+        wakeup.set()
+        return True
+
     async def start(self) -> None:
         if self._running:
             return

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timedelta, timezone
@@ -7,6 +9,15 @@ from app.app_lifecycle import (
     _defer_order_retry,
 )
 from app.models.rental import Order
+
+
+def test_request_validation_check_wakes_queue_worker():
+    lifecycle = AppLifecycle("", 0)
+    lifecycle.scheduler.wake = MagicMock(return_value=True)
+
+    lifecycle.request_validation_check()
+
+    lifecycle.scheduler.wake.assert_called_once_with("refresh_recover")
 
 
 async def _seed_verified_pending_order(session, funpay_order_id: str) -> Order:
@@ -1261,11 +1272,74 @@ async def test_refresh_task_uses_configured_concurrency(monkeypatch):
     assert process.await_count == 4
     lifecycle.request_capacity_reconcile.assert_not_called()
 
-    process.return_value = True
+    process.reset_mock()
+    process.side_effect = [True] * 4 + [False] * 4
     await lifecycle._task_refresh_recover()
 
     assert process.await_count == 8
     lifecycle.request_capacity_reconcile.assert_called_once_with()
+
+
+async def test_refresh_task_wakes_until_backlog_larger_than_concurrency_is_drained(
+    monkeypatch,
+):
+    from app.scheduler import ScheduledTask
+
+    lifecycle = AppLifecycle("", 0)
+    lifecycle._refresh_concurrency = 2
+    lifecycle._recover_stale_validation_leases = AsyncMock()
+    lifecycle._enqueue_due_refresh_recoveries = AsyncMock()
+    lifecycle.request_capacity_reconcile = MagicMock()
+
+    processed_calls = 0
+    backlog_drained = asyncio.Event()
+
+    async def process_next(_worker, _session):
+        nonlocal processed_calls
+        processed_calls += 1
+        # Five jobs require three non-empty batches at concurrency=2. A fourth
+        # fully empty batch proves the queue has been drained and stops wakes.
+        processed = processed_calls <= 5
+        if processed_calls == 8:
+            backlog_drained.set()
+        return processed
+
+    monkeypatch.setattr(
+        "app.refresh_worker.RefreshRecoveryWorker.process_next",
+        process_next,
+    )
+
+    class Context:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        "app.app_lifecycle.async_session_factory", lambda: Context()
+    )
+    lifecycle.scheduler.register(
+        "refresh_recover",
+        ScheduledTask(
+            callback=lifecycle._task_refresh_recover,
+            interval=60,
+        ),
+    )
+
+    await lifecycle.scheduler.start()
+    try:
+        await asyncio.wait_for(backlog_drained.wait(), timeout=1)
+        # The fully empty confirmation batch must stop immediate re-wakes.
+        # Give the event loop a turn so a busy-loop would become observable.
+        await asyncio.sleep(0.02)
+        assert processed_calls == 8
+    finally:
+        await lifecycle.scheduler.stop()
+
+    assert lifecycle._recover_stale_validation_leases.await_count == 1
+    assert lifecycle._enqueue_due_refresh_recoveries.await_count == 1
+    assert lifecycle.request_capacity_reconcile.call_count == 3
 
 
 async def test_reload_settings_updates_validation_not_lot_interval(

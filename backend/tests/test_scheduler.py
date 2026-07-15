@@ -79,3 +79,23 @@ async def test_register_updates_live_interval_without_restart():
     await sched.stop()
 
     assert task.await_count >= 2
+
+
+async def test_wake_runs_registered_task_without_waiting_for_interval():
+    sched = Scheduler()
+    task = AsyncMock()
+    sched.register("test", ScheduledTask(callback=task, interval=60))
+    await sched.start()
+    await asyncio.sleep(0.02)
+    assert task.await_count == 1
+
+    assert sched.wake("test") is True
+    await asyncio.sleep(0.02)
+    await sched.stop()
+
+    assert task.await_count >= 2
+
+
+async def test_wake_is_noop_for_missing_or_stopped_task():
+    sched = Scheduler()
+    assert sched.wake("missing") is False

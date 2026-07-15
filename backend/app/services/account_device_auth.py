@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -67,12 +68,33 @@ class AccountDeviceAuthManager:
         self,
         *,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
+        validation_queued: Callable[[], None] | None = None,
     ) -> None:
         self._sessions: dict[str, DeviceAuthSession] = {}
         self._lock = asyncio.Lock()
         self._queue = CheckJobQueue()
         self._session_factory = session_factory
+        self._validation_queued = validation_queued
         self._tasks: dict[str, asyncio.Task[None]] = {}
+
+    def set_validation_queued_callback(
+        self,
+        callback: Callable[[], None] | None,
+    ) -> None:
+        """Attach the live scheduler without coupling this service to FastAPI."""
+
+        self._validation_queued = callback
+
+    def _notify_validation_queued(self) -> None:
+        callback = self._validation_queued
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            # The job is already committed; the periodic worker remains the
+            # recovery path and a wake failure must not corrupt Device Auth.
+            logger.exception("Could not wake validation queue after Device Auth")
 
     async def start(
         self,
@@ -267,6 +289,7 @@ class AccountDeviceAuthManager:
                 },
             ))
             await db.commit()
+            self._notify_validation_queued()
             auth_session.status = "completed"
             auth_session.code = None
             self._cancel_background_task(session_id)
