@@ -17,6 +17,7 @@ from app.integrations.email.provider import (
     FreshVerificationCode,
     parse_verification_code,
 )
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 
 MICROSOFT_AUTHORITY = "https://login.microsoftonline.com/consumers/oauth2/v2.0"
@@ -43,6 +44,35 @@ RefreshTokenUpdate = Callable[[str], Awaitable[None]]
 CredentialStatusUpdate = Callable[[], Awaitable[None]]
 
 
+def microsoft_graph_http_client(
+    *,
+    browser_proxy: BrowserProxy | None = None,
+    timeout: float = 15.0,
+) -> httpx.AsyncClient:
+    """Build a Graph client that cannot inherit or bypass the selected route."""
+
+    client_proxy: httpx.Proxy | None = None
+    if browser_proxy is not None:
+        auth = None
+        if browser_proxy.username is not None:
+            auth = (browser_proxy.username, browser_proxy.password or "")
+        client_proxy = httpx.Proxy(browser_proxy.server, auth=auth)
+    try:
+        return httpx.AsyncClient(
+            proxy=client_proxy,
+            timeout=timeout,
+            trust_env=False,
+        )
+    except ImportError:
+        # SOCKS support is optional in HTTPX. Never fall back to a direct
+        # client when the selected route cannot be constructed.
+        if browser_proxy is not None:
+            raise ProxyUnavailableError(
+                "Маршрут входа в почту через прокси недоступен."
+            ) from None
+        raise
+
+
 class MicrosoftGraphEmailProvider:
     """Read only newly-arrived OpenAI codes through delegated Graph access."""
 
@@ -55,6 +85,7 @@ class MicrosoftGraphEmailProvider:
         refresh_token: str,
         on_refresh_token: RefreshTokenUpdate,
         on_reauthorization_required: CredentialStatusUpdate | None = None,
+        browser_proxy: BrowserProxy | None = None,
         poll_interval_s: float = 2.0,
         request_timeout_s: float = 15.0,
     ) -> None:
@@ -64,6 +95,7 @@ class MicrosoftGraphEmailProvider:
         self._refresh_token = refresh_token
         self._on_refresh_token = on_refresh_token
         self._on_reauthorization_required = on_reauthorization_required
+        self._browser_proxy = browser_proxy
         self._poll_interval_s = poll_interval_s
         self._request_timeout_s = request_timeout_s
         self._access_token: str | None = None
@@ -175,7 +207,10 @@ class MicrosoftGraphEmailProvider:
             return self._access_token
 
         try:
-            async with httpx.AsyncClient(timeout=self._request_timeout_s) as client:
+            async with microsoft_graph_http_client(
+                browser_proxy=self._browser_proxy,
+                timeout=self._request_timeout_s,
+            ) as client:
                 response = await client.post(
                     _TOKEN_URL,
                     data={
@@ -187,6 +222,10 @@ class MicrosoftGraphEmailProvider:
                     },
                 )
         except httpx.HTTPError as exc:
+            if self._browser_proxy is not None:
+                raise ProxyUnavailableError(
+                    "Маршрут входа в почту через прокси недоступен."
+                ) from None
             raise EmailProviderError(
                 EmailErrorCode.CONNECTION_FAILED,
                 "Microsoft не ответил при обновлении доступа к почте.",
@@ -239,7 +278,10 @@ class MicrosoftGraphEmailProvider:
         access_token = await self._get_access_token()
         messages: list[dict[str, Any]] = []
         try:
-            async with httpx.AsyncClient(timeout=self._request_timeout_s) as client:
+            async with microsoft_graph_http_client(
+                browser_proxy=self._browser_proxy,
+                timeout=self._request_timeout_s,
+            ) as client:
                 for folder_id in folder_ids:
                     response = await client.get(
                         _MESSAGES_URL.format(folder_id=folder_id),
@@ -277,6 +319,10 @@ class MicrosoftGraphEmailProvider:
                         )
                     messages.extend(values)
         except httpx.HTTPError as exc:
+            if self._browser_proxy is not None:
+                raise ProxyUnavailableError(
+                    "Маршрут входа в почту через прокси недоступен."
+                ) from None
             raise EmailProviderError(
                 EmailErrorCode.CONNECTION_FAILED,
                 "Microsoft Graph не ответил при чтении почты.",
@@ -306,7 +352,10 @@ class MicrosoftGraphEmailProvider:
     async def _get_message_body(self, message_id: str) -> dict[str, Any]:
         access_token = await self._get_access_token()
         try:
-            async with httpx.AsyncClient(timeout=self._request_timeout_s) as client:
+            async with microsoft_graph_http_client(
+                browser_proxy=self._browser_proxy,
+                timeout=self._request_timeout_s,
+            ) as client:
                 async with client.stream(
                     "GET",
                     _MESSAGE_URL.format(message_id=quote(message_id, safe="")),
@@ -350,6 +399,10 @@ class MicrosoftGraphEmailProvider:
                                 "Письмо с кодом превышает безопасный размер.",
                             )
         except httpx.HTTPError as exc:
+            if self._browser_proxy is not None:
+                raise ProxyUnavailableError(
+                    "Маршрут входа в почту через прокси недоступен."
+                ) from None
             raise EmailProviderError(
                 EmailErrorCode.CONNECTION_FAILED,
                 "Microsoft Graph не ответил при чтении письма.",

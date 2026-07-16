@@ -20,6 +20,7 @@ from app.models.account import (
 from app.models.audit import AuditLog
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
 from app.models.rental import Order, Rental
+from app.models.proxy_route import ProxyRoute
 
 
 @pytest.fixture
@@ -343,6 +344,113 @@ async def test_capacity_callback_failure_does_not_undo_committed_status(
     account = await session.get(Account, account_id)
     await session.refresh(account)
     assert account.status == "maintenance"
+
+
+async def test_proxy_assignment_requests_capacity_reconcile(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={"login": "proxy-capacity@example.com", "password": "password"},
+    )
+    initial_job = (
+        await session.execute(
+            select(AccountCheckJob).where(
+                AccountCheckJob.account_id == created.json()["id"]
+            )
+        )
+    ).scalar_one()
+    initial_job.status = "done"
+    initial_job.result = "test_setup"
+    account = await session.get(Account, created.json()["id"])
+    assert account is not None
+    route_a = ProxyRoute(
+        name="Account capacity route A",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="proxy-a.example.test",
+        port=3127,
+        enabled=True,
+        status="online",
+        last_checked_at=datetime.now(timezone.utc),
+    )
+    route = ProxyRoute(
+        name="Account capacity route B",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="proxy.example.test",
+        port=3128,
+        enabled=True,
+        status="online",
+        last_checked_at=datetime.now(timezone.utc),
+    )
+    session.add_all([route_a, route])
+    await session.flush()
+    account.proxy_route_id = route_a.id
+    account.status = "active"
+    account.chatgpt_last_check_at = datetime.now(timezone.utc)
+    await session.commit()
+    lifecycle = MagicMock()
+    app.state.lifecycle = lifecycle
+    try:
+        response = await auth_client.patch(
+            f"/api/accounts/{created.json()['id']}",
+            json={"proxy_route_id": route.id},
+        )
+    finally:
+        del app.state.lifecycle
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending_validation"
+    assert response.json()["proxy_route_id"] == route.id
+    await session.refresh(account)
+    assert account.status == "pending_validation"
+    assert account.chatgpt_last_check_at is None
+    route_job = (
+        await session.execute(
+            select(AccountCheckJob)
+            .where(
+                AccountCheckJob.account_id == account.id,
+                AccountCheckJob.status == "pending",
+            )
+        )
+    ).scalar_one()
+    assert route_job.job_type == "full_validation"
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
+
+
+async def test_proxy_assignment_rejects_active_validation(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+):
+    created = await auth_client.post(
+        "/api/accounts",
+        json={"login": "proxy-busy@example.com", "password": "password"},
+    )
+    route = ProxyRoute(
+        name="Busy account route",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="busy.proxy.test",
+        port=3130,
+        enabled=True,
+        status="online",
+        last_checked_at=datetime.now(timezone.utc),
+    )
+    session.add(route)
+    await session.commit()
+
+    response = await auth_client.patch(
+        f"/api/accounts/{created.json()['id']}",
+        json={"proxy_route_id": route.id},
+    )
+
+    assert response.status_code == 409
+    account = await session.get(Account, created.json()["id"])
+    assert account is not None
+    await session.refresh(account)
+    assert account.proxy_route_id is None
 
 
 async def test_validation_enqueues_wake_scheduler_without_false_http_failure(

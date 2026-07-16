@@ -3,6 +3,7 @@ import { getDeviceAuthStatus, startMicrosoftEmailOAuth, useAccounts, useConfirmB
 import { useTiers } from '../api/catalog'
 import { api, ApiError } from '../api/client'
 import { useSettings } from '../api/settings'
+import { useLoginRoutes } from '../api/loginRoutes'
 import { Icon } from '../components/Icon'
 import { EmptyState, ErrorState, LoadingState, ModalOverlay, PageHeader, StatusBadge, TableShell } from '../components/ui'
 import type { Account, AccountCredentialsUpdate, DeviceAuthSession, DeviceAuthStatus, TotpCode, TotpExport } from '../types/api'
@@ -292,7 +293,7 @@ export default function Accounts() {
                             </button>
                           </span>
                         )}
-                        {!isValidationInProgress(account) && !isCloudflareBrowserChallenge(account) && (
+                        {!isValidationInProgress(account) && (
                           <button type="button" className="icon-button account-icon-action" onClick={() => recheck(account)} disabled={accountOccupied || recheckTarget === account.id} aria-label={`Повторить автоматическую проверку ${account.login}; Device Auth не выполняется`} title={autoValidationHint}>
                             {recheckTarget === account.id ? <span className="spinner" /> : <Icon name="refresh" size={15} />}
                           </button>
@@ -671,11 +672,13 @@ function RepairCredentialsDialog({ account, onClose, onSaved }: { account: Accou
 
 function EditAccountDialog({ account, onClose, onSaved }: { account: Account; onClose: () => void; onSaved: () => void }) {
   const updateAccount = useUpdateAccount()
+  const routesQuery = useLoginRoutes()
   const [error, setError] = useState('')
   const accountOccupied = (account.active_rentals_count ?? 0) > 0 || account.replacement_reserved
   const [form, setForm] = useState({
     maxRentals: account.max_active_rentals == null ? '' : '1',
     operatorStatus: (account.operator_status_override ?? '') as '' | 'maintenance' | 'disabled',
+    proxyRouteId: account.proxy_route_id == null ? '' : String(account.proxy_route_id),
     notes: account.notes ?? '',
   })
 
@@ -689,12 +692,14 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
     }
     try {
       const safeStatus = accountOccupied ? '' : form.operatorStatus
+      const nextProxyRouteId = form.proxyRouteId === '' ? null : Number(form.proxyRouteId)
       await updateAccount.mutateAsync({
         id: account.id,
         ...(!accountOccupied ? {
           max_active_rentals: maxRentals,
           ...(safeStatus ? { status: safeStatus } : {}),
         } : {}),
+        ...(nextProxyRouteId !== (account.proxy_route_id ?? null) ? { proxy_route_id: nextProxyRouteId } : {}),
         notes: form.notes.trim() || null,
       })
       onSaved()
@@ -715,6 +720,7 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
             <label className="field"><span className="field__label">Лимит активных аренд</span><select value={form.maxRentals} disabled={accountOccupied} onChange={(event) => setForm((current) => ({ ...current, maxRentals: event.target.value }))}><option value="">Системный лимит — 1</option><option value="1">Явный лимит — 1</option></select><span className="field__hint">Аккаунт нельзя одновременно выдать нескольким покупателям: завершение аренды закрывает его общую сессию.</span></label>
             <label className="field"><span className="field__label">Ручная приостановка</span><select value={form.operatorStatus} disabled={accountOccupied} onChange={(event) => setForm((current) => ({ ...current, operatorStatus: event.target.value as '' | 'maintenance' | 'disabled' }))}><option value="">Не менять текущий статус</option><option value="maintenance">Перевести на обслуживание</option><option value="disabled">Отключить аккаунт</option></select><span className="field__hint">{accountOccupied ? 'Недоступно, пока аккаунт занят арендой или заменой.' : `Сейчас: ${accountStatusLabel(account.status)}. Возврат в работу выполняется только повторной проверкой аккаунта.`}</span></label>
           </div>
+          <label className="field"><span className="field__label">Маршрут входа</span><select value={form.proxyRouteId} onChange={(event) => setForm((current) => ({ ...current, proxyRouteId: event.target.value }))} disabled={accountOccupied || routesQuery.isLoading || routesQuery.isError}><option value="">Системный маршрут по умолчанию</option>{(routesQuery.data?.routes ?? []).map((route) => <option key={route.id} value={route.id} disabled={!route.enabled || route.status !== 'online'}>{route.name} · {route.mode === 'home_relay' ? 'домашний шлюз' : (route.proxy_type ?? 'proxy').toUpperCase()}{!route.enabled ? ' · отключён' : route.status !== 'online' ? ' · сначала проверьте' : ''}</option>)}</select><span className="field__hint">{accountOccupied ? 'Нельзя менять маршрут во время активной аренды или резервирования.' : 'Доступны только успешно проверенные маршруты. Они применяются к входу OpenAI и почты; при сбое проверка остановится без прямого подключения.'}</span></label>
           <label className="field"><span className="field__label">Заметка оператора</span><textarea value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} maxLength={4000} placeholder="Обслуживание или другой важный контекст" /></label>
           <div className="modal__actions"><button className="button button--secondary" type="button" onClick={onClose}>Отмена</button><button className="button button--primary" type="submit" disabled={updateAccount.isPending}>{updateAccount.isPending ? <><span className="spinner spinner--light" />Сохраняем…</> : <><Icon name="check" />Сохранить</>}</button></div>
         </form>
@@ -725,12 +731,13 @@ function EditAccountDialog({ account, onClose, onSaved }: { account: Account; on
 
 function AddAccountDialog({ graphConfigured, onClose }: { graphConfigured: boolean; onClose: () => void }) {
   const createAccount = useCreateAccount()
+  const routesQuery = useLoginRoutes()
   const [mode, setMode] = useState<'totp' | 'outlook' | 'email'>('totp')
   const [error, setError] = useState('')
   const [createdOutlookAccountId, setCreatedOutlookAccountId] = useState<number | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [form, setForm] = useState({
-    login: '', password: '', totp_secret: '', email: '', email_password: '',
+    login: '', password: '', totp_secret: '', email: '', email_password: '', proxyRouteId: '',
   })
 
   const submit = async (event: React.FormEvent) => {
@@ -756,10 +763,12 @@ function AddAccountDialog({ graphConfigured, onClose }: { graphConfigured: boole
     try {
       const account = createdOutlookAccountId === null
         ? await createAccount.mutateAsync({
-            ...form,
+            login: form.login,
+            password: form.password,
             totp_secret: mode === 'totp' ? form.totp_secret.trim() : '',
             email: form.email.trim() || undefined,
             email_password: mode === 'email' ? form.email_password || undefined : undefined,
+            proxy_route_id: form.proxyRouteId === '' ? undefined : Number(form.proxyRouteId),
           })
         : { id: createdOutlookAccountId }
       if (mode === 'outlook') {
@@ -795,6 +804,8 @@ function AddAccountDialog({ graphConfigured, onClose }: { graphConfigured: boole
           </div>
 
           <div className="form-alert form-alert--info"><Icon name="activity" /><span>План назначать вручную не нужно: система определит Free, Go, Plus или вариант Pro по данным самого аккаунта во время проверки.</span></div>
+
+          <label className="field"><span className="field__label">Маршрут первого входа</span><select value={form.proxyRouteId} onChange={(event) => setForm({ ...form, proxyRouteId: event.target.value })} disabled={routesQuery.isLoading || createdOutlookAccountId !== null}><option value="">Системный маршрут по умолчанию</option>{(routesQuery.data?.routes ?? []).map((route) => <option key={route.id} value={route.id} disabled={!route.enabled || route.status !== 'online'}>{route.name} · {route.mode === 'home_relay' ? 'домашний шлюз' : (route.proxy_type ?? 'proxy').toUpperCase()}{!route.enabled ? ' · отключён' : route.status !== 'online' ? ' · сначала проверьте' : ''}</option>)}</select><span className="field__hint">Маршрут применяется сразу — уже к первой проверке OpenAI и входу в почту. При его отказе прямое подключение с сервера не используется.{routesQuery.isError ? ' Список маршрутов сейчас недоступен; будет использован системный маршрут.' : ''}</span></label>
 
           <fieldset className="segmented-fieldset">
             <legend>Как настроить двухфакторную защиту</legend>

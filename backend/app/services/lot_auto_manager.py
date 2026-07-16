@@ -29,6 +29,7 @@ from app.services.lot_templates import (
 from app.services.subscription_eligibility import (
     trusted_paid_subscription_expiry,
 )
+from app.services.proxy_routes import effective_proxy_route_is_healthy
 
 
 logger = logging.getLogger(__name__)
@@ -500,6 +501,7 @@ class LotAutoManager:
             .where(
                 Account.status == "active",
                 Account.operator_status_override.is_(None),
+                effective_proxy_route_is_healthy(now=now),
                 Account.tier_id == matrix.tier_id,
                 expiry_condition,
                 AccountLimits.measured_at >= fresh_cutoff,

@@ -999,12 +999,15 @@ class CodeHandler:
         try:
             if self._email_provider_builder is None:
                 from app.services.account_validation import _build_email_provider
+                from app.services.proxy_routes import resolve_browser_proxy
 
+                browser_proxy = await resolve_browser_proxy(session, account)
                 provider = await _build_email_provider(
                     session,
                     account,
                     account.email,
                     account.email_password_encrypted or None,
+                    browser_proxy=browser_proxy,
                 )
             else:
                 provider = await self._email_provider_builder(

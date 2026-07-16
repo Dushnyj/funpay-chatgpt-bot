@@ -1,7 +1,7 @@
 import asyncio
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.integrations.openai.device_auth import DeviceAuthorization, DeviceCode
 from app.integrations.openai.oauth import RefreshedTokens
+from app.integrations.playwright.proxy import BrowserProxy
 from app.models.account import Account, AccountCheckJob
 from app.models.audit import AuditLog
 from app.check_job_queue import ActiveJobConflict, CheckJobQueue
@@ -82,7 +83,10 @@ async def test_device_auth_success_verifies_identity(
     async def fake_exchange(_authorization):
         return RefreshedTokens("access", "refresh", _id_token("OWNER@example.com"))
 
-    async def fake_save(_session, target: Account, _tokens):
+    async def fake_save(
+        _session, target: Account, _tokens, *, browser_proxy=None
+    ):
+        assert browser_proxy is None
         target.status = "active"
 
     monkeypatch.setattr("app.services.account_device_auth.request_device_code", fake_request)
@@ -114,6 +118,230 @@ async def test_device_auth_success_verifies_identity(
     assert len(credential_jobs) == 1
     assert credential_jobs[0].status == "pending"
     assert validation_wakes == 1
+
+
+async def test_device_auth_manager_routes_request_poll_and_exchange(
+    session: AsyncSession,
+    monkeypatch,
+):
+    account = await _account(session)
+    manager = AccountDeviceAuthManager()
+    selected = BrowserProxy(
+        41,
+        "socks5",
+        "home-relay",
+        1080,
+        username="relay-user",
+        password="relay-password",
+        config_revision=7,
+    )
+    resolved_for: list[int] = []
+    request_routes: list[BrowserProxy | None] = []
+    poll_routes: list[BrowserProxy | None] = []
+    exchange_routes: list[BrowserProxy | None] = []
+    pinned_checks: list[tuple[BrowserProxy | None, bool]] = []
+
+    async def fake_resolve(_session, target):
+        resolved_for.append(target.id)
+        return selected
+
+    async def fake_request(*, proxy=None):
+        request_routes.append(proxy)
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    async def fake_poll(*_args, proxy=None):
+        poll_routes.append(proxy)
+        return DeviceAuthorization("code", "verifier", "challenge")
+
+    async def fake_exchange(_authorization, *, proxy=None):
+        exchange_routes.append(proxy)
+        return RefreshedTokens("access", "refresh", _id_token("owner@example.com"))
+
+    async def fake_save(
+        _session, target: Account, _tokens, *, browser_proxy=None
+    ):
+        assert browser_proxy is selected
+        target.status = "active"
+
+    async def fake_assert_proxy(
+        _session,
+        _target,
+        expected,
+        *,
+        lock_account=False,
+    ):
+        pinned_checks.append((expected, lock_account))
+
+    monkeypatch.setattr(
+        "app.services.account_device_auth.resolve_browser_proxy", fake_resolve
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.request_device_code", fake_request
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.poll_device_authorization", fake_poll
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.exchange_device_authorization",
+        fake_exchange,
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth._save_tokens_and_measure", fake_save
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.assert_proxy_selection_unchanged",
+        fake_assert_proxy,
+    )
+
+    auth_session = await manager.start(session, account)
+    auth_session.next_poll_at = datetime.now(timezone.utc)
+    result = await manager.poll(session, account, auth_session.id)
+
+    assert result.status == "completed"
+    assert resolved_for == [account.id, account.id, account.id]
+    assert request_routes == [selected]
+    assert poll_routes == [selected]
+    assert exchange_routes == [selected]
+    assert pinned_checks == [(selected, True), (selected, False)]
+    assert result.browser_proxy is None
+
+    assert result.terminal_at is not None
+    result.terminal_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+    with pytest.raises(KeyError):
+        await manager.poll(session, account, result.id)
+    assert result.id not in manager._sessions
+
+
+async def test_device_auth_fails_closed_if_route_changes_mid_session(
+    session: AsyncSession,
+    monkeypatch,
+):
+    account = await _account(session)
+    manager = AccountDeviceAuthManager()
+    route_a = BrowserProxy(51, "socks5", "home-a", 1080, config_revision=3)
+    route_b = BrowserProxy(52, "socks5", "home-b", 1080, config_revision=1)
+    resolutions = 0
+
+    async def fake_resolve(_session, _target):
+        nonlocal resolutions
+        resolutions += 1
+        return route_a if resolutions <= 2 else route_b
+
+    async def fake_request(*, proxy=None):
+        assert proxy is route_a
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    async def unexpected_poll(*_args, **_kwargs):
+        pytest.fail("a changed route must be rejected before polling OpenAI")
+
+    monkeypatch.setattr(
+        "app.services.account_device_auth.resolve_browser_proxy", fake_resolve
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.request_device_code", fake_request
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.poll_device_authorization",
+        unexpected_poll,
+    )
+
+    auth_session = await manager.start(session, account)
+    auth_session.next_poll_at = datetime.now(timezone.utc)
+    result = await manager.poll(session, account, auth_session.id)
+
+    assert result.status == "failed"
+    assert result.error_code == "proxy_route_changed"
+    assert result.browser_proxy is None
+    assert resolutions == 3
+
+
+async def test_device_auth_rechecks_pinned_route_after_exchange(
+    session: AsyncSession,
+    monkeypatch,
+):
+    from app.services.account_validation import (
+        AccountValidationError,
+        ValidationCode,
+        ValidationStage,
+    )
+
+    account = await _account(session)
+    manager = AccountDeviceAuthManager()
+    checks = 0
+    save_called = False
+
+    async def fake_request(*, proxy=None):
+        assert proxy is None
+        return DeviceCode("device", "ABCD-EFGH", 1)
+
+    async def fake_poll(*_args, proxy=None):
+        assert proxy is None
+        return DeviceAuthorization("code", "verifier", "challenge")
+
+    async def fake_exchange(_authorization, *, proxy=None):
+        assert proxy is None
+        return RefreshedTokens("access", "refresh", _id_token(account.login))
+
+    async def fake_assert(
+        _session,
+        target,
+        _expected,
+        *,
+        lock_account=False,
+    ):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            target.validation_rerun_requested = True
+            raise AccountValidationError(
+                ValidationStage.PROXY,
+                ValidationCode.PROXY_ROUTE_CHANGED,
+                "route changed",
+            )
+        assert lock_account is True
+
+    async def unexpected_save(*_args, **_kwargs):
+        nonlocal save_called
+        save_called = True
+
+    monkeypatch.setattr(
+        "app.services.account_device_auth.request_device_code", fake_request
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.poll_device_authorization", fake_poll
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.exchange_device_authorization",
+        fake_exchange,
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth.assert_proxy_selection_unchanged",
+        fake_assert,
+    )
+    monkeypatch.setattr(
+        "app.services.account_device_auth._save_tokens_and_measure",
+        unexpected_save,
+    )
+
+    auth_session = await manager.start(session, account)
+    auth_session.next_poll_at = datetime.now(timezone.utc)
+    result = await manager.poll(session, account, auth_session.id)
+
+    assert result.status == "failed"
+    assert result.error_code == ValidationCode.PROXY_ROUTE_CHANGED.value
+    assert checks == 2
+    assert save_called is False
+    jobs = list(
+        (
+            await session.execute(
+                select(AccountCheckJob)
+                .where(AccountCheckJob.account_id == account.id)
+                .order_by(AccountCheckJob.id)
+            )
+        ).scalars()
+    )
+    assert [job.status for job in jobs] == ["failed", "pending"]
+    assert jobs[-1].job_type == "full_validation"
 
 
 async def test_device_auth_rejects_another_openai_account(
@@ -379,7 +607,10 @@ async def test_background_poll_completes_without_frontend_status_requests(
     async def fake_exchange(_authorization):
         return RefreshedTokens("access", "refresh", _id_token("owner@example.com"))
 
-    async def fake_save(_session, target: Account, _tokens):
+    async def fake_save(
+        _session, target: Account, _tokens, *, browser_proxy=None
+    ):
+        assert browser_proxy is None
         target.status = "active"
         completed.set()
 
@@ -450,7 +681,10 @@ async def test_background_and_frontend_poll_cannot_exchange_twice(
     async def fake_exchange(_authorization):
         return RefreshedTokens("access", "refresh", _id_token("owner@example.com"))
 
-    async def fake_save(_session, target: Account, _tokens):
+    async def fake_save(
+        _session, target: Account, _tokens, *, browser_proxy=None
+    ):
+        assert browser_proxy is None
         target.status = "active"
 
     monkeypatch.setattr("app.services.account_device_auth.request_device_code", fake_request)

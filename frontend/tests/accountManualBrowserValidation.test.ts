@@ -99,7 +99,8 @@ test('icon action guidance separates Device Auth, auto validation, TOTP, and con
   assert.match(source, /Показать текущий код TOTP для ручного входа/)
   assert.match(source, /Подтвердить уже выполненный ручной вход/)
   assert.match(source, /account-icon-action account-icon-action--success/)
-  assert.match(source, /!isValidationInProgress\(account\) && !isCloudflareBrowserChallenge\(account\)/)
+  assert.match(source, /\{!isValidationInProgress\(account\) && \(/)
+  assert.doesNotMatch(source, /!isValidationInProgress\(account\) && !isCloudflareBrowserChallenge\(account\)/)
   assert.match(source, /if \(isManualBrowserConfirmationAvailable\(account\)\) return false/)
 })
 

@@ -169,6 +169,7 @@ class AccountOut(_Base):
     status: str
     operator_status_override: str | None = None
     notes: str | None = None
+    proxy_route_id: int | None = None
     plan_raw_type: str | None = None
     plan_source: str | None = None
     plan_confidence: float | None = None
@@ -189,6 +190,7 @@ class AccountCreate(BaseModel):
     email_password: str | None = Field(default=None, max_length=4096)
     max_active_rentals: int | None = Field(default=None, ge=1, le=1)
     notes: str | None = Field(default=None, max_length=4000)
+    proxy_route_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -206,6 +208,8 @@ class AccountUpdate(BaseModel):
     # Returning to active always goes through the recheck endpoint.
     status: Literal["maintenance", "disabled"] | None = None
     notes: str | None = Field(default=None, max_length=4000)
+    # Null means "inherit the global route" and is distinct from omission.
+    proxy_route_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -543,6 +547,198 @@ class SettingsUpdate(BaseModel):
         if value is None:
             raise ValueError("field cannot be null")
         return value
+
+
+# --- Browser login routes ---
+
+class ProxyRouteOut(_Base):
+    id: int
+    name: str
+    mode: Literal["home_relay", "custom_proxy"]
+    proxy_type: Literal["http", "https", "socks5"]
+    host: str
+    port: int
+    username: str | None = None
+    has_password: bool = False
+    enabled: bool
+    config_revision: int
+    is_default: bool = False
+    status: Literal["unchecked", "online", "offline"]
+    egress_ip: str | None = None
+    latency_ms: int | None = None
+    last_checked_at: datetime | None = None
+    last_error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProxyRouteListOut(BaseModel):
+    default_route_id: int | None = None
+    routes: list[ProxyRouteOut]
+
+
+class ProxyRouteCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    # Managed home relays can only be created by the one-time setup flow.
+    mode: Literal["custom_proxy"] = "custom_proxy"
+    proxy_type: Literal["http", "https", "socks5"]
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(ge=1, le=65535)
+    username: str | None = Field(default=None, max_length=512)
+    password: str | None = Field(default=None, max_length=4096, repr=False)
+    enabled: bool = True
+    is_default: bool = False
+
+    @field_validator("name", "host", "username")
+    @classmethod
+    def normalize_text(cls, value):
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("field cannot be blank")
+        return value
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        if any(char.isspace() or ord(char) < 32 for char in value):
+            raise ValueError("host contains invalid characters")
+        if "://" in value or "/" in value or "@" in value:
+            raise ValueError("host must not contain a URL or credentials")
+        return value
+
+    @model_validator(mode="after")
+    def validate_credentials(self):
+        if (self.username is None) != (self.password is None):
+            raise ValueError("username and password must be provided together")
+        if self.username == "" or self.password == "":
+            raise ValueError("proxy credentials cannot be blank")
+        if self.proxy_type == "socks5" and self.username is not None:
+            raise ValueError("Playwright does not support SOCKS5 authentication")
+        return self
+
+
+class ProxyRouteUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    proxy_type: Literal["http", "https", "socks5"] | None = None
+    host: str | None = Field(default=None, min_length=1, max_length=255)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    username: str | None = Field(default=None, max_length=512)
+    password: str | None = Field(default=None, max_length=4096, repr=False)
+    clear_credentials: bool = False
+    enabled: bool | None = None
+    is_default: bool | None = None
+
+    @field_validator("name", "host", "username")
+    @classmethod
+    def normalize_text(cls, value):
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("field cannot be blank")
+        return value
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if any(char.isspace() or ord(char) < 32 for char in value):
+            raise ValueError("host contains invalid characters")
+        if "://" in value or "/" in value or "@" in value:
+            raise ValueError("host must not contain a URL or credentials")
+        return value
+
+    @model_validator(mode="after")
+    def validate_change(self):
+        provided = self.model_fields_set
+        if not provided:
+            raise ValueError("at least one field must be provided")
+        supplied_secret = bool({"username", "password"} & provided)
+        if supplied_secret and not {"username", "password"} <= provided:
+            raise ValueError("username and password must be updated together")
+        if supplied_secret and (not self.username or not self.password):
+            raise ValueError("proxy credentials cannot be blank")
+        if self.clear_credentials and supplied_secret:
+            raise ValueError("cannot set and clear credentials together")
+        for field_name in (
+            "name",
+            "proxy_type",
+            "host",
+            "port",
+            "enabled",
+            "is_default",
+        ):
+            if field_name in provided and getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} cannot be null")
+        return self
+
+
+class ProxyRouteDefaultUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    route_id: int | None = Field(default=None, gt=0)
+
+
+class HomeRelaySetupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(default="Домашний прокси", min_length=1, max_length=120)
+    autostart: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name cannot be blank")
+        return value
+
+
+class HomeRelaySetupOut(BaseModel):
+    setup_token: str = Field(repr=False)
+    expires_at: datetime
+    powershell_command: str = Field(repr=False)
+    script_download_url: str
+    installer_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class HomeRelayEnrollRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal[1]
+    machine_name: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=120)
+    public_key: str = Field(min_length=32, max_length=2048, repr=False)
+    client_version: str = Field(min_length=1, max_length=32)
+
+    @field_validator("machine_name", "display_name", "client_version")
+    @classmethod
+    def normalize_enroll_text(cls, value: str) -> str:
+        value = value.strip()
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("control characters are not allowed")
+        return value
+
+
+class HomeRelayHostKey(BaseModel):
+    type: Literal["ssh-ed25519"]
+    data: str
+
+
+class HomeRelayEnrollOut(BaseModel):
+    schema_version: Literal[1] = 1
+    relay_id: str
+    display_name: str
+    ssh_host: str
+    ssh_port: int
+    ssh_user: str
+    remote_socks_bind: str
+    remote_socks_port: int
+    host_key: HomeRelayHostKey
 
 
 class FunPayKeyUpdate(BaseModel):

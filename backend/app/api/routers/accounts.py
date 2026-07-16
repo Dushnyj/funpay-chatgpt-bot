@@ -33,6 +33,7 @@ from app.models.account import (
     EmailOAuthCredential,
 )
 from app.models.audit import AuditLog
+from app.models.proxy_route import ProxyRoute
 from app.services.account_device_auth import (
     AccountBusyError,
     account_device_auth_manager,
@@ -43,6 +44,7 @@ from app.services.account_occupancy import (
     replacement_reserved_account_ids,
 )
 from app.services.totp import generate_totp_at, is_valid_base32
+from app.services.proxy_routes import proxy_route_check_is_fresh
 from app.integrations.openai.device_auth import DeviceAuthError
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[Depends(get_current_user)])
@@ -66,6 +68,7 @@ class BulkAccountItem(BaseModel):
     totp_secret: str = Field(default="", max_length=256)
     email: str | None = Field(default=None, max_length=320)
     email_password: str | None = Field(default=None, max_length=4096)
+    proxy_route_id: int | None = Field(default=None, gt=0)
 
 
 class BulkAccountRequest(BaseModel):
@@ -74,6 +77,54 @@ class BulkAccountRequest(BaseModel):
 
 class BulkAccountResponse(BaseModel):
     created: int
+
+
+async def _validate_proxy_route_reference(
+    session: AsyncSession,
+    route_id: int | None,
+) -> None:
+    if route_id is None:
+        return
+    # Serialize assignment with home-relay re-pair/delete and connection
+    # changes.  Reading an old online snapshot and waiting only on the FK
+    # write could otherwise attach an account after the route became unchecked.
+    route = (
+        await session.execute(
+            select(ProxyRoute)
+            .where(ProxyRoute.id == route_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if route is None:
+        raise HTTPException(status_code=422, detail="Proxy route not found")
+    if (
+        not route.enabled
+        or route.status != "online"
+        or not proxy_route_check_is_fresh(route.last_checked_at)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Proxy route must have a fresh online test before assignment",
+        )
+
+
+async def _lock_active_account_check(
+    session: AsyncSession,
+    account_id: int,
+) -> AccountCheckJob | None:
+    """Lock the durable check lease after the caller locked Account."""
+
+    return (
+        await session.execute(
+            select(AccountCheckJob)
+            .where(
+                AccountCheckJob.account_id == account_id,
+                AccountCheckJob.status.in_(("pending", "running")),
+            )
+            .order_by(AccountCheckJob.id)
+            .with_for_update()
+        )
+    ).scalars().first()
 
 
 def _validation_job_out(job: AccountCheckJob | None) -> ValidationJobOut | None:
@@ -614,6 +665,7 @@ async def create_account(
     request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
+    await _validate_proxy_route_reference(session, req.proxy_route_id)
     account = Account(
         login=req.login,
         password_encrypted=req.password,
@@ -623,6 +675,7 @@ async def create_account(
         tier_id=None,
         max_active_rentals=req.max_active_rentals,
         notes=req.notes,
+        proxy_route_id=req.proxy_route_id,
     )
     session.add(account)
     try:
@@ -648,6 +701,7 @@ async def bulk_add_accounts(
 ):
     accounts: list[Account] = []
     for item in req.accounts:
+        await _validate_proxy_route_reference(session, item.proxy_route_id)
         account = Account(
             login=item.login,
             password_encrypted=item.password,
@@ -656,6 +710,7 @@ async def bulk_add_accounts(
             email_password_encrypted=item.email_password,
             tier_id=None,
             status="pending_validation",
+            proxy_route_id=item.proxy_route_id,
         )
         session.add(account)
         accounts.append(account)
@@ -813,6 +868,7 @@ async def start_device_auth(
             detail=f"Validation job {exc.job_type} is already running",
         ) from exc
     except DeviceAuthError as exc:
+        notify_capacity_changed(request)
         raise HTTPException(
             status_code=503,
             detail="OpenAI device authorization is temporarily unavailable",
@@ -835,6 +891,7 @@ async def start_device_auth(
 async def get_device_auth_status(
     account_id: int,
     session_id: str,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
 ):
     account = await session.get(Account, account_id)
@@ -848,6 +905,8 @@ async def get_device_auth_status(
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="Device authorization not found")
+    if auth_session.status in {"completed", "failed", "expired"}:
+        notify_capacity_changed(request)
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)
     active_rentals_count = (
@@ -971,6 +1030,20 @@ async def update_account(
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     changes = req.model_dump(exclude_unset=True)
+    proxy_route_changed = (
+        "proxy_route_id" in changes
+        and changes["proxy_route_id"] != account.proxy_route_id
+    )
+    if proxy_route_changed:
+        active_job = await _lock_active_account_check(session, account.id)
+        if active_job is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Proxy route cannot change while validation job "
+                    f"{active_job.id} is {active_job.status}"
+                ),
+            )
     protected_changes = set(changes) - {"notes"}
     if protected_changes and await account_is_busy(session, account.id):
         raise HTTPException(
@@ -980,13 +1053,41 @@ async def update_account(
                 "occupied by a rental or reserved for replacement"
             ),
         )
+    if proxy_route_changed:
+        await _validate_proxy_route_reference(session, changes["proxy_route_id"])
     for field, value in changes.items():
         setattr(account, field, value)
     if "status" in changes:
         account.operator_status_override = changes["status"]
+    route_validation_job: AccountCheckJob | None = None
+    if proxy_route_changed:
+        # A successful check only certifies the route it used. Never keep an
+        # account sellable after switching even to another already-online
+        # route; require a complete login/mail/limits pass on the new path.
+        account.status = account.operator_status_override or "pending_validation"
+        account.chatgpt_last_check_at = None
+        account.validation_rerun_requested = False
+        route_validation_job = await _check_job_queue.enqueue(
+            session,
+            account.id,
+            priority="manual",
+            job_type="full_validation",
+        )
+        session.add(
+            AuditLog(
+                event_type="account_proxy_route_changed",
+                account_id=account.id,
+                metadata_={
+                    "actor": "admin",
+                    "job_id": route_validation_job.id,
+                },
+            )
+        )
     await session.commit()
-    if "status" in changes:
+    if "status" in changes or "proxy_route_id" in changes:
         notify_capacity_changed(request)
+    if route_validation_job is not None:
+        notify_validation_queued(request)
     await session.refresh(account)
     jobs = await _latest_jobs(session, [account.id])
     email_oauth = await session.get(EmailOAuthCredential, account.id)

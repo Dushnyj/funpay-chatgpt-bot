@@ -14,8 +14,11 @@ from app.api.deps import get_current_user, get_db_session
 from app.check_job_queue import ActiveJobConflict, CheckJobQueue
 from app.config import get_settings
 from app.integrations.email.outlook_web_provider import is_outlook_address
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 from app.models.account import Account, EmailOAuthCredential
 from app.models.audit import AuditLog
+from app.models.proxy_route import ProxyRoute
+from app.models.settings import SellerSettings
 from app.services.account_occupancy import account_is_busy
 from app.services.email_oauth import (
     EmailOAuthConfigurationError,
@@ -24,6 +27,11 @@ from app.services.email_oauth import (
     MicrosoftGraphOAuthConfig,
     email_oauth_state_manager,
     exchange_and_verify_microsoft_code,
+)
+from app.services.proxy_routes import (
+    browser_proxy_from_route,
+    proxy_route_check_is_fresh,
+    resolve_browser_proxy,
 )
 
 
@@ -35,6 +43,62 @@ _CALLBACK_BODY_LIMIT = 16_384
 class EmailOAuthStartOut(BaseModel):
     authorization_url: str
     expires_at: datetime
+
+
+def _same_proxy_selection(
+    left: BrowserProxy | None,
+    right: BrowserProxy | None,
+) -> bool:
+    if left is None or right is None:
+        return left is right
+    return (
+        left.route_id == right.route_id
+        and left.config_revision == right.config_revision
+    )
+
+
+async def _resolve_browser_proxy_for_update(
+    session: AsyncSession,
+    account: Account,
+) -> BrowserProxy | None:
+    """Lock the effective route selection until the OAuth credential commits."""
+
+    route_id = account.proxy_route_id
+    if route_id is None:
+        seller_settings = (
+            await session.execute(
+                select(SellerSettings)
+                .where(SellerSettings.id == 1)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        route_id = (
+            seller_settings.default_proxy_route_id
+            if seller_settings is not None
+            else None
+        )
+    if route_id is None:
+        return None
+
+    route = (
+        await session.execute(
+            select(ProxyRoute)
+            .where(ProxyRoute.id == route_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        route is None
+        or not route.enabled
+        or route.status != "online"
+        or not proxy_route_check_is_fresh(route.last_checked_at)
+    ):
+        raise ProxyUnavailableError(
+            "Настроенный маршрут входа не проверен или недоступен."
+        )
+    return browser_proxy_from_route(route)
 
 
 def _accounts_redirect(status: str, reason: str | None = None) -> RedirectResponse:
@@ -91,10 +155,19 @@ async def start_microsoft_email_oauth(
             detail="Microsoft Graph OAuth is not configured",
         ) from exc
 
+    try:
+        browser_proxy = await resolve_browser_proxy(session, account)
+    except ProxyUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Configured login route is unavailable",
+        ) from exc
+
     pending = await email_oauth_state_manager.start(
         account_id=account.id,
         expected_email=account.email,
         config=config,
+        browser_proxy=browser_proxy,
     )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
@@ -145,6 +218,12 @@ async def microsoft_email_oauth_callback(
         or account.email.strip().casefold() != pending.expected_email
     ):
         return _accounts_redirect("failed", "account_changed")
+    try:
+        current_proxy = await resolve_browser_proxy(session, account)
+    except ProxyUnavailableError:
+        return _accounts_redirect("failed", "proxy_unavailable")
+    if not _same_proxy_selection(current_proxy, pending.browser_proxy):
+        return _accounts_redirect("failed", "proxy_route_changed")
     # The provider exchange is external I/O. Keep only immutable identity
     # snapshots and release the read transaction before waiting on Microsoft.
     expected_account_id = pending.account_id
@@ -162,6 +241,8 @@ async def microsoft_email_oauth_callback(
         return _accounts_redirect("failed", "configuration_missing")
     except EmailOAuthExchangeError as exc:
         return _accounts_redirect("failed", exc.reason)
+    except ProxyUnavailableError:
+        return _accounts_redirect("failed", "proxy_unavailable")
 
     # Serialize with credential edits and allocation after external I/O, then
     # re-check the exact mailbox and occupancy before attaching the token.
@@ -181,6 +262,12 @@ async def microsoft_email_oauth_callback(
         return _accounts_redirect("failed", "account_changed")
     if await account_is_busy(session, account.id):
         return _accounts_redirect("failed", "account_in_use")
+    try:
+        current_proxy = await _resolve_browser_proxy_for_update(session, account)
+    except ProxyUnavailableError:
+        return _accounts_redirect("failed", "proxy_unavailable")
+    if not _same_proxy_selection(current_proxy, pending.browser_proxy):
+        return _accounts_redirect("failed", "proxy_route_changed")
 
     now = datetime.now(timezone.utc)
     credential = await session.get(EmailOAuthCredential, account.id)

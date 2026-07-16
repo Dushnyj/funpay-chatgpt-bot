@@ -14,6 +14,7 @@ import {
   useUpdateTelegramConfig,
 } from '../api/settings'
 import { Icon } from '../components/Icon'
+import { LoginRoutesSection } from '../components/LoginRoutesSection'
 import { ErrorState, LoadingState, PageHeader, StatusBadge } from '../components/ui'
 import type { Settings as SettingsType } from '../types/api'
 
@@ -252,6 +253,8 @@ export default function Settings() {
           <div className="integration-actions"><button className="button button--primary" onClick={saveFunPayKey} disabled={!goldenKey.trim() || setFunPayKey.isPending}><Icon name="key" />{setFunPayKey.isPending ? 'Подключаем…' : 'Сохранить ключ'}</button>{funPayKeyQuery.data?.configured && <button className="button button--secondary" onClick={removeFunPayKey} disabled={clearFunPayKey.isPending}>Удалить ключ</button>}<span className={metricsQuery.data?.bot_status === 'connected' ? 'integration-note--ok' : ''}><Icon name={metricsQuery.data?.bot_status === 'connected' ? 'check' : 'warning'} size={15} />{metricsQuery.data?.bot_status === 'connected' ? 'FunPay принимает события' : 'После сохранения проверяется подключение'}</span></div>
         </div>
       </section>
+
+      <LoginRoutesSection />
 
       <section className="settings-section">
         <div className="settings-section__intro"><div className="settings-section__icon"><Icon name="clock" /></div><div><h2>Автоматизация</h2><p>Частота проверок, замеров лимитов и поднятия лотов.</p></div></div>

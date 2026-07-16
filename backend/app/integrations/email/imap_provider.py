@@ -9,10 +9,13 @@ from email.utils import getaddresses, parsedate_to_datetime
 import hashlib
 import logging
 import re
+import socket
 import ssl
 import time
 
 import aioimaplib
+from python_socks import ProxyError, ProxyType
+from python_socks.async_.asyncio import Proxy as AsyncioProxy
 
 from app.integrations.email.provider import (
     EmailErrorCode,
@@ -21,6 +24,7 @@ from app.integrations.email.provider import (
     FreshVerificationCode,
     parse_verification_code,
 )
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +55,98 @@ _JUNK_FOLDER_CANDIDATES: dict[str, tuple[str, ...]] = {
 _GENERIC_JUNK_FOLDER_CANDIDATES = ("Junk", "Junk Email", "Spam")
 _MAX_MESSAGE_BYTES = 512 * 1024
 _MAX_CANDIDATES_PER_FOLDER = 20
+_PROXY_CONNECT_TIMEOUT_SECONDS = 10.0
 
 
 class IMAPResponseError(RuntimeError):
     """An IMAP command completed with a non-OK protocol response."""
+
+
+class _SocketIMAP4SSL(aioimaplib.IMAP4_SSL):
+    """Start aioimaplib TLS on an already proxy-connected TCP socket."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        sock: socket.socket,
+        ssl_context: ssl.SSLContext,
+    ) -> None:
+        self._connected_socket = sock
+        super().__init__(host=host, port=port, ssl_context=ssl_context)
+
+    def create_client(
+        self,
+        host: str,
+        port: int,
+        loop: asyncio.AbstractEventLoop | None,
+        conn_lost_cb=None,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
+        del port
+        local_loop = loop if loop is not None else asyncio.get_running_loop()
+        context = ssl_context or ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        self.protocol = aioimaplib.IMAP4ClientProtocol(local_loop, conn_lost_cb)
+        self._client_task = local_loop.create_task(
+            local_loop.create_connection(
+                lambda: self.protocol,
+                sock=self._connected_socket,
+                ssl=context,
+                server_hostname=host,
+            )
+        )
+
+
+def _proxy_connector(proxy: BrowserProxy) -> AsyncioProxy:
+    is_socks5 = proxy.proxy_type == "socks5"
+    proxy_type = ProxyType.SOCKS5 if is_socks5 else ProxyType.HTTP
+    return AsyncioProxy(
+        proxy_type=proxy_type,
+        host=proxy.host,
+        port=proxy.port,
+        username=None if is_socks5 else proxy.username,
+        password=None if is_socks5 else proxy.password,
+        rdns=True,
+    )
+
+
+async def _connect_imap_over_proxy(
+    proxy: BrowserProxy,
+    *,
+    imap_host: str,
+    imap_port: int,
+    ssl_context: ssl.SSLContext,
+) -> _SocketIMAP4SSL:
+    """Open HTTP CONNECT/SOCKS5, then authenticate TLS to the IMAP host."""
+
+    sock: socket.socket | None = None
+    try:
+        sock = await _proxy_connector(proxy).connect(
+            dest_host=imap_host,
+            dest_port=imap_port,
+            timeout=_PROXY_CONNECT_TIMEOUT_SECONDS,
+        )
+        client = _SocketIMAP4SSL(
+            host=imap_host,
+            port=imap_port,
+            sock=sock,
+            ssl_context=ssl_context,
+        )
+        # Await the TLS transport task explicitly. aioimaplib normally starts
+        # it in the background; doing so here lets a dead route fail now and
+        # never fall back to a direct connection.
+        await asyncio.wait_for(
+            client._client_task,
+            timeout=_PROXY_CONNECT_TIMEOUT_SECONDS,
+        )
+        return client
+    except (ProxyError, OSError, ssl.SSLError, asyncio.TimeoutError) as exc:
+        if sock is not None:
+            sock.close()
+        raise ProxyUnavailableError(
+            "Маршрут входа в почту через прокси недоступен."
+        ) from exc
 
 
 def _require_ok(response, operation: str) -> None:
@@ -185,12 +277,14 @@ class IMAPProvider:
         imap_port: int = _DEFAULT_PORT,
         *,
         basic_auth_supported: bool = True,
+        proxy: BrowserProxy | None = None,
     ) -> None:
         self.email = email
         self._password = password
         self.imap_host = imap_host
         self.imap_port = imap_port
         self._basic_auth_supported = basic_auth_supported
+        self._proxy = proxy
         self._baseline_ids: set[tuple[str, str]] = set()
 
     def _ensure_supported(self) -> None:
@@ -215,7 +309,7 @@ class IMAPProvider:
                 self._baseline_ids = baseline_ids
             finally:
                 await self._logout(client)
-        except EmailProviderError:
+        except (EmailProviderError, ProxyUnavailableError):
             raise
         except Exception as exc:
             logger.warning("IMAP preflight failed for %s", self.email, exc_info=True)
@@ -233,7 +327,7 @@ class IMAPProvider:
         self._ensure_supported()
         try:
             return await self._do_fetch(timeout)
-        except EmailProviderError:
+        except (EmailProviderError, ProxyUnavailableError):
             raise
         except Exception as exc:
             logger.warning("IMAP failure for %s", self.email, exc_info=True)
@@ -257,7 +351,7 @@ class IMAPProvider:
         )
         try:
             return await self._do_fetch_fresh(cutoff, timeout)
-        except EmailProviderError:
+        except (EmailProviderError, ProxyUnavailableError):
             raise
         except Exception as exc:
             logger.warning("IMAP fresh-code lookup failed for %s", self.email, exc_info=True)
@@ -267,11 +361,20 @@ class IMAPProvider:
             ) from exc
 
     async def _connect(self):
-        client = aioimaplib.IMAP4_SSL(
-            host=self.imap_host,
-            port=self.imap_port,
-            ssl_context=ssl.create_default_context(),
-        )
+        ssl_context = ssl.create_default_context()
+        if self._proxy is None:
+            client = aioimaplib.IMAP4_SSL(
+                host=self.imap_host,
+                port=self.imap_port,
+                ssl_context=ssl_context,
+            )
+        else:
+            client = await _connect_imap_over_proxy(
+                self._proxy,
+                imap_host=self.imap_host,
+                imap_port=self.imap_port,
+                ssl_context=ssl_context,
+            )
         try:
             await client.wait_hello_from_server()
             _require_ok(await client.login(self.email, self._password), "login")
@@ -449,6 +552,8 @@ def detect_imap_provider(
     email: str,
     password: str,
     fallback_host: str = _DEFAULT_FALLBACK_HOST,
+    *,
+    browser_proxy: BrowserProxy | None = None,
 ) -> EmailProvider:
     """По email-домену выбирает безопасный источник кодов подтверждения.
 
@@ -462,11 +567,12 @@ def detect_imap_provider(
         # to disk or persisted in the database.
         from app.integrations.email.outlook_web_provider import OutlookWebProvider
 
-        return OutlookWebProvider(email, password)
+        return OutlookWebProvider(email, password, proxy=browser_proxy)
 
     host = _KNOWN_HOSTS.get(domain, fallback_host)
     return IMAPProvider(
         email=email,
         password=password,
         imap_host=host,
+        proxy=browser_proxy,
     )

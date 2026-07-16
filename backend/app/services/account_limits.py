@@ -8,6 +8,7 @@ from app.integrations.openai.client import OpenAIClient
 from app.integrations.openai.exceptions import BackendApiError, RefreshFailedError, TokenExpiredError
 from app.integrations.openai.oauth import parse_id_token, refresh_access_token
 from app.integrations.openai.types import AccountMetadata, UsageInfo
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 from app.models.account import (
     Account,
     AccountLimits,
@@ -21,6 +22,7 @@ from app.services.subscription_plans import (
     resolve_subscription_plan,
     validate_plan_window_contract,
 )
+from app.services.proxy_routes import mark_proxy_route_offline, resolve_browser_proxy
 
 # access_token считается свежим, если истекает не раньше чем через это время
 _TOKEN_FRESH_THRESHOLD = timedelta(minutes=5)
@@ -28,6 +30,7 @@ _TOKEN_FRESH_THRESHOLD = timedelta(minutes=5)
 _MAX_RETRIES = 1
 _FIVE_HOURS_SECONDS = 5 * 60 * 60
 _ONE_WEEK_SECONDS = 7 * 24 * 60 * 60
+_UNRESOLVED_PROXY = object()
 
 
 class MeasureResult(enum.Enum):
@@ -43,20 +46,29 @@ async def measure_account_limits(
     account_id: int,
     *,
     claim_plan_type: str | None = None,
+    browser_proxy: BrowserProxy | None | object = _UNRESOLVED_PROXY,
 ) -> MeasureResult:
     """Замеряет лимиты и подписку аккаунта, обновляет AccountLimits.
 
     Цикл: refresh access_token (если протух) → get_usage + get_account_metadata → запись в БД.
     При RefreshFailedError → refresh_status=expired, возврат REFRESH_FAILED.
     """
-    limits, access_token = await _acquire_access_token(
-        session, account_id,
-    )
-    if access_token is None:
-        return MeasureResult.REFRESH_FAILED
     account = await session.get(Account, account_id)
     if account is None:
         raise ValueError(f"Account not found for account_id={account_id}")
+    if browser_proxy is _UNRESOLVED_PROXY:
+        pinned_proxy = await resolve_browser_proxy(session, account)
+    else:
+        assert browser_proxy is None or isinstance(browser_proxy, BrowserProxy)
+        pinned_proxy = browser_proxy
+
+    limits, access_token = await _acquire_access_token(
+        session,
+        account_id,
+        browser_proxy=pinned_proxy,
+    )
+    if access_token is None:
+        return MeasureResult.REFRESH_FAILED
 
     # Current OpenAI access tokens carry the ChatGPT account ID and plan in the
     # auth namespace. Older id_token-derived values remain a supported fallback.
@@ -67,7 +79,11 @@ async def measure_account_limits(
     # Замер с retry при 401
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            async with OpenAIClient(access_token, limits.account_id_openai) as client:
+            async with OpenAIClient(
+                access_token,
+                limits.account_id_openai,
+                proxy=pinned_proxy,
+            ) as client:
                 usage = await client.get_usage()
                 try:
                     metadata = await client.get_account_metadata()
@@ -88,6 +104,7 @@ async def measure_account_limits(
                 account_id,
                 force=True,
                 stale_access_token=access_token,
+                browser_proxy=pinned_proxy,
             )
             if refreshed is None:
                 return MeasureResult.REFRESH_FAILED
@@ -95,6 +112,10 @@ async def measure_account_limits(
             access_claims = parse_id_token(access_token)
             if access_claims.account_id:
                 limits.account_id_openai = access_claims.account_id
+        except ProxyUnavailableError:
+            await mark_proxy_route_offline(session, pinned_proxy)
+            await session.commit()
+            raise
         except BackendApiError:
             return MeasureResult.BACKEND_ERROR
 
@@ -338,6 +359,7 @@ async def _acquire_access_token(
     *,
     force: bool = False,
     stale_access_token: str | None = None,
+    browser_proxy: BrowserProxy | None | object = _UNRESOLVED_PROXY,
 ) -> tuple[AccountLimits, str | None]:
     """Serialize rotating refresh-token use across workers for one account."""
 
@@ -369,13 +391,40 @@ async def _acquire_access_token(
         await session.commit()
         return limits, current
 
-    return limits, await _do_refresh(session, limits)
+    if browser_proxy is _UNRESOLVED_PROXY:
+        account = await session.get(Account, account_id)
+        if account is None:
+            raise ValueError(f"Account not found for account_id={account_id}")
+        pinned_proxy = await resolve_browser_proxy(session, account)
+    else:
+        assert browser_proxy is None or isinstance(browser_proxy, BrowserProxy)
+        pinned_proxy = browser_proxy
+    return limits, await _do_refresh(
+        session,
+        limits,
+        browser_proxy=pinned_proxy,
+    )
 
 
-async def _do_refresh(session: AsyncSession, limits: AccountLimits) -> str | None:
+async def _do_refresh(
+    session: AsyncSession,
+    limits: AccountLimits,
+    *,
+    browser_proxy: BrowserProxy | None = None,
+) -> str | None:
     """Обновляет access_token. При провале — ставит refresh_status=expired, возвращает None."""
     try:
-        refreshed = await refresh_access_token(limits.refresh_token_encrypted)
+        if browser_proxy is None:
+            refreshed = await refresh_access_token(limits.refresh_token_encrypted)
+        else:
+            refreshed = await refresh_access_token(
+                limits.refresh_token_encrypted,
+                proxy=browser_proxy,
+            )
+    except ProxyUnavailableError:
+        await mark_proxy_route_offline(session, browser_proxy)
+        await session.commit()
+        raise
     except RefreshFailedError:
         limits.refresh_status = "expired"
         limits.refresh_failed_at = datetime.now(timezone.utc)

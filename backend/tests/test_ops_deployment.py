@@ -28,12 +28,13 @@ def test_backup_service_has_bounded_runtime():
     assert "TimeoutStartSec=1h" in service
 
 
-def test_deployment_runbook_requires_dump_restore_through_0021():
+def test_deployment_runbook_requires_dump_restore_through_0022():
     runbook = (ROOT / "docs" / "deployment.md").read_text(encoding="utf-8")
 
-    assert "20260713_0015`–`20260715_0021" in runbook
+    assert "20260713_0015`–`20260716_0022" in runbook
     assert "docker compose stop backend" in runbook
     assert "dropdb --if-exists --force" in runbook
     assert "pg_restore --exit-on-error --single-transaction" in runbook
     assert "git switch --detach FETCH_HEAD" in runbook
     assert "20260715_0021" in runbook
+    assert "20260716_0022" in runbook

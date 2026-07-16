@@ -7,6 +7,8 @@ import pytest
 
 from app.models.account import Account, AccountLimits, EmailOAuthCredential
 from app.models.catalog import SubscriptionTier
+from app.models.proxy_route import ProxyRoute
+from app.models.settings import SellerSettings
 
 
 def _make_jwt(payload: dict) -> str:
@@ -14,6 +16,74 @@ def _make_jwt(payload: dict) -> str:
     header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode()).rstrip(b"=").decode()
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
     return f"{header}.{body}."
+
+
+@pytest.mark.asyncio
+async def test_email_provider_receives_same_selected_proxy(session, monkeypatch):
+    from app.integrations.playwright.proxy import BrowserProxy
+    from app.services.account_validation import _build_email_provider
+
+    account = Account(
+        login="proxy-mail@example.com",
+        password_encrypted="account-password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        email="mailbox@gmail.com",
+        email_password_encrypted="mail-password",
+    )
+    session.add(account)
+    await session.commit()
+    selected_proxy = BrowserProxy(
+        route_id=23,
+        proxy_type="socks5",
+        host="home-relay",
+        port=1080,
+    )
+    expected_provider = MagicMock()
+
+    def fake_detect(email, password, fallback_host="imap.gmail.com", **kwargs):
+        assert email == account.email
+        assert password == account.email_password_encrypted
+        assert fallback_host == "imap.gmail.com"
+        assert kwargs["browser_proxy"] is selected_proxy
+        return expected_provider
+
+    monkeypatch.setattr(
+        "app.services.account_validation.detect_imap_provider", fake_detect
+    )
+
+    provider = await _build_email_provider(
+        session,
+        account,
+        account.email,
+        account.email_password_encrypted,
+        browser_proxy=selected_proxy,
+    )
+
+    assert provider is expected_provider
+
+
+@pytest.mark.asyncio
+async def test_token_exchange_receives_same_selected_proxy(monkeypatch):
+    from app.integrations.openai.oauth import RefreshedTokens
+    from app.integrations.playwright.proxy import BrowserProxy
+    from app.services.account_validation import _exchange_tokens
+
+    selected_proxy = BrowserProxy(24, "socks5", "home-relay", 1080)
+    observed = []
+
+    async def fake_exchange(code, verifier, redirect_uri, *, proxy=None):
+        observed.append((code, verifier, redirect_uri, proxy))
+        return RefreshedTokens("access", "refresh", None)
+
+    monkeypatch.setattr(
+        "app.services.account_validation.exchange_code_for_tokens", fake_exchange
+    )
+
+    result = await _exchange_tokens("code", "verifier", selected_proxy)
+
+    assert result.access_token == "access"
+    assert len(observed) == 1
+    assert observed[0][3] is selected_proxy
 
 
 @pytest.mark.asyncio
@@ -150,6 +220,220 @@ async def test_token_identity_must_match_configured_account(session, monkeypatch
     assert error.value.code == ValidationCode.INVALID_CREDENTIALS.value
     assert await session.get(AccountLimits, account.id) is None
     measure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_token_save_rejects_changed_account_proxy_snapshot(session, monkeypatch):
+    from app.integrations.openai.oauth import RefreshedTokens
+    from app.services.account_validation import (
+        AccountValidationError,
+        ValidationCode,
+        _save_tokens_and_measure,
+    )
+    from app.services.proxy_routes import browser_proxy_from_route
+
+    route_a = ProxyRoute(
+        name="Snapshot A",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="a.proxy.test",
+        port=3101,
+        enabled=True,
+        config_revision=4,
+    )
+    route_b = ProxyRoute(
+        name="Snapshot B",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="b.proxy.test",
+        port=3102,
+        enabled=True,
+        config_revision=2,
+    )
+    session.add_all([route_a, route_b])
+    await session.flush()
+    account = Account(
+        login="route-snapshot@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        proxy_route_id=route_a.id,
+    )
+    session.add(account)
+    await session.commit()
+    expected = browser_proxy_from_route(route_a)
+
+    account.proxy_route_id = route_b.id
+    await session.commit()
+    tokens = RefreshedTokens(
+        "access",
+        "refresh",
+        _make_jwt({"email": account.login}),
+    )
+    measure = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.account_validation.measure_account_limits",
+        measure,
+    )
+
+    with pytest.raises(AccountValidationError) as error:
+        await _save_tokens_and_measure(
+            session,
+            account,
+            tokens,
+            browser_proxy=expected,
+        )
+
+    assert error.value.code == ValidationCode.PROXY_ROUTE_CHANGED.value
+    assert account.validation_rerun_requested is True
+    assert await session.get(AccountLimits, account.id) is None
+    measure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["route_b", "direct"])
+async def test_token_save_rejects_changed_default_proxy_snapshot(
+    session,
+    monkeypatch,
+    target,
+):
+    from app.integrations.openai.oauth import RefreshedTokens
+    from app.services.account_validation import (
+        AccountValidationError,
+        ValidationCode,
+        _save_tokens_and_measure,
+    )
+    from app.services.proxy_routes import browser_proxy_from_route
+
+    route_a = ProxyRoute(
+        name=f"Default snapshot A {target}",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="default-a.proxy.test",
+        port=3201,
+        enabled=True,
+        config_revision=8,
+    )
+    route_b = ProxyRoute(
+        name=f"Default snapshot B {target}",
+        mode="custom_proxy",
+        proxy_type="socks5",
+        host="default-b.proxy.test",
+        port=3202,
+        enabled=True,
+        config_revision=3,
+    )
+    session.add_all([route_a, route_b])
+    await session.flush()
+    settings = SellerSettings(id=1, default_proxy_route_id=route_a.id)
+    account = Account(
+        login=f"default-{target}@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        proxy_route_id=None,
+    )
+    session.add_all([settings, account])
+    await session.commit()
+    expected = browser_proxy_from_route(route_a)
+
+    settings.default_proxy_route_id = route_b.id if target == "route_b" else None
+    await session.commit()
+    tokens = RefreshedTokens(
+        "access",
+        "refresh",
+        _make_jwt({"email": account.login}),
+    )
+    measure = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.account_validation.measure_account_limits",
+        measure,
+    )
+
+    with pytest.raises(AccountValidationError) as error:
+        await _save_tokens_and_measure(
+            session,
+            account,
+            tokens,
+            browser_proxy=expected,
+        )
+
+    assert error.value.code == ValidationCode.PROXY_ROUTE_CHANGED.value
+    assert account.validation_rerun_requested is True
+    assert await session.get(AccountLimits, account.id) is None
+    measure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_token_save_rechecks_route_after_limit_measurement_commit(
+    session,
+    monkeypatch,
+):
+    from app.integrations.openai.oauth import RefreshedTokens
+    from app.services.account_limits import MeasureResult
+    from app.services.account_validation import (
+        AccountValidationError,
+        ValidationCode,
+        _save_tokens_and_measure,
+    )
+    from app.services.proxy_routes import browser_proxy_from_route
+
+    route_a = ProxyRoute(
+        name="Measurement route A",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="measure-a.proxy.test",
+        port=3301,
+        enabled=True,
+        config_revision=5,
+    )
+    route_b = ProxyRoute(
+        name="Measurement route B",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="measure-b.proxy.test",
+        port=3302,
+        enabled=True,
+        config_revision=2,
+    )
+    session.add_all([route_a, route_b])
+    await session.flush()
+    account = Account(
+        login="measurement-route@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="JBSWY3DPEHPK3PXP",
+        proxy_route_id=route_a.id,
+    )
+    session.add(account)
+    await session.commit()
+    expected = browser_proxy_from_route(route_a)
+
+    async def measure_then_change_route(*_args, **_kwargs):
+        # Account-limit measurement intentionally commits around network I/O.
+        # Simulate a concurrent admin mutation in that released window.
+        account.proxy_route_id = route_b.id
+        await session.commit()
+        return MeasureResult.OK
+
+    monkeypatch.setattr(
+        "app.services.account_validation.measure_account_limits",
+        measure_then_change_route,
+    )
+    tokens = RefreshedTokens(
+        "access",
+        "refresh",
+        _make_jwt({"email": account.login}),
+    )
+
+    with pytest.raises(AccountValidationError) as error:
+        await _save_tokens_and_measure(
+            session,
+            account,
+            tokens,
+            browser_proxy=expected,
+        )
+
+    assert error.value.code == ValidationCode.PROXY_ROUTE_CHANGED.value
+    assert account.validation_rerun_requested is True
+    assert account.status != "active"
 
 
 @pytest.mark.asyncio
@@ -446,6 +730,7 @@ async def test_outlook_validation_prefers_connected_graph_credential(
     from app.integrations.email.microsoft_graph_provider import (
         MicrosoftGraphEmailProvider,
     )
+    from app.integrations.playwright.proxy import BrowserProxy
     from app.services.account_validation import _build_email_provider
 
     monkeypatch.setenv("MICROSOFT_GRAPH_CLIENT_ID", "graph-client")
@@ -471,14 +756,25 @@ async def test_outlook_validation_prefers_connected_graph_credential(
     session.add(credential)
     await session.commit()
 
+    browser_proxy = BrowserProxy(
+        route_id=7,
+        proxy_type="socks5",
+        host="127.0.0.1",
+        port=1080,
+        username="relay-user",
+        password="relay-password",
+        config_revision=3,
+    )
     provider = await _build_email_provider(
         session,
         account,
         account.email,
         account.email_password_encrypted,
+        browser_proxy=browser_proxy,
     )
 
     assert isinstance(provider, MicrosoftGraphEmailProvider)
+    assert provider._browser_proxy is browser_proxy
     await provider._on_refresh_token("rotated-graph-refresh")
     await session.refresh(credential)
     assert credential.refresh_token_encrypted == "rotated-graph-refresh"

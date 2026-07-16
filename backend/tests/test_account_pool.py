@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.account import Account, AccountCheckJob, AccountLimits
 from app.models.catalog import SubscriptionTier, Duration, LimitScope
 from app.models.rental import Rental, Order
+from app.models.proxy_route import ProxyRoute
+from app.models.settings import SellerSettings
 from app.services.account_pool import AccountPool, AccountCriteria
 
 
@@ -121,6 +123,47 @@ async def test_acquire_returns_none_when_no_active_accounts(session: AsyncSessio
     )
     result = await pool.acquire(session, criteria, default_max_active_rentals=1)
     assert result is None
+
+
+@pytest.mark.parametrize("account_override", [True, False])
+async def test_acquire_requires_fresh_effective_proxy_route(
+    session: AsyncSession,
+    account_override: bool,
+):
+    tier, duration, _scope_any = await _seed_tier_ds(session)
+    account = await _add_account(session, tier)
+    route = ProxyRoute(
+        name=f"Route freshness {account_override}",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="proxy.example.test",
+        port=3128,
+        enabled=True,
+        status="online",
+        last_checked_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    session.add(route)
+    await session.flush()
+    if account_override:
+        account.proxy_route_id = route.id
+    else:
+        session.add(SellerSettings(id=1, default_proxy_route_id=route.id))
+    await session.flush()
+    criteria = AccountCriteria(
+        tier_id=tier.id,
+        duration_minutes=duration.minutes,
+        scope="any",
+        min_limit_pct=None,
+        max_5h_pct=None,
+        max_weekly_pct=None,
+    )
+
+    assert await AccountPool().acquire(session, criteria, 1) is None
+
+    route.last_checked_at = datetime.now(timezone.utc)
+    await session.flush()
+    result = await AccountPool().acquire(session, criteria, 1)
+    assert result is not None and result.id == account.id
 
 
 @pytest.mark.parametrize("job_status", ["pending", "running"])

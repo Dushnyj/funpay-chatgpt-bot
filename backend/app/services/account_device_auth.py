@@ -5,7 +5,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -20,6 +20,7 @@ from app.integrations.openai.device_auth import (
     request_device_code,
 )
 from app.integrations.openai.oauth import parse_id_token
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 from app.models.account import Account, AccountCheckJob
 from app.models.audit import AuditLog
 from app.check_job_queue import CheckJobQueue
@@ -28,14 +29,32 @@ from app.services.account_validation import (
     ValidationCode,
     ValidationStage,
     _save_tokens_and_measure,
+    assert_proxy_selection_unchanged,
 )
 from app.services.account_occupancy import account_is_busy
+from app.services.proxy_routes import mark_proxy_route_offline, resolve_browser_proxy
 
 
 _DEVICE_SESSION_TTL = timedelta(minutes=15)
+_TERMINAL_SESSION_RETENTION = timedelta(minutes=5)
 _BACKGROUND_RETRY_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
+
+
+def _same_proxy_selection(
+    first: BrowserProxy | None,
+    second: BrowserProxy | None,
+) -> bool:
+    if first is None or second is None:
+        return first is second
+    return (
+        first.route_id == second.route_id
+        and first.config_revision == second.config_revision
+        and first.server == second.server
+        and first.username == second.username
+        and first.password == second.password
+    )
 
 
 class AccountBusyError(RuntimeError):
@@ -54,6 +73,8 @@ class DeviceAuthSession:
     status: str = "pending"
     error_code: str | None = None
     error_detail: str | None = None
+    browser_proxy: BrowserProxy | None = field(default=None, repr=False)
+    terminal_at: datetime | None = field(default=None, repr=False)
 
 
 class AccountDeviceAuthManager:
@@ -69,12 +90,14 @@ class AccountDeviceAuthManager:
         *,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         validation_queued: Callable[[], None] | None = None,
+        capacity_changed: Callable[[], None] | None = None,
     ) -> None:
         self._sessions: dict[str, DeviceAuthSession] = {}
         self._lock = asyncio.Lock()
         self._queue = CheckJobQueue()
         self._session_factory = session_factory
         self._validation_queued = validation_queued
+        self._capacity_changed = capacity_changed
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
     def set_validation_queued_callback(
@@ -84,6 +107,12 @@ class AccountDeviceAuthManager:
         """Attach the live scheduler without coupling this service to FastAPI."""
 
         self._validation_queued = callback
+
+    def set_capacity_changed_callback(
+        self,
+        callback: Callable[[], None] | None,
+    ) -> None:
+        self._capacity_changed = callback
 
     def _notify_validation_queued(self) -> None:
         callback = self._validation_queued
@@ -96,22 +125,73 @@ class AccountDeviceAuthManager:
             # recovery path and a wake failure must not corrupt Device Auth.
             logger.exception("Could not wake validation queue after Device Auth")
 
+    def _notify_capacity_changed(self) -> None:
+        callback = self._capacity_changed
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            logger.exception("Could not reconcile capacity after Device Auth")
+
+    def _finish_session(
+        self,
+        auth_session: DeviceAuthSession,
+        status: str,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Retain a short status result without retaining proxy credentials."""
+
+        auth_session.status = status
+        auth_session.code = None
+        auth_session.browser_proxy = None
+        auth_session.terminal_at = now or datetime.now(timezone.utc)
+        self._cancel_background_task(auth_session.id)
+
+    def _prune_terminal_sessions(self, now: datetime) -> None:
+        for session_id, auth_session in list(self._sessions.items()):
+            terminal_at = auth_session.terminal_at
+            if (
+                auth_session.status != "pending"
+                and terminal_at is not None
+                and now - terminal_at >= _TERMINAL_SESSION_RETENTION
+            ):
+                self._sessions.pop(session_id, None)
+
     async def start(
         self,
         session: AsyncSession,
         account: Account,
     ) -> DeviceAuthSession:
         account_id = account.id
+        try:
+            browser_proxy = await resolve_browser_proxy(session, account)
+        except ProxyUnavailableError as exc:
+            raise DeviceAuthError("proxy_unavailable") from exc
         # Device-code creation is remote I/O and can be slow. Release the
         # preflight transaction, then serialize the state transition again.
         if session.in_transaction():
             await session.commit()
-        code = await request_device_code()
+        try:
+            if browser_proxy is None:
+                code = await request_device_code()
+            else:
+                code = await request_device_code(proxy=browser_proxy)
+        except ProxyUnavailableError as exc:
+            marked_offline = await mark_proxy_route_offline(
+                session, browser_proxy
+            )
+            await session.commit()
+            if marked_offline:
+                self._notify_capacity_changed()
+            raise DeviceAuthError("proxy_unavailable") from exc
         now = datetime.now(timezone.utc)
         # poll() already serializes Device Auth under the process lock before
         # it mutates the database. Keep the same lock order here so a retry
         # cannot hold the account row while a background poll waits to commit.
         async with self._lock:
+            self._prune_terminal_sessions(now)
             account = (
                 await session.execute(
                     select(Account)
@@ -126,6 +206,14 @@ class AccountDeviceAuthManager:
             if await account_is_busy(session, account_id):
                 await session.rollback()
                 raise AccountBusyError(account_id)
+            try:
+                current_proxy = await resolve_browser_proxy(session, account)
+            except ProxyUnavailableError as exc:
+                await session.rollback()
+                raise DeviceAuthError("proxy_unavailable") from exc
+            if not _same_proxy_selection(browser_proxy, current_proxy):
+                await session.rollback()
+                raise DeviceAuthError("proxy_route_changed")
 
             # A second operator click means "issue a fresh browser code". A
             # running Device Auth job is owned by this manager, so it can be
@@ -148,6 +236,7 @@ class AccountDeviceAuthManager:
                 metadata_={"actor": "admin", "job_id": job.id},
             ))
             await session.commit()
+            self._notify_capacity_changed()
 
             auth_session = DeviceAuthSession(
                 id=uuid.uuid4().hex,
@@ -157,6 +246,7 @@ class AccountDeviceAuthManager:
                 created_at=now,
                 expires_at=now + _DEVICE_SESSION_TTL,
                 next_poll_at=now,
+                browser_proxy=browser_proxy,
             )
             self._sessions[auth_session.id] = auth_session
             self._start_background_task(auth_session)
@@ -197,13 +287,11 @@ class AccountDeviceAuthManager:
                     )
                 )
 
-            existing.status = "expired"
+            self._finish_session(existing, "expired", now=now)
             existing.error_code = "device_auth_restarted"
             existing.error_detail = (
                 "Предыдущий код отменён: начата новая проверка через браузер."
             )
-            existing.code = None
-            self._cancel_background_task(existing.id)
 
         await db.flush()
 
@@ -214,6 +302,7 @@ class AccountDeviceAuthManager:
         session_id: str,
     ) -> DeviceAuthSession:
         async with self._lock:
+            self._prune_terminal_sessions(datetime.now(timezone.utc))
             auth_session = self._sessions.get(session_id)
             if auth_session is None or auth_session.account_id != account.id:
                 raise KeyError(session_id)
@@ -229,9 +318,8 @@ class AccountDeviceAuthManager:
                     auth_session,
                     "device_auth_expired",
                     "Время подтверждения входа истекло.",
+                    terminal_status="expired",
                 )
-                auth_session.status = "expired"
-                self._cancel_background_task(session_id)
                 return auth_session
             if now < auth_session.next_poll_at:
                 return auth_session
@@ -254,20 +342,60 @@ class AccountDeviceAuthManager:
                 # durably superseded this job while its browser code was still
                 # present in this process. Never let that stale session race
                 # the replacement validation.
-                auth_session.status = "expired"
-                auth_session.code = None
-                self._cancel_background_task(session_id)
+                self._finish_session(auth_session, "expired", now=now)
                 return auth_session
             if job.status == "pending":
                 job.status = "running"
                 job.started_at = now
                 await db.commit()
 
+            browser_proxy = auth_session.browser_proxy
             try:
-                authorization = await poll_device_authorization(
-                    code.device_auth_id,
-                    code.user_code,
+                current_proxy = await resolve_browser_proxy(db, account)
+            except ProxyUnavailableError:
+                await self._fail(
+                    db,
+                    account,
+                    auth_session,
+                    "proxy_unavailable",
+                    "Маршрут входа через прокси недоступен.",
+                    stage="proxy",
                 )
+                return auth_session
+            if not _same_proxy_selection(browser_proxy, current_proxy):
+                await self._fail(
+                    db,
+                    account,
+                    auth_session,
+                    "proxy_route_changed",
+                    "Маршрут входа изменился; начните подтверждение заново.",
+                    stage="proxy",
+                )
+                return auth_session
+
+            try:
+                if browser_proxy is None:
+                    authorization = await poll_device_authorization(
+                        code.device_auth_id,
+                        code.user_code,
+                    )
+                else:
+                    authorization = await poll_device_authorization(
+                        code.device_auth_id,
+                        code.user_code,
+                        proxy=browser_proxy,
+                    )
+            except ProxyUnavailableError:
+                await mark_proxy_route_offline(db, browser_proxy)
+                await self._fail(
+                    db,
+                    account,
+                    auth_session,
+                    "proxy_unavailable",
+                    "Маршрут входа через прокси недоступен.",
+                    stage="proxy",
+                )
+                return auth_session
             except DeviceAuthError:
                 await self._fail(
                     db,
@@ -281,7 +409,31 @@ class AccountDeviceAuthManager:
                 return auth_session
 
             try:
-                tokens = await exchange_device_authorization(authorization)
+                # Polling may take long enough for an operator to change the
+                # account/default route. Lock the Account serialization row and
+                # compare the exact pinned transport before exchanging or
+                # persisting anything.
+                await assert_proxy_selection_unchanged(
+                    db,
+                    account,
+                    browser_proxy,
+                    lock_account=True,
+                )
+                if browser_proxy is None:
+                    tokens = await exchange_device_authorization(authorization)
+                else:
+                    tokens = await exchange_device_authorization(
+                        authorization,
+                        proxy=browser_proxy,
+                    )
+                # Keep an explicit post-exchange check even though the Account
+                # row lock blocks supported API mutations. It catches direct DB
+                # edits and makes the token-persistence boundary self-evident.
+                await assert_proxy_selection_unchanged(
+                    db,
+                    account,
+                    browser_proxy,
+                )
                 claims = parse_id_token(tokens.id_token) if tokens.id_token else None
                 if claims is None or not self._identity_matches(account, claims.email):
                     raise AccountValidationError(
@@ -289,8 +441,30 @@ class AccountDeviceAuthManager:
                         ValidationCode.INVALID_CREDENTIALS,
                         "В браузере подтверждён другой аккаунт OpenAI.",
                     )
-                await _save_tokens_and_measure(db, account, tokens)
+                await _save_tokens_and_measure(
+                    db,
+                    account,
+                    tokens,
+                    browser_proxy=browser_proxy,
+                )
+            except ProxyUnavailableError:
+                await mark_proxy_route_offline(db, browser_proxy)
+                await self._fail(
+                    db,
+                    account,
+                    auth_session,
+                    "proxy_unavailable",
+                    "Маршрут входа через прокси недоступен.",
+                    stage="proxy",
+                )
+                return auth_session
             except AccountValidationError as exc:
+                if exc.code == ValidationCode.PROXY_ROUTE_CHANGED.value:
+                    # _fail() refreshes durable rerun intent before deciding
+                    # whether to enqueue. Publish this exact race signal first
+                    # so the refresh cannot discard the in-memory assignment.
+                    account.validation_rerun_requested = True
+                    await db.flush()
                 await self._fail(
                     db,
                     account,
@@ -340,9 +514,8 @@ class AccountDeviceAuthManager:
             ))
             await db.commit()
             self._notify_validation_queued()
-            auth_session.status = "completed"
-            auth_session.code = None
-            self._cancel_background_task(session_id)
+            self._notify_capacity_changed()
+            self._finish_session(auth_session, "completed", now=finished_at)
             return auth_session
 
     def _start_background_task(self, auth_session: DeviceAuthSession) -> None:
@@ -376,8 +549,7 @@ class AccountDeviceAuthManager:
                         async with self._lock:
                             current = self._sessions.get(session_id)
                             if current is not None and current.status == "pending":
-                                current.status = "expired"
-                                current.code = None
+                                self._finish_session(current, "expired")
                         return
                     result = await self.poll(db, account, session_id)
             except asyncio.CancelledError:
@@ -458,12 +630,11 @@ class AccountDeviceAuthManager:
             for auth_session in self._sessions.values():
                 if auth_session.status == "pending":
                     interrupted.append(auth_session)
-                    auth_session.status = "expired"
+                    self._finish_session(auth_session, "expired")
                     auth_session.error_code = "device_auth_shutdown"
                     auth_session.error_detail = (
                         "Подтверждение входа прервано перезапуском сервера."
                     )
-                    auth_session.code = None
             for session_id, task in tasks:
                 if self._tasks.get(session_id) is task:
                     self._tasks.pop(session_id, None)
@@ -539,6 +710,7 @@ class AccountDeviceAuthManager:
         detail: str,
         *,
         stage: str = "device_auth",
+        terminal_status: str = "failed",
     ) -> None:
         now = datetime.now(timezone.utc)
         await db.refresh(
@@ -584,11 +756,10 @@ class AccountDeviceAuthManager:
             metadata_=metadata,
         ))
         await db.commit()
-        auth_session.status = "failed"
+        self._notify_capacity_changed()
+        self._finish_session(auth_session, terminal_status, now=now)
         auth_session.error_code = code
         auth_session.error_detail = detail
-        auth_session.code = None
-        self._cancel_background_task(auth_session.id)
 
 account_device_auth_manager = AccountDeviceAuthManager(
     session_factory=async_session_factory

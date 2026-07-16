@@ -17,6 +17,7 @@ from app.models.audit import AuditLog
 from app.models.lot import Lot
 from app.models.rental import OCCUPYING_RENTAL_STATUSES, Order, Rental
 from app.models.settings import SellerSettings
+from app.models.proxy_route import ProxyRoute
 from app.scheduler import ScheduledTask, Scheduler
 from app.services.bump import BumpService
 from app.services.funpay_lifecycle import build_callbacks
@@ -43,6 +44,11 @@ from app.services.rental_service import (
 )
 from app.services.delivery_policy import CREDENTIAL_DELIVERY_POLL_SECONDS
 from app.services.rental_expiry import RentalExpiryService
+from app.services.proxy_routes import (
+    probe_proxy_route,
+    proxy_route_check_is_fresh,
+    publish_proxy_probe_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +91,11 @@ class AppLifecycle:
     """Own the FunPay transport and all periodic application tasks."""
 
     def __init__(self, golden_key: str, category_id: int) -> None:
-        self._browser_concurrency_cap = get_settings().browser_concurrency_cap
+        app_settings = get_settings()
+        self._browser_concurrency_cap = app_settings.browser_concurrency_cap
+        self._proxy_probe_interval_seconds = (
+            app_settings.proxy_route_probe_interval_seconds
+        )
         self._golden_key = golden_key
         self._category_id = category_id
         self.scheduler = Scheduler()
@@ -442,6 +452,56 @@ class AppLifecycle:
             callback=self._task_order_confirmed_notify,
             interval=60,
         ))
+        self.scheduler.register("proxy_route_health", ScheduledTask(
+            callback=self._task_proxy_route_health,
+            interval=self._proxy_probe_interval_seconds,
+        ))
+
+    async def _task_proxy_route_health(self) -> None:
+        """Keep configured login routes fresh and fail sales closed."""
+
+        async with async_session_factory() as session:
+            route_ids = list((await session.execute(
+                select(ProxyRoute.id)
+                .where(ProxyRoute.enabled.is_(True))
+                .order_by(ProxyRoute.id.asc())
+            )).scalars())
+
+        capacity_changed = False
+        # Probe sequentially: each check launches Chromium and the documented
+        # production host intentionally budgets one browser at a time.
+        for route_id in route_ids:
+            async with async_session_factory() as session:
+                route = await session.get(ProxyRoute, route_id)
+                if route is None or not route.enabled:
+                    continue
+                tested_revision = route.config_revision
+                was_persisted_online = route.status == "online"
+                was_healthy = (
+                    route.status == "online"
+                    and proxy_route_check_is_fresh(route.last_checked_at)
+                )
+
+            result = await probe_proxy_route(route)
+            async with async_session_factory() as session:
+                published = await publish_proxy_probe_result(
+                    session,
+                    route_id=route_id,
+                    tested_revision=tested_revision,
+                    result=result,
+                )
+                if not published:
+                    await session.rollback()
+                    continue
+                await session.commit()
+            is_online = result.status == "online"
+            capacity_changed = capacity_changed or (
+                was_persisted_online != is_online
+                or was_healthy != is_online
+            )
+
+        if capacity_changed:
+            self.request_capacity_reconcile()
 
     async def sync_funpay_sales(
         self,

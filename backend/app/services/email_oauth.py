@@ -4,7 +4,7 @@ import asyncio
 import base64
 import hashlib
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urlparse
 
@@ -14,7 +14,9 @@ from app.config import Settings
 from app.integrations.email.microsoft_graph_provider import (
     MICROSOFT_AUTHORITY,
     MICROSOFT_GRAPH_SCOPE_STRING,
+    microsoft_graph_http_client,
 )
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 
 _STATE_TTL = timedelta(minutes=10)
@@ -73,6 +75,7 @@ class PendingEmailOAuth:
     client_id: str
     redirect_uri: str
     expires_at: datetime
+    browser_proxy: BrowserProxy | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +105,7 @@ class EmailOAuthStateManager:
         account_id: int,
         expected_email: str,
         config: MicrosoftGraphOAuthConfig,
+        browser_proxy: BrowserProxy | None = None,
     ) -> EmailOAuthStart:
         now = datetime.now(timezone.utc)
         expires_at = now + self._ttl
@@ -117,6 +121,7 @@ class EmailOAuthStateManager:
             client_id=config.client_id,
             redirect_uri=config.redirect_uri,
             expires_at=expires_at,
+            browser_proxy=browser_proxy,
         )
 
         async with self._lock:
@@ -177,9 +182,15 @@ async def exchange_and_verify_microsoft_code(
         or config.redirect_uri != pending.redirect_uri
     ):
         raise EmailOAuthExchangeError("configuration_changed")
+    # The route is part of the one-time state. Callers cannot accidentally
+    # exchange a proxy-bound code through a direct client.
+    browser_proxy = pending.browser_proxy
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout_s) as client:
+        async with microsoft_graph_http_client(
+            browser_proxy=browser_proxy,
+            timeout=request_timeout_s,
+        ) as client:
             token_response = await client.post(
                 f"{MICROSOFT_AUTHORITY}/token",
                 data={
@@ -193,6 +204,10 @@ async def exchange_and_verify_microsoft_code(
                 },
             )
     except httpx.HTTPError as exc:
+        if browser_proxy is not None:
+            raise ProxyUnavailableError(
+                "Маршрут входа в почту через прокси недоступен."
+            ) from None
         raise EmailOAuthExchangeError("token_service_unavailable") from exc
 
     if token_response.is_error:
@@ -206,13 +221,20 @@ async def exchange_and_verify_microsoft_code(
         raise EmailOAuthExchangeError("offline_access_missing")
 
     try:
-        async with httpx.AsyncClient(timeout=request_timeout_s) as client:
+        async with microsoft_graph_http_client(
+            browser_proxy=browser_proxy,
+            timeout=request_timeout_s,
+        ) as client:
             profile_response = await client.get(
                 _PROFILE_URL,
                 headers={"Authorization": f"Bearer {access_token}"},
                 params={"$select": "id,mail,userPrincipalName"},
             )
     except httpx.HTTPError as exc:
+        if browser_proxy is not None:
+            raise ProxyUnavailableError(
+                "Маршрут входа в почту через прокси недоступен."
+            ) from None
         raise EmailOAuthExchangeError("profile_service_unavailable") from exc
     if profile_response.is_error:
         raise EmailOAuthExchangeError("profile_lookup_failed")

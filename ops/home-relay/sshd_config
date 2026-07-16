@@ -1,0 +1,35 @@
+Port 2222
+ListenAddress 0.0.0.0
+AddressFamily any
+
+HostKey /var/lib/funpay-relay/host/ssh_host_ed25519_key
+PidFile /run/sshd.pid
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+AllowUsers relay
+
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+AllowTcpForwarding remote
+GatewayPorts clientspecified
+PermitListen 0.0.0.0:1080
+X11Forwarding no
+PermitTTY no
+PermitUserEnvironment no
+PermitUserRC no
+PermitTunnel no
+
+ClientAliveInterval 30
+ClientAliveCountMax 3
+LoginGraceTime 30
+MaxAuthTries 3
+MaxSessions 0
+MaxStartups 3:30:10
+LogLevel VERBOSE
+StrictModes yes
+AuthorizedKeysFile /var/lib/funpay-relay/auth/authorized_keys

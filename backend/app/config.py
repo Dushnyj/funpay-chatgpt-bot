@@ -1,7 +1,7 @@
 from functools import lru_cache
 
 from cryptography.fernet import Fernet
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +29,34 @@ class Settings(BaseSettings):
     microsoft_graph_client_id: str = ""
     microsoft_graph_client_secret: str = ""
     microsoft_graph_redirect_uri: str = ""
+    # Home relay control plane.  The SOCKS port is internal to the Compose
+    # network; only the SSH enrollment endpoint is exposed by operations.
+    home_relay_proxy_host: str = "home-relay"
+    home_relay_proxy_port: int = Field(default=1080, ge=1, le=65535)
+    home_relay_public_base_url: str = "https://funpay-bot.duckdns.org"
+    home_relay_public_host: str = "funpay-bot.duckdns.org"
+    home_relay_ssh_port: int = Field(default=2222, ge=1, le=65535)
+    home_relay_ssh_user: str = "relay"
+    home_relay_authorized_keys_path: str = (
+        "/var/lib/funpay-relay/auth/authorized_keys"
+    )
+    home_relay_host_public_key_path: str = (
+        "/var/lib/funpay-relay/auth/ssh_host_ed25519_key.pub"
+    )
+    home_relay_setup_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    home_relay_session_ack_timeout_seconds: float = Field(
+        default=5.0, ge=0.1, le=30.0
+    )
+    # A route is sellable only while a recent end-to-end probe confirms it.
+    # The TTL is deliberately longer than the probe interval so a single
+    # transient probe failure is published explicitly instead of becoming a
+    # silent direct-network fallback.
+    proxy_route_probe_interval_seconds: int = Field(
+        default=60, ge=30, le=600
+    )
+    proxy_route_max_age_seconds: int = Field(
+        default=180, ge=60, le=3600
+    )
 
     @field_validator("encryption_key")
     @classmethod
@@ -48,6 +76,18 @@ class Settings(BaseSettings):
         }:
             raise ValueError("SECRET_KEY must be a unique random value")
         return value
+
+    @model_validator(mode="after")
+    def _validate_proxy_probe_timing(self) -> "Settings":
+        if (
+            self.proxy_route_max_age_seconds
+            < self.proxy_route_probe_interval_seconds * 2
+        ):
+            raise ValueError(
+                "PROXY_ROUTE_MAX_AGE_SECONDS must be at least twice "
+                "PROXY_ROUTE_PROBE_INTERVAL_SECONDS"
+            )
+        return self
 
 
 @lru_cache

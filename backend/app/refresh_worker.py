@@ -33,6 +33,7 @@ _TERMINAL_ACCOUNT_FAILURE_CODES = {
     ValidationCode.EMAIL_SECURITY_CHALLENGE.value,
     ValidationCode.PLAN_DETECTION_FAILED.value,
     ValidationCode.PLAN_WINDOW_MISMATCH.value,
+    ValidationCode.PROXY_ROUTE_CHANGED.value,
 }
 
 

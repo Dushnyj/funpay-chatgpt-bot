@@ -1,11 +1,22 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+import asyncio
 from datetime import datetime, timezone
+import re
+import ssl
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from python_socks import ProxyError, ProxyTimeoutError, ProxyType
 
-from app.integrations.email.imap_provider import IMAPProvider, detect_imap_provider
+from app.integrations.email.imap_provider import (
+    IMAPProvider,
+    _SocketIMAP4SSL,
+    _proxy_connector,
+    detect_imap_provider,
+)
 from app.integrations.email.outlook_web_provider import OutlookWebProvider
 from app.integrations.email.provider import EmailErrorCode, EmailProviderError
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 
 def _response(result="OK", lines=None):
@@ -50,6 +61,136 @@ def test_detect_hotmail():
     assert isinstance(provider, OutlookWebProvider)
 
 
+async def test_outlook_scan_reacquires_dynamic_tab_without_losing_baseline():
+    provider = OutlookWebProvider("user@hotmail.com", "mail-password")
+
+    other_tab = MagicMock()
+    other_tab.is_visible = AsyncMock(return_value=True)
+    other_tab.get_attribute = AsyncMock(return_value="false")
+    other_tab.click = AsyncMock(
+        side_effect=[PlaywrightTimeoutError("re-rendered"), None]
+    )
+    other_tab.press = AsyncMock(return_value=None)
+    selected_other_tab = MagicMock()
+    selected_other_tab.is_visible = AsyncMock(return_value=True)
+    selected_other_tab.get_attribute = AsyncMock(return_value="true")
+    focused_tab = MagicMock()
+    focused_tab.is_visible = AsyncMock(return_value=True)
+    focused_tab.get_attribute = AsyncMock(return_value="true")
+
+    other_result = MagicMock()
+    other_result.first = other_tab
+    focused_result = MagicMock()
+    focused_result.first = focused_tab
+    page = MagicMock()
+    other_calls = 0
+
+    def get_by_role(_role, *, name):
+        nonlocal other_calls
+        if "other" not in name.pattern:
+            return focused_result
+        other_calls += 1
+        result = MagicMock()
+        result.first = selected_other_tab if other_calls >= 5 else other_tab
+        return result
+
+    page.get_by_role.side_effect = get_by_role
+
+    provider._open_mail_folder = AsyncMock(side_effect=[True, False])
+    old_other = MagicMock(key="old-other")
+    old_focused = MagicMock(key="old-focused")
+    provider._visible_openai_messages = AsyncMock(
+        side_effect=[[old_other], [old_focused]]
+    )
+
+    snapshots = await provider._scan_all_folders(page)
+
+    assert {snapshot.key for snapshot in snapshots} == {
+        "old-other",
+        "old-focused",
+    }
+    assert other_tab.click.await_count == 1
+    assert all(
+        call.kwargs == {"timeout": 3_000}
+        for call in other_tab.click.await_args_list
+    )
+    other_tab.press.assert_awaited_once_with("Enter", timeout=3_000)
+    focused_tab.click.assert_not_called()
+
+
+async def test_outlook_scan_rejects_incomplete_focused_inbox_baseline():
+    provider = OutlookWebProvider("user@hotmail.com", "mail-password")
+
+    other_tab = MagicMock()
+    other_tab.is_visible = AsyncMock(return_value=True)
+    focused_tab = MagicMock()
+    focused_tab.is_visible = AsyncMock(return_value=False)
+    other_result = MagicMock()
+    other_result.first = other_tab
+    focused_result = MagicMock()
+    focused_result.first = focused_tab
+    page = MagicMock()
+    page.get_by_role.side_effect = lambda _role, *, name: (
+        other_result if "other" in name.pattern else focused_result
+    )
+
+    provider._open_mail_folder = AsyncMock(return_value=True)
+    provider._visible_openai_messages = AsyncMock()
+
+    with pytest.raises(EmailProviderError) as error:
+        await provider._scan_all_folders(page)
+
+    assert error.value.code == EmailErrorCode.TIMEOUT
+    provider._visible_openai_messages.assert_not_awaited()
+
+
+async def test_outlook_scan_restarts_when_tabs_appear_after_single_list_scan():
+    provider = OutlookWebProvider("user@hotmail.com", "mail-password")
+    page = MagicMock()
+    other = re.compile(r"other|другие", re.IGNORECASE)
+    focused = re.compile(r"focused|приоритетные", re.IGNORECASE)
+    provider._visible_inbox_tabs = AsyncMock(
+        side_effect=[[], [other, focused], [other, focused], [other, focused]]
+    )
+    old_single = MagicMock(key="old-single")
+    old_other = MagicMock(key="old-other")
+    old_focused = MagicMock(key="old-focused")
+    provider._visible_openai_messages = AsyncMock(
+        side_effect=[[old_single], [old_other], [old_focused]]
+    )
+    provider._activate_inbox_tab = AsyncMock()
+
+    snapshots = await provider._scan_inbox_stably(page)
+
+    assert {snapshot.key for snapshot in snapshots} == {
+        "old-other",
+        "old-focused",
+    }
+    assert provider._activate_inbox_tab.await_count == 2
+
+
+async def test_outlook_tab_click_must_result_in_selected_state():
+    provider = OutlookWebProvider("user@hotmail.com", "mail-password")
+    tab = MagicMock()
+    tab.is_visible = AsyncMock(return_value=True)
+    tab.get_attribute = AsyncMock(return_value="false")
+    tab.click = AsyncMock(return_value=None)
+    tab.press = AsyncMock(return_value=None)
+    result = MagicMock()
+    result.first = tab
+    page = MagicMock()
+    page.get_by_role.return_value = result
+
+    with pytest.raises(EmailProviderError) as error:
+        await provider._activate_inbox_tab(
+            page, re.compile(r"other", re.IGNORECASE)
+        )
+
+    assert error.value.code == EmailErrorCode.TIMEOUT
+    assert tab.click.await_count == 3
+    assert tab.press.await_count == 3
+
+
 def test_detect_yahoo():
     provider = detect_imap_provider("user@yahoo.com", "pass")
     assert provider.imap_host == "imap.mail.yahoo.com"
@@ -62,6 +203,43 @@ def test_detect_custom_domain_uses_fallback():
     assert provider.imap_host == "mail.mydomain.com"
 
 
+def _browser_proxy(proxy_type: str = "http") -> BrowserProxy:
+    return BrowserProxy(
+        route_id=17,
+        proxy_type=proxy_type,
+        host="proxy.example.test",
+        port=3128,
+        username="proxy-user",
+        password="proxy-password",
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_type", "expected_type"),
+    [
+        ("http", ProxyType.HTTP),
+        ("https", ProxyType.HTTP),
+        ("socks5", ProxyType.SOCKS5),
+    ],
+)
+def test_imap_proxy_uses_connect_transport(configured_type, expected_type):
+    proxy = _browser_proxy(configured_type)
+
+    with patch(
+        "app.integrations.email.imap_provider.AsyncioProxy"
+    ) as constructor:
+        _proxy_connector(proxy)
+
+    constructor.assert_called_once_with(
+        proxy_type=expected_type,
+        host=proxy.host,
+        port=proxy.port,
+        username=None if configured_type == "socks5" else proxy.username,
+        password=None if configured_type == "socks5" else proxy.password,
+        rdns=True,
+    )
+
+
 def _client() -> AsyncMock:
     client = AsyncMock()
     client.wait_hello_from_server = AsyncMock()
@@ -69,6 +247,109 @@ def _client() -> AsyncMock:
     client.select = AsyncMock(return_value=_response())
     client.logout = AsyncMock()
     return client
+
+
+async def test_selected_proxy_reaches_imap_tunnel_and_tls_client():
+    proxy = _browser_proxy()
+    provider = detect_imap_provider(
+        "user@gmail.com", "mail-password", browser_proxy=proxy
+    )
+    assert isinstance(provider, IMAPProvider)
+
+    connected_socket = MagicMock()
+    connector = MagicMock()
+    connector.connect = AsyncMock(return_value=connected_socket)
+    client = _client()
+    client.search = AsyncMock(return_value=_response(lines=[]))
+    client_task = asyncio.get_running_loop().create_future()
+    client_task.set_result((MagicMock(), client.protocol))
+    client._client_task = client_task
+
+    with (
+        patch(
+            "app.integrations.email.imap_provider._proxy_connector",
+            return_value=connector,
+        ) as connector_factory,
+        patch(
+            "app.integrations.email.imap_provider._SocketIMAP4SSL",
+            return_value=client,
+        ) as imap_constructor,
+    ):
+        await provider.preflight()
+
+    connector_factory.assert_called_once_with(proxy)
+    connector.connect.assert_awaited_once_with(
+        dest_host="imap.gmail.com",
+        dest_port=993,
+        timeout=10.0,
+    )
+    assert imap_constructor.call_args.kwargs["sock"] is connected_socket
+    assert isinstance(
+        imap_constructor.call_args.kwargs["ssl_context"], ssl.SSLContext
+    )
+    assert imap_constructor.call_args.kwargs["host"] == "imap.gmail.com"
+
+
+async def test_proxy_connected_socket_gets_tls_sni_without_direct_destination_dial():
+    loop = asyncio.get_running_loop()
+    connected_socket = MagicMock()
+    tls_context = ssl.create_default_context()
+    create_connection = AsyncMock(return_value=(MagicMock(), MagicMock()))
+
+    with patch.object(loop, "create_connection", create_connection):
+        client = _SocketIMAP4SSL(
+            host="imap.gmail.com",
+            port=993,
+            sock=connected_socket,
+            ssl_context=tls_context,
+        )
+        await client._client_task
+
+    create_connection.assert_awaited_once()
+    call = create_connection.await_args
+    assert len(call.args) == 1  # protocol factory only; no direct host/port dial
+    assert call.kwargs == {
+        "sock": connected_socket,
+        "ssl": tls_context,
+        "server_hostname": "imap.gmail.com",
+    }
+
+
+@pytest.mark.parametrize("operation", ["preflight", "fetch", "fetch_fresh"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ProxyError("proxy authentication failed"),
+        ProxyTimeoutError("proxy connection timed out"),
+    ],
+)
+async def test_imap_proxy_failure_is_not_swallowed(operation, failure):
+    proxy = _browser_proxy()
+    provider = IMAPProvider(
+        "user@gmail.com",
+        "mail-password",
+        "imap.gmail.com",
+        proxy=proxy,
+    )
+    connector = MagicMock()
+    connector.connect = AsyncMock(side_effect=failure)
+
+    with patch(
+        "app.integrations.email.imap_provider._proxy_connector",
+        return_value=connector,
+    ):
+        with pytest.raises(ProxyUnavailableError) as error:
+            if operation == "preflight":
+                await provider.preflight()
+            elif operation == "fetch":
+                await provider.fetch_verification_code(timeout=0)
+            else:
+                await provider.fetch_fresh_verification_code(
+                    not_before=datetime.now(timezone.utc), timeout=0
+                )
+
+    assert error.value.code == "proxy_unavailable"
+    assert error.value.__cause__ is failure
 
 
 async def test_fetch_verification_code_returns_code():

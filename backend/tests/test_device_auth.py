@@ -2,11 +2,14 @@ import pytest
 
 from app.integrations.openai.device_auth import (
     DEVICE_AUTH_REDIRECT_URI,
+    DeviceAuthorization,
     DeviceAuthError,
     exchange_device_authorization,
     poll_device_authorization,
     request_device_code,
 )
+from app.integrations.openai.oauth import RefreshedTokens
+from app.integrations.playwright.proxy import BrowserProxy
 
 
 @pytest.mark.asyncio
@@ -75,3 +78,72 @@ async def test_device_auth_errors_are_safe_codes(httpx_mock):
     )
     with pytest.raises(DeviceAuthError, match="device_code_request_failed:500"):
         await request_device_code()
+
+
+@pytest.mark.asyncio
+async def test_device_auth_http_steps_keep_selected_proxy(monkeypatch):
+    selected = BrowserProxy(21, "http", "proxy.internal", 3128)
+    observed: list[BrowserProxy | None] = []
+    responses = [
+        {
+            "device_auth_id": "device-id",
+            "user_code": "ABCD-EFGH",
+            "interval": "1",
+        },
+        {
+            "authorization_code": "authorization-code",
+            "code_verifier": "verifier",
+            "code_challenge": "challenge",
+        },
+    ]
+
+    class FakeResponse:
+        is_success = True
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return FakeResponse(responses.pop(0))
+
+    def fake_client(*, proxy=None, timeout=30.0):
+        observed.append(proxy)
+        return FakeClient()
+
+    exchanged: list[BrowserProxy | None] = []
+
+    async def fake_exchange(*_args, proxy=None):
+        exchanged.append(proxy)
+        return RefreshedTokens("access", "refresh", None)
+
+    monkeypatch.setattr(
+        "app.integrations.openai.device_auth.openai_http_client", fake_client
+    )
+    monkeypatch.setattr(
+        "app.integrations.openai.device_auth.exchange_code_for_tokens", fake_exchange
+    )
+
+    device_code = await request_device_code(proxy=selected)
+    authorization = await poll_device_authorization(
+        device_code.device_auth_id,
+        device_code.user_code,
+        proxy=selected,
+    )
+    assert authorization == DeviceAuthorization(
+        "authorization-code", "verifier", "challenge"
+    )
+    await exchange_device_authorization(authorization, proxy=selected)
+
+    assert observed == [selected, selected]
+    assert exchanged == [selected]

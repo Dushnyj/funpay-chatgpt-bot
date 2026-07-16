@@ -10,6 +10,7 @@ from app.integrations.playwright.browser import browser_context
 from app.integrations.playwright.kick import kick_account
 from app.models.account import Account
 from app.services.account_validation import _build_email_provider
+from app.services.proxy_routes import resolve_browser_proxy
 
 
 _KICK_LOCKS: dict[int, asyncio.Lock] = {}
@@ -103,13 +104,15 @@ class KickService:
         totp_secret = account.totp_secret_encrypted
 
         try:
+            browser_proxy = await resolve_browser_proxy(session, account)
             email_provider = await _build_email_provider(
                 session,
                 account,
                 account.email,
                 account.email_password_encrypted or None,
+                browser_proxy=browser_proxy,
             )
-            async with browser_context() as context:
+            async with browser_context(proxy=browser_proxy) as context:
                 await kick_account(
                     context=context,
                     login=account.login,

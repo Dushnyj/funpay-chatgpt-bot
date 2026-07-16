@@ -313,9 +313,69 @@ async def test_register_periodic_tasks():
     assert "pending_order_retry" in lc.scheduler._tasks
     assert "funpay_sale_sync" in lc.scheduler._tasks
     assert "order_confirmed_notify" in lc.scheduler._tasks
+    assert "proxy_route_health" in lc.scheduler._tasks
     assert lc.scheduler._tasks["funpay_sale_sync"].interval == 120
     assert lc.scheduler._tasks["order_confirmed_notify"].interval == 60
+    assert lc.scheduler._tasks["proxy_route_health"].interval == 60
     await lc.stop()
+
+
+async def test_proxy_health_task_publishes_status_and_reconciles_capacity(
+    session,
+    monkeypatch,
+):
+    import app.app_lifecycle as lifecycle_module
+    from app.models.proxy_route import ProxyRoute
+    from app.services.proxy_routes import ProxyProbeResult
+
+    route = ProxyRoute(
+        name="Periodic health",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="proxy.example.test",
+        port=3128,
+        enabled=True,
+        status="unchecked",
+    )
+    session.add(route)
+    await session.commit()
+    route_id = route.id
+
+    class Context:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        lifecycle_module,
+        "async_session_factory",
+        lambda: Context(),
+    )
+    monkeypatch.setattr(
+        lifecycle_module,
+        "probe_proxy_route",
+        AsyncMock(
+            return_value=ProxyProbeResult(
+                status="online",
+                checked_at=datetime.now(timezone.utc),
+                egress_ip="203.0.113.90",
+                latency_ms=21,
+            )
+        ),
+    )
+    lifecycle = AppLifecycle("", 0)
+    lifecycle.request_capacity_reconcile = MagicMock()
+
+    await lifecycle._task_proxy_route_health()
+
+    session.expire_all()
+    persisted = await session.get(ProxyRoute, route_id)
+    assert persisted is not None
+    assert persisted.status == "online"
+    assert persisted.egress_ip == "203.0.113.90"
+    lifecycle.request_capacity_reconcile.assert_called_once_with()
 
 
 async def test_confirmed_order_notification_task_is_exact_and_idempotent(

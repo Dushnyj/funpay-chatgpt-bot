@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -27,6 +27,9 @@ class SellerSettings(Base):
         FernetEncrypted(allow_legacy_plaintext=True), default=None
     )
     telegram_seller_chat_id: Mapped[str | None] = mapped_column(default=None)
+    default_proxy_route_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proxy_routes.id", ondelete="RESTRICT"), default=None
+    )
     # A full browser/OAuth validation is intentionally infrequent. Lightweight
     # usage-window measurements have their own five-minute scheduler below.
     check_interval_minutes: Mapped[int] = mapped_column(default=1440)

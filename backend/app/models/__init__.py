@@ -14,6 +14,7 @@ from app.models.funpay_sale import (
 )
 from app.models.lot import BumpLog, Lot, LotTemplate, PriceMatrix
 from app.models.message import MessageTemplate
+from app.models.proxy_route import HomeRelaySetup, ProxyRoute
 from app.models.rental import Order, Rental
 from app.models.settings import SellerSettings
 
@@ -22,7 +23,7 @@ __all__ = [
     "SubscriptionTier", "Duration", "LimitScope",
     "Lot", "PriceMatrix", "LotTemplate", "BumpLog",
     "Order", "Rental",
-    "MessageTemplate", "SellerSettings", "AuditLog",
+    "MessageTemplate", "SellerSettings", "AuditLog", "ProxyRoute", "HomeRelaySetup",
     "ChatConversation", "ChatMessage", "FunPaySale", "FunPaySaleCandidate",
     "FunPaySaleSyncState",
 ]

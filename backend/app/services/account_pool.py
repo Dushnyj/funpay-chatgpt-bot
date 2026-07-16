@@ -15,6 +15,7 @@ from app.services.limit_eligibility import (
     apply_limit_scope_filters,
     observed_codex_long,
 )
+from app.services.proxy_routes import effective_proxy_route_is_healthy
 from app.services.subscription_eligibility import (
     trusted_paid_subscription_expiry,
 )
@@ -114,6 +115,7 @@ class AccountPool:
             .where(
                 Account.status == "active",
                 Account.operator_status_override.is_(None),
+                effective_proxy_route_is_healthy(now=now),
                 Account.tier_id == criteria.tier_id,
                 SubscriptionTier.is_active.is_(True),
                 SubscriptionTier.is_sellable.is_(True),
@@ -214,6 +216,16 @@ async def _has_fresh_allocation_conflict(
     """Recheck mutable cross-table blockers after Account is locked."""
 
     if await account_is_busy(session, account_id):
+        return True
+    route_is_healthy = await session.scalar(
+        select(Account.id)
+        .where(
+            Account.id == account_id,
+            effective_proxy_route_is_healthy(),
+        )
+        .limit(1)
+    )
+    if route_is_healthy is None:
         return True
     return (
         await session.scalar(

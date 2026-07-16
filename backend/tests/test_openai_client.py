@@ -1,4 +1,7 @@
+import httpx
 import pytest
+
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -100,3 +103,67 @@ async def test_client_sends_correct_headers(httpx_mock):
     assert request.headers["authorization"] == "Bearer my-token"
     assert request.headers["chatgpt-account-id"] == "my-acc"
     assert request.headers["user-agent"] == "codex-cli/1.0.0"
+
+
+@pytest.mark.asyncio
+async def test_client_uses_the_selected_proxy_transport(monkeypatch):
+    from app.integrations.openai.client import OpenAIClient
+
+    selected = BrowserProxy(
+        71,
+        "socks5",
+        "home-relay.internal",
+        1080,
+        username="relay-user",
+        password="relay-password",
+        config_revision=9,
+    )
+    observed: list[tuple[BrowserProxy | None, float]] = []
+
+    class FakeTransport:
+        async def aclose(self):
+            return None
+
+    def fake_http_client(*, proxy=None, timeout=30.0):
+        observed.append((proxy, timeout))
+        return FakeTransport()
+
+    monkeypatch.setattr(
+        "app.integrations.openai.client.openai_http_client",
+        fake_http_client,
+    )
+
+    async with OpenAIClient("access", "account", proxy=selected):
+        pass
+
+    assert observed == [(selected, 30.0)]
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_a_fail_closed_proxy_error(monkeypatch):
+    from app.integrations.openai.client import OpenAIClient
+
+    selected = BrowserProxy(72, "http", "home-relay.internal", 3128)
+
+    def fail_transport(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("secret-bearing transport detail", request=request)
+
+    def fake_http_client(*, proxy=None, timeout=30.0):
+        assert proxy is selected
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(fail_transport),
+            timeout=timeout,
+            trust_env=False,
+        )
+
+    monkeypatch.setattr(
+        "app.integrations.openai.client.openai_http_client",
+        fake_http_client,
+    )
+
+    async with OpenAIClient("access", "account", proxy=selected) as client:
+        with pytest.raises(ProxyUnavailableError) as failure:
+            await client.get_usage()
+
+    assert failure.value.code == "proxy_unavailable"
+    assert "secret-bearing" not in str(failure.value)

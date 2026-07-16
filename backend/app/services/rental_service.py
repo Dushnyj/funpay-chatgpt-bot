@@ -39,6 +39,7 @@ from app.services.subscription_eligibility import (
 from app.services.limit_eligibility import apply_limit_scope_filters
 from app.services.messages import issued_usage_template_variables, render_message
 from app.services.order_provenance import is_verified_bot_sale_order
+from app.services.proxy_routes import effective_proxy_route_is_healthy
 
 
 logger = logging.getLogger(__name__)
@@ -661,6 +662,7 @@ class RentalService:
                 Account.id == account.id,
                 Account.status == "active",
                 Account.operator_status_override.is_(None),
+                effective_proxy_route_is_healthy(now=now),
                 Account.tier_id == rental.tier_id,
                 SubscriptionTier.is_active.is_(True),
                 SubscriptionTier.is_sellable.is_(True),

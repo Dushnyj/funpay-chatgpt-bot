@@ -862,6 +862,28 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 for column in inspect(sync_connection).get_columns("accounts")
             }
         )
+        proxy_schema = await connection.run_sync(
+            lambda sync_connection: {
+                "columns": {
+                    column["name"]: column
+                    for column in inspect(sync_connection).get_columns(
+                        "proxy_routes"
+                    )
+                },
+                "indexes": {
+                    index["name"]: index
+                    for index in inspect(sync_connection).get_indexes(
+                        "proxy_routes"
+                    )
+                },
+                "account_fks": inspect(sync_connection).get_foreign_keys(
+                    "accounts"
+                ),
+                "settings_fks": inspect(sync_connection).get_foreign_keys(
+                    "seller_settings"
+                ),
+            }
+        )
         sale_sync_columns = await connection.run_sync(
             lambda sync_connection: {
                 column["name"]
@@ -884,7 +906,7 @@ async def test_upgrade_database_creates_head_schema_idempotently(
                 )
             }
         )
-    assert version == "20260715_0021"
+    assert version == "20260716_0022"
     assert "funpay_sales" in tables
     assert "funpay_sale_sync_state" in tables
     assert "funpay_sale_candidates" in tables
@@ -909,6 +931,27 @@ async def test_upgrade_database_creates_head_schema_idempotently(
     assert {
         "plan_raw_type", "plan_source", "plan_confidence", "plan_detected_at"
     } <= set(account_columns)
+    assert proxy_schema["columns"]["config_revision"]["nullable"] is False
+    assert str(
+        proxy_schema["columns"]["config_revision"]["default"]
+    ).strip("'\"") == "1"
+    singleton_index = proxy_schema["indexes"][
+        "uq_proxy_routes_single_home_relay"
+    ]
+    assert singleton_index["unique"] == 1
+    assert singleton_index["column_names"] == ["mode"]
+    account_proxy_fk = next(
+        foreign_key
+        for foreign_key in proxy_schema["account_fks"]
+        if foreign_key["constrained_columns"] == ["proxy_route_id"]
+    )
+    settings_proxy_fk = next(
+        foreign_key
+        for foreign_key in proxy_schema["settings_fks"]
+        if foreign_key["constrained_columns"] == ["default_proxy_route_id"]
+    )
+    assert account_proxy_fk["options"].get("ondelete") == "RESTRICT"
+    assert settings_proxy_fk["options"].get("ondelete") == "RESTRICT"
     async with engine.connect() as connection:
         limits_columns = await connection.run_sync(
             lambda sync_connection: {
@@ -1563,7 +1606,7 @@ async def test_upgrade_adopts_pre_chat_schema_and_normalizes_secrets(
     assert account_status == "pending_validation"
     assert job_type == "full_validation"
     assert job_status == "pending"
-    assert version == "20260715_0021"
+    assert version == "20260716_0022"
     await engine.dispose()
 
 
@@ -1654,7 +1697,7 @@ async def test_upgrade_from_existing_0005_revalidates_only_untrusted_accounts(
         "legacy-pending": (None, "pending_validation", None),
     }
     assert jobs == {1: 1, 2: 1, 4: 1}
-    assert version == "20260715_0021"
+    assert version == "20260716_0022"
     await engine.dispose()
 
 

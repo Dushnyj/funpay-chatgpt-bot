@@ -10,6 +10,8 @@ import pytest
 from app.models.account import Account, AccountLimits
 from app.models.catalog import SubscriptionTier
 from app.integrations.openai.types import UsageInfo
+from app.integrations.openai.oauth import RefreshedTokens
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 from app.services.account_limits import (
     MeasureResult,
     _acquire_access_token,
@@ -91,6 +93,268 @@ async def test_stale_401_reuses_token_rotated_by_previous_worker(session):
 
     assert access_token == "already-rotated-access"
     refresh.assert_not_awaited()
+    assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_uses_account_selected_proxy(session, monkeypatch):
+    account = Account(
+        login="routed-refresh@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        status="active",
+    )
+    session.add(account)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="refresh-token",
+        access_token_encrypted="expired-access",
+        access_token_expires_at=None,
+        refresh_status="ok",
+    ))
+    await session.commit()
+    selected = BrowserProxy(31, "socks5", "home-relay", 1080)
+    resolved_for: list[int] = []
+    refreshed_with: list[BrowserProxy | None] = []
+
+    async def fake_resolve(_session, target):
+        resolved_for.append(target.id)
+        return selected
+
+    async def fake_refresh(token, *, proxy=None):
+        assert token == "refresh-token"
+        refreshed_with.append(proxy)
+        return RefreshedTokens("new-access", "new-refresh", None)
+
+    monkeypatch.setattr(
+        "app.services.account_limits.resolve_browser_proxy", fake_resolve
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.refresh_access_token", fake_refresh
+    )
+
+    _limits, access_token = await _acquire_access_token(session, account.id)
+
+    assert access_token == "new-access"
+    assert resolved_for == [account.id]
+    assert refreshed_with == [selected]
+
+
+@pytest.mark.asyncio
+async def test_refresh_proxy_failure_marks_selected_route_offline(
+    session,
+    monkeypatch,
+):
+    account = Account(
+        login="offline-refresh@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        status="active",
+    )
+    session.add(account)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="refresh-token",
+        access_token_encrypted="expired-access",
+        access_token_expires_at=None,
+        refresh_status="ok",
+    ))
+    await session.commit()
+    selected = BrowserProxy(32, "socks5", "home-relay", 1080)
+    marked: list[BrowserProxy | None] = []
+
+    async def fake_resolve(_session, _target):
+        return selected
+
+    async def failing_refresh(_token, *, proxy=None):
+        assert proxy is selected
+        raise ProxyUnavailableError()
+
+    async def fake_mark(_session, proxy, **_kwargs):
+        marked.append(proxy)
+        return True
+
+    monkeypatch.setattr(
+        "app.services.account_limits.resolve_browser_proxy", fake_resolve
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.refresh_access_token", failing_refresh
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.mark_proxy_route_offline", fake_mark
+    )
+
+    with pytest.raises(ProxyUnavailableError):
+        await _acquire_access_token(session, account.id)
+
+    assert marked == [selected]
+    assert not session.in_transaction()
+
+
+@pytest.mark.asyncio
+async def test_measure_pins_one_route_for_refresh_usage_and_account_check(
+    session,
+    monkeypatch,
+):
+    tier = SubscriptionTier(
+        code="free",
+        name="Free",
+        is_active=True,
+        system_managed=True,
+        is_sellable=False,
+    )
+    account = Account(
+        login="pinned-measure@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        status="active",
+    )
+    session.add_all([tier, account])
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="refresh-token",
+        access_token_encrypted="expired-access",
+        access_token_expires_at=None,
+        account_id_openai="openai-account",
+        refresh_status="ok",
+    ))
+    await session.commit()
+
+    selected = BrowserProxy(
+        73,
+        "socks5",
+        "home-relay.internal",
+        1080,
+        config_revision=11,
+    )
+    resolved: list[int] = []
+    refreshed: list[BrowserProxy | None] = []
+    clients: list[BrowserProxy | None] = []
+    calls: list[str] = []
+
+    async def fake_resolve(_session, target):
+        resolved.append(target.id)
+        return selected
+
+    async def fake_refresh(_token, *, proxy=None):
+        refreshed.append(proxy)
+        return RefreshedTokens("fresh-access", "fresh-refresh", None)
+
+    class FakeOpenAIClient:
+        def __init__(self, _token, _account_id, *, proxy=None):
+            clients.append(proxy)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get_usage(self):
+            calls.append("usage")
+            return UsageInfo(
+                plan_type="free",
+                primary_remaining_pct=95,
+                primary_window_seconds=30 * 24 * 60 * 60,
+            )
+
+        async def get_account_metadata(self):
+            calls.append("accounts_check")
+            from app.integrations.openai.types import AccountMetadata
+
+            return AccountMetadata(
+                plan_type="free",
+                has_active_subscription=False,
+            )
+
+    monkeypatch.setattr(
+        "app.services.account_limits.resolve_browser_proxy", fake_resolve
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.refresh_access_token", fake_refresh
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.OpenAIClient", FakeOpenAIClient
+    )
+
+    result = await measure_account_limits(session, account.id)
+
+    assert result is MeasureResult.OK
+    assert resolved == [account.id]
+    assert refreshed == [selected]
+    assert clients == [selected]
+    assert calls == ["usage", "accounts_check"]
+
+
+@pytest.mark.asyncio
+async def test_usage_transport_failure_marks_the_pinned_route_revision_offline(
+    session,
+    monkeypatch,
+):
+    account = Account(
+        login="usage-route-failure@example.com",
+        password_encrypted="password",
+        totp_secret_encrypted="totp",
+        status="active",
+    )
+    session.add(account)
+    await session.flush()
+    session.add(AccountLimits(
+        account_id=account.id,
+        refresh_token_encrypted="refresh-token",
+        access_token_encrypted="fresh-access",
+        access_token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        refresh_status="ok",
+    ))
+    await session.commit()
+
+    selected = BrowserProxy(
+        74,
+        "socks5",
+        "home-relay.internal",
+        1080,
+        config_revision=13,
+    )
+    marked: list[BrowserProxy | None] = []
+
+    async def fake_resolve(_session, _target):
+        return selected
+
+    async def fake_mark(_session, proxy, **_kwargs):
+        marked.append(proxy)
+        return True
+
+    class FailingOpenAIClient:
+        def __init__(self, _token, _account_id, *, proxy=None):
+            assert proxy is selected
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get_usage(self):
+            raise ProxyUnavailableError()
+
+    monkeypatch.setattr(
+        "app.services.account_limits.resolve_browser_proxy", fake_resolve
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.mark_proxy_route_offline", fake_mark
+    )
+    monkeypatch.setattr(
+        "app.services.account_limits.OpenAIClient", FailingOpenAIClient
+    )
+
+    with pytest.raises(ProxyUnavailableError):
+        await measure_account_limits(session, account.id)
+
+    assert marked == [selected]
+    assert marked[0].config_revision == 13
     assert not session.in_transaction()
 
 

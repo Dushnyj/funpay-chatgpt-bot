@@ -24,10 +24,15 @@ RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1.2" \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 app \
-    && chown -R app:app /app /ms-playwright
+    && chown -R root:root /app /ms-playwright \
+    && chmod -R a-w /app /ms-playwright
 
 # Копируем собранный фронтенд из frontend-builder
-COPY --from=frontend-builder --chown=app:app /frontend/dist /app/frontend/dist
+# Application code and the privileged Windows installer stay root-owned and
+# immutable to the unprivileged web process. Runtime data belongs in the app
+# user's home, /tmp, PostgreSQL, or explicit named volumes.
+COPY --from=frontend-builder /frontend/dist /app/frontend/dist
+COPY ops/windows-relay /app/ops/windows-relay
 
 USER app
 

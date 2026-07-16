@@ -82,6 +82,7 @@ export interface Account {
   status: string
   operator_status_override?: 'maintenance' | 'disabled' | null
   notes: string | null
+  proxy_route_id?: number | null
   plan_raw_type?: string | null
   plan_source?: string | null
   plan_confidence?: number | null
@@ -120,12 +121,14 @@ export interface AccountCreate {
   email_password?: string
   max_active_rentals?: number
   notes?: string
+  proxy_route_id?: number
 }
 
 export interface AccountUpdate {
   max_active_rentals?: number | null
   status?: 'maintenance' | 'disabled'
   notes?: string | null
+  proxy_route_id?: number | null
 }
 
 export interface AccountCredentialsUpdate {
@@ -336,6 +339,72 @@ export interface Settings {
   check_delay_seconds: number
   limits_warn_threshold_pct: number
   graph_configured?: boolean
+}
+
+export type LoginRouteMode = 'direct' | 'home_relay' | 'custom_proxy'
+
+export type LoginProxyType = 'http' | 'https' | 'socks5'
+
+export type LoginRouteStatus = 'unchecked' | 'online' | 'offline'
+
+export interface LoginRoute {
+  id: number
+  name: string
+  mode: LoginRouteMode
+  proxy_type: LoginProxyType | null
+  host: string | null
+  port: number | null
+  username: string | null
+  has_password: boolean
+  enabled: boolean
+  config_revision: number
+  is_default: boolean
+  status: LoginRouteStatus
+  egress_ip: string | null
+  latency_ms: number | null
+  last_checked_at: string | null
+  last_error: string | null
+}
+
+export interface LoginRoutesResponse {
+  default_route_id: number | null
+  routes: LoginRoute[]
+}
+
+export interface LoginRouteWrite {
+  name: string
+  mode: 'custom_proxy'
+  proxy_type: LoginProxyType
+  host: string
+  port: number
+  username?: string | null
+  password?: string
+  enabled?: boolean
+}
+
+export interface LoginRoutePatch {
+  name?: string
+  proxy_type?: LoginProxyType
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  clear_credentials?: boolean
+  enabled?: boolean
+  is_default?: boolean
+}
+
+export interface HomeRelaySetupRequest {
+  name: string
+  autostart: boolean
+}
+
+export interface HomeRelaySetup {
+  setup_token: string
+  powershell_command: string
+  script_download_url: string
+  installer_sha256: string
+  expires_at: string
 }
 
 export interface Metrics {

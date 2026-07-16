@@ -4,7 +4,14 @@ from dataclasses import dataclass
 
 import httpx
 
-from app.integrations.openai.oauth import OPENAI_CLIENT_ID, OPENAI_ISSUER, RefreshedTokens, exchange_code_for_tokens
+from app.integrations.openai.oauth import (
+    OPENAI_CLIENT_ID,
+    OPENAI_ISSUER,
+    RefreshedTokens,
+    exchange_code_for_tokens,
+    openai_http_client,
+)
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 
 DEVICE_AUTH_REDIRECT_URI = f"{OPENAI_ISSUER}/deviceauth/callback"
@@ -30,11 +37,19 @@ class DeviceAuthorization:
     code_challenge: str
 
 
-async def request_device_code() -> DeviceCode:
+async def request_device_code(
+    *,
+    proxy: BrowserProxy | None = None,
+) -> DeviceCode:
     """Start the same user-assisted device flow supported by OpenAI Codex."""
     url = f"{OPENAI_ISSUER}/api/accounts/deviceauth/usercode"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, json={"client_id": OPENAI_CLIENT_ID})
+    try:
+        async with openai_http_client(proxy=proxy) as client:
+            response = await client.post(url, json={"client_id": OPENAI_CLIENT_ID})
+    except httpx.TransportError as exc:
+        if proxy is not None:
+            raise ProxyUnavailableError() from None
+        raise DeviceAuthError("device_code_request_transport_failed") from exc
     if not response.is_success:
         raise DeviceAuthError(f"device_code_request_failed:{response.status_code}")
     try:
@@ -52,14 +67,21 @@ async def request_device_code() -> DeviceCode:
 async def poll_device_authorization(
     device_auth_id: str,
     user_code: str,
+    *,
+    proxy: BrowserProxy | None = None,
 ) -> DeviceAuthorization | None:
     """Poll once. ``None`` means the operator has not completed the browser step yet."""
     url = f"{OPENAI_ISSUER}/api/accounts/deviceauth/token"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            url,
-            json={"device_auth_id": device_auth_id, "user_code": user_code},
-        )
+    try:
+        async with openai_http_client(proxy=proxy) as client:
+            response = await client.post(
+                url,
+                json={"device_auth_id": device_auth_id, "user_code": user_code},
+            )
+    except httpx.TransportError as exc:
+        if proxy is not None:
+            raise ProxyUnavailableError() from None
+        raise DeviceAuthError("device_code_poll_transport_failed") from exc
     if response.status_code in (403, 404):
         return None
     if not response.is_success:
@@ -77,9 +99,12 @@ async def poll_device_authorization(
 
 async def exchange_device_authorization(
     authorization: DeviceAuthorization,
+    *,
+    proxy: BrowserProxy | None = None,
 ) -> RefreshedTokens:
     return await exchange_code_for_tokens(
         authorization.authorization_code,
         authorization.code_verifier,
         DEVICE_AUTH_REDIRECT_URI,
+        proxy=proxy,
     )

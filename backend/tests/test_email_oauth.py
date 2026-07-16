@@ -10,16 +10,23 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import app.api.routers.email_oauth as email_oauth_router
+import app.services.email_oauth as email_oauth_service
 from app.api.auth import COOKIE_NAME, create_access_token
 from app.config import get_settings
+from app.integrations.playwright.proxy import BrowserProxy
 from app.main import app
 from app.models.account import Account, AccountCheckJob, EmailOAuthCredential
 from app.models.catalog import Duration, LimitScope, SubscriptionTier
+from app.models.proxy_route import ProxyRoute
 from app.models.rental import Order, Rental
 from app.services.email_oauth import (
     EmailOAuthStateError,
     EmailOAuthStateManager,
     MicrosoftGraphOAuthConfig,
+    PendingEmailOAuth,
+    VerifiedMicrosoftTokens,
+    exchange_and_verify_microsoft_code,
 )
 
 
@@ -53,6 +60,32 @@ async def _outlook_account(session: AsyncSession, email: str) -> Account:
     session.add(account)
     await session.commit()
     return account
+
+
+async def _online_proxy_route(
+    session: AsyncSession,
+    account: Account,
+) -> ProxyRoute:
+    now = datetime.now(timezone.utc)
+    route = ProxyRoute(
+        name=f"oauth-route-{account.id}",
+        mode="custom_proxy",
+        proxy_type="http",
+        host="127.0.0.1",
+        port=3128,
+        username_encrypted="proxy-user",
+        password_encrypted="proxy-password",
+        enabled=True,
+        config_revision=1,
+        status="online",
+        last_checked_at=now,
+        updated_at=now,
+    )
+    session.add(route)
+    await session.flush()
+    account.proxy_route_id = route.id
+    await session.commit()
+    return route
 
 
 async def _occupy_account(session: AsyncSession, account: Account) -> Rental:
@@ -129,6 +162,74 @@ async def test_state_is_pkce_bound_one_time_and_expires():
     expired_state = parse_qs(urlparse(expired.authorization_url).query)["state"][0]
     with pytest.raises(EmailOAuthStateError):
         await expired_manager.consume(expired_state)
+
+
+async def test_code_exchange_and_profile_lookup_share_pinned_proxy(
+    monkeypatch,
+    httpx_mock,
+):
+    config = MicrosoftGraphOAuthConfig(
+        "client-id",
+        "client-secret",
+        "https://example.test/oauth/callback",
+    )
+    proxy = BrowserProxy(
+        route_id=19,
+        proxy_type="http",
+        host="127.0.0.1",
+        port=3128,
+        username="proxy-user",
+        password="proxy-password",
+        config_revision=5,
+    )
+    pending = PendingEmailOAuth(
+        account_id=17,
+        expected_email="owner@outlook.com",
+        code_verifier="code-verifier",
+        client_id=config.client_id,
+        redirect_uri=config.redirect_uri,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        browser_proxy=proxy,
+    )
+    seen_proxies = []
+    real_client_factory = email_oauth_service.microsoft_graph_http_client
+
+    def recording_client_factory(*, browser_proxy=None, timeout=15.0):
+        seen_proxies.append(browser_proxy)
+        return real_client_factory(browser_proxy=browser_proxy, timeout=timeout)
+
+    monkeypatch.setattr(
+        email_oauth_service,
+        "microsoft_graph_http_client",
+        recording_client_factory,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+        json={
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "scope": "openid offline_access User.Read Mail.Read",
+        },
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=re.compile(r"https://graph\.microsoft\.com/v1\.0/me.*"),
+        json={
+            "id": "microsoft-subject",
+            "mail": "owner@outlook.com",
+            "userPrincipalName": "owner@outlook.com",
+        },
+    )
+
+    tokens = await exchange_and_verify_microsoft_code(
+        code="authorization-code",
+        pending=pending,
+        config=config,
+    )
+
+    assert tokens.refresh_token == "refresh-token"
+    assert seen_proxies == [proxy, proxy]
 
 
 async def test_start_returns_clear_503_without_client_configuration(
@@ -277,6 +378,59 @@ async def test_callback_verifies_identity_encrypts_refresh_and_exposes_status(
     assert token_form["client_secret"] == ["graph-client-secret"]
     assert token_form["code_verifier"][0]
     assert token_form["code"] == ["authorization-code"]
+
+
+async def test_callback_fails_closed_if_route_changes_before_token_save(
+    auth_client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch,
+):
+    _configure_graph(monkeypatch)
+    account = await _outlook_account(session, "routed@outlook.com")
+    route = await _online_proxy_route(session, account)
+    started = await auth_client.post(
+        f"/api/accounts/{account.id}/email-oauth/microsoft"
+    )
+    assert started.status_code == 200
+    state = parse_qs(urlparse(started.json()["authorization_url"]).query)[
+        "state"
+    ][0]
+    exchange_called = False
+
+    async def exchange_then_rotate_route(*, pending, **_kwargs):
+        nonlocal exchange_called
+        exchange_called = True
+        browser_proxy = pending.browser_proxy
+        assert browser_proxy is not None
+        assert browser_proxy.route_id == route.id
+        assert browser_proxy.config_revision == 1
+        route.config_revision = 2
+        route.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+        return VerifiedMicrosoftTokens(
+            refresh_token="must-not-be-saved",
+            scopes="Mail.Read",
+            external_subject="microsoft-subject",
+        )
+
+    monkeypatch.setattr(
+        email_oauth_router,
+        "exchange_and_verify_microsoft_code",
+        exchange_then_rotate_route,
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as public:
+        callback = await public.post(
+            "/api/email-oauth/microsoft/callback",
+            data={"state": state, "code": "authorization-code"},
+        )
+
+    assert exchange_called is True
+    assert callback.status_code == 303
+    assert callback.headers["location"] == (
+        "/accounts?email_oauth=failed&reason=proxy_route_changed"
+    )
+    assert await session.get(EmailOAuthCredential, account.id) is None
 
 
 async def test_callback_rechecks_occupancy_before_storing_mailbox_token(

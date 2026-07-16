@@ -29,3 +29,13 @@ def test_settings_validates_browser_concurrency_cap(monkeypatch):
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_settings_requires_proxy_ttl_to_cover_probe_jitter(monkeypatch):
+    monkeypatch.setenv("PROXY_ROUTE_PROBE_INTERVAL_SECONDS", "120")
+    monkeypatch.setenv("PROXY_ROUTE_MAX_AGE_SECONDS", "180")
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings()

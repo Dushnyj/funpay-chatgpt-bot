@@ -41,6 +41,11 @@ class Account(Base):
     totp_secret_encrypted: Mapped[str] = mapped_column(FernetEncrypted)
     email: Mapped[str | None] = mapped_column(default=None)
     email_password_encrypted: Mapped[str | None] = mapped_column(FernetEncrypted, default=None)
+    # Null inherits the global browser route.  A configured but unavailable
+    # route fails closed; validation never falls back to the VPS address.
+    proxy_route_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proxy_routes.id", ondelete="RESTRICT"), default=None
+    )
     # The tier is unknown until the first successful OpenAI metadata check.
     tier_id: Mapped[int | None] = mapped_column(
         ForeignKey("subscription_tiers.id"), default=None

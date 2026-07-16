@@ -19,6 +19,10 @@ from app.api.routers.orders import router as orders_router
 from app.api.routers.rentals import router as rentals_router
 from app.api.routers.settings import router as settings_router
 from app.api.routers.prices import router as prices_router
+from app.api.routers.proxy_routes import (
+    public_router as public_proxy_routes_router,
+    router as proxy_routes_router,
+)
 from app.api.routers.templates import router as templates_router
 from app.api.routers.metrics import router as metrics_router
 from app.api.deps import get_db_session
@@ -54,12 +58,16 @@ async def lifespan(app: FastAPI):
     account_device_auth_manager.set_validation_queued_callback(
         lifecycle.request_validation_check
     )
+    account_device_auth_manager.set_capacity_changed_callback(
+        lifecycle.request_capacity_reconcile
+    )
     await lifecycle.start()
     try:
         yield
     finally:
         await account_device_auth_manager.shutdown()
         account_device_auth_manager.set_validation_queued_callback(None)
+        account_device_auth_manager.set_capacity_changed_callback(None)
         try:
             await lifecycle.stop()
         finally:
@@ -106,6 +114,8 @@ app.include_router(orders_router)
 app.include_router(rentals_router)
 app.include_router(settings_router)
 app.include_router(prices_router)
+app.include_router(proxy_routes_router)
+app.include_router(public_proxy_routes_router)
 app.include_router(templates_router)
 app.include_router(metrics_router)
 

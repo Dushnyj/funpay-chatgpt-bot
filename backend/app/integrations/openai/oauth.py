@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import httpx
 
 from app.integrations.openai.exceptions import RefreshFailedError
+from app.integrations.playwright.proxy import BrowserProxy, ProxyUnavailableError
 
 # Константы из codex-switcher (реверс-инжиниринг OpenAI OAuth)
 OPENAI_ISSUER = "https://auth.openai.com"
@@ -108,7 +109,43 @@ class RefreshedTokens:
     id_token: str | None
 
 
-async def refresh_access_token(refresh_token: str) -> RefreshedTokens:
+def openai_http_client(
+    *,
+    proxy: BrowserProxy | None = None,
+    timeout: float = 30.0,
+) -> httpx.AsyncClient:
+    """Build a secret-safe HTTP client for OpenAI authentication endpoints.
+
+    A selected route is applied to the HTTP token requests as well as the
+    Playwright browser. ``trust_env=False`` is deliberate: a configured route
+    must never silently fall back to an unrelated process-level proxy.
+    """
+
+    client_proxy: httpx.Proxy | None = None
+    if proxy is not None:
+        auth = None
+        if proxy.username is not None:
+            auth = (proxy.username, proxy.password or "")
+        client_proxy = httpx.Proxy(proxy.server, auth=auth)
+    try:
+        return httpx.AsyncClient(
+            proxy=client_proxy,
+            timeout=timeout,
+            trust_env=False,
+        )
+    except ImportError:
+        # HTTPX raises here when its optional SOCKS transport is absent. Keep
+        # the dependency/configuration detail out of durable job diagnostics.
+        if proxy is not None:
+            raise ProxyUnavailableError() from None
+        raise
+
+
+async def refresh_access_token(
+    refresh_token: str,
+    *,
+    proxy: BrowserProxy | None = None,
+) -> RefreshedTokens:
     """Обновляет access_token через refresh_token.
 
     POST https://auth.openai.com/oauth/token
@@ -120,7 +157,7 @@ async def refresh_access_token(refresh_token: str) -> RefreshedTokens:
         f"&client_id={OPENAI_CLIENT_ID}"
     )
 
-    async with httpx.AsyncClient() as client:
+    async with openai_http_client(proxy=proxy) as client:
         for attempt in range(1, 4):
             try:
                 response = await client.post(
@@ -129,14 +166,17 @@ async def refresh_access_token(refresh_token: str) -> RefreshedTokens:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
                 break
-            except httpx.HTTPError:
+            except httpx.TransportError:
                 if attempt == 3:
+                    if proxy is not None:
+                        raise ProxyUnavailableError() from None
                     raise
                 await _short_backoff(attempt)
 
-    if response.status_code in (400, 401):
-        raise RefreshFailedError(f"refresh failed: {response.status_code} {response.text}")
-    response.raise_for_status()
+    if not response.is_success:
+        # Upstream bodies are intentionally omitted: they are not needed for
+        # diagnosis and may echo account-specific authentication details.
+        raise RefreshFailedError(f"refresh failed: {response.status_code}")
 
     data = response.json()
     return RefreshedTokens(
@@ -151,7 +191,11 @@ async def _short_backoff(attempt: int) -> None:
 
 
 async def exchange_code_for_tokens(
-    code: str, code_verifier: str, redirect_uri: str
+    code: str,
+    code_verifier: str,
+    redirect_uri: str,
+    *,
+    proxy: BrowserProxy | None = None,
 ) -> RefreshedTokens:
     """Обменивает authorization_code на токены (первичный вход через Playwright OAuth).
 
@@ -165,16 +209,21 @@ async def exchange_code_for_tokens(
         f"&code_verifier={code_verifier}"
     )
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{OPENAI_ISSUER}/oauth/token",
-            content=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+    try:
+        async with openai_http_client(proxy=proxy) as client:
+            response = await client.post(
+                f"{OPENAI_ISSUER}/oauth/token",
+                content=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+    except httpx.TransportError:
+        if proxy is not None:
+            raise ProxyUnavailableError() from None
+        raise
 
     if not response.is_success:
         raise RefreshFailedError(
-            f"token exchange failed: {response.status_code} {response.text}"
+            f"token exchange failed: {response.status_code}"
         )
 
     data = response.json()
